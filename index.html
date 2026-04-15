@@ -53,7 +53,6 @@
     }
     textarea{min-height:120px;resize:vertical}
     .btn{cursor:pointer}
-    .btn:disabled,input:disabled,textarea:disabled,select:disabled{opacity:.55;cursor:not-allowed;background:#f3f4f6}
     .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
     .btn.soft{background:var(--accent-soft);border-color:#bfdbfe;color:#1d4ed8;font-weight:700}
     .btn.ok{background:#ecfdf5;border-color:#bbf7d0;color:var(--ok);font-weight:700}
@@ -214,7 +213,6 @@
     </div>
 
     <div id="tab-manage" class="hidden">
-      <div class="banner" id="manageLockNotice">未ログインです。問題の追加・更新・削除・クラウド保存はログイン後に使えます。</div>
       <h2>問題管理</h2>
       <div class="sub">
         検索・追加・更新・削除ができます。<br>
@@ -306,12 +304,6 @@
 
 <script type="module">
 const firebaseConfig = {
-  apiKey: "REPLACE_ME",
-  authDomain: "REPLACE_ME",
-  projectId: "REPLACE_ME",
-  storageBucket: "REPLACE_ME",
-  messagingSenderId: "REPLACE_ME",
-  appId: "REPLACE_ME"
   apiKey: "AIzaSyBdYSfjIWOT4JeNEG4ZB3j5c9I1FLoVlhM",
   authDomain: "dental-qa-hub-e7cce.firebaseapp.com",
   projectId: "dental-qa-hub-e7cce",
@@ -336,7 +328,7 @@ import {
   setDoc,
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
-import { initializeAppCheck, ReCaptchaV3Provider } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-app-check.js";
+import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-app-check.js";
   
 const SAMPLE_QUESTIONS = [
   {
@@ -680,10 +672,6 @@ function renderManageTable() {
 }
 
 function addQuestion() {
-  if (!currentUser) {
-    alert("問題の追加はログイン後に使えます。");
-    return;
-  }
   const payload = readEditorForm();
   if (!payload) return;
 
@@ -698,10 +686,6 @@ function addQuestion() {
 }
 
 function updateQuestion() {
-  if (!currentUser) {
-    alert("問題の更新はログイン後に使えます。");
-    return;
-  }
   if (!selectedQuestionId) {
     alert("更新したい問題を一覧から選んでください。");
     return;
@@ -722,10 +706,6 @@ function updateQuestion() {
 }
 
 function deleteQuestion() {
-  if (!currentUser) {
-    alert("問題の削除はログイン後に使えます。");
-    return;
-  }
   if (!selectedQuestionId) {
     alert("削除したい問題を一覧から選んでください。");
     return;
@@ -877,11 +857,9 @@ async function initFirebase() {
         currentUser = user;
         el.authStatus.textContent = `ログイン中: ${user.email || "メール不明"}`;
         el.cloudStatus.textContent = "Firebase接続済みです。クラウド保存・再開が使えます。";
-        updateAuthLockedUI();
       } else {
         currentUser = null;
         el.authStatus.textContent = "未ログインです。";
-        updateAuthLockedUI();
       }
     });
   } catch (error) {
@@ -1055,34 +1033,6 @@ el.userAnswer.addEventListener("keydown", (e) => {
   }
 });
 
-
-function updateAuthLockedUI() {
-  const loggedIn = !!currentUser;
-
-  const buttonIds = [
-    "addBtn", "updateBtn", "deleteBtn", "saveCloudBtn", "saveCloudBtn2", "loadCloudBtn"
-  ];
-  buttonIds.forEach(id => {
-    const node = document.getElementById(id);
-    if (node) node.disabled = !loggedIn;
-  });
-
-  const inputIds = [
-    "editSubject", "editQuestion", "editAnswers", "editExplanation"
-  ];
-  inputIds.forEach(id => {
-    const node = document.getElementById(id);
-    if (node) node.disabled = !loggedIn;
-  });
-
-  const notice = document.getElementById("manageLockNotice");
-  if (notice) {
-    notice.textContent = loggedIn
-      ? "ログイン中です。問題の追加・更新・削除・クラウド保存が使えます。"
-      : "未ログインです。問題の追加・更新・削除・クラウド保存はログイン後に使えます。";
-  }
-}
-
 function init() {
   allQuestions = structuredClone(SAMPLE_QUESTIONS);
   wrongQuestionIds = [];
@@ -1092,7 +1042,6 @@ function init() {
   renderManageTable();
   renderProgressTable();
   renderStudy();
-  updateAuthLockedUI();
   initFirebase();
 }
 
