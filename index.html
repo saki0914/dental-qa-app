@@ -850,7 +850,7 @@ async function initFirebase() {
 
     app = initializeApp(firebaseConfig);
     const appCheck = initializeAppCheck(app, {
-      provider: new ReCaptchaV3Provider("6LcMO7gsAAAAAM54NMv21YbI1tP3WqUP_dzR5YmX"),
+      provider: new ReCaptchaEnterpriseProvider("6LcMO7gsAAAAAM54NMv21YbI1tP3WqUP_dzR5YmX"),
       isTokenAutoRefreshEnabled: true
     });
     
