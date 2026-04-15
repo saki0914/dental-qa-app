@@ -131,7 +131,7 @@
       iPhone版は「見て覚える」、iPad版は「書いて判定する」形式です。<br>
       問題管理、苦手復習、教科別進捗、Firebaseログイン連携までまとめています。
     </div>
-    <div class="banner" id="cloudStatus">Firebase未接続です。READMEの手順で設定を入れてください。</div>
+    <div class="banner" id="cloudStatus">Firebase接続を確認中です...</div>
   </div>
 
   <div class="panel">
@@ -865,6 +865,7 @@ async function initFirebase() {
       } else {
         currentUser = null;
         el.authStatus.textContent = "未ログインです。";
+        el.cloudStatus.textContent = "Firebase接続済みです。ログインするとクラウド保存・再開が使えます。";
       }
     });
   } catch (error) {
