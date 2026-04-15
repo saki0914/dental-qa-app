@@ -336,7 +336,8 @@ import {
   setDoc,
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
-
+import { initializeAppCheck, ReCaptchaV3Provider } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-app-check.js";
+  
 const SAMPLE_QUESTIONS = [
   {
     id: crypto.randomUUID(),
