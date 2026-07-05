@@ -5,6 +5,11 @@
 node_modules/
 .codex/
 
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
 *.log
 logs/
 

@@ -6,7 +6,9 @@
   },
   "remoteUser": "node",
   "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
-  "forwardPorts": [3000],
+  "forwardPorts": [
+    3000
+  ],
   "portsAttributes": {
     "3000": {
       "label": "Dental QA local server",
@@ -16,7 +18,7 @@
   "mounts": [
     "source=dental-qa-app-codex,target=/home/node/.codex,type=volume"
   ],
-  "postCreateCommand": "sudo chown -R node:node /home/node/.codex && chmod 700 /home/node/.codex && git config --global --add safe.directory /workspaces/${localWorkspaceFolderBasename}",
+  "postCreateCommand": "sudo chown -R node:node /home/node/.codex && chmod 700 /home/node/.codex && git config --global --add safe.directory /workspaces/${localWorkspaceFolderBasename} && npm install && npx playwright install --with-deps chromium webkit",
   "customizations": {
     "vscode": {
       "extensions": [
