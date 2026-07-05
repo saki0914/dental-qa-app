@@ -1,0 +1,10 @@
+{
+  "name": "dental-qa-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Static dental Q&A learning app development helpers.",
+  "scripts": {
+    "dev": "http-server . -a 0.0.0.0 -p 3000 -c-1",
+    "check": "node -e \"const fs=require('fs'); JSON.parse(fs.readFileSync('package.json','utf8')); JSON.parse(fs.readFileSync('.devcontainer/devcontainer.json','utf8')); const html=fs.readFileSync('index.html','utf8'); const start='<script type=\\\"module\\\">'; const open=html.indexOf(start); const close=html.lastIndexOf('</script>'); if(open<0||close<0||close<=open) throw new Error('module script not found'); const script=html.slice(open+start.length, close); require('child_process').execFileSync(process.execPath,['--check','--input-type=module'],{input:script,stdio:['pipe','inherit','inherit']}); console.log('check OK');\""
+  }
+}

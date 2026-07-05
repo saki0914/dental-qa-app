@@ -54,3 +54,54 @@ GitHub Pages などに `index.html` を置けば使えます。
 - iPadで家で書いて判定
 - 苦手だけ復習で弱点潰し
 - 問題管理画面で教科書ベースの問題を追加
+
+## Dev Container での開発
+
+このリポジトリには、macOS + Rancher Desktop + VS Code Dev Containers 向けの開発環境を同梱しています。
+
+### 必要なもの
+
+- Rancher Desktop
+- VS Code
+- VS Code Dev Containers 拡張機能
+
+### 開き方
+
+1. Rancher Desktop を起動します。
+2. VS Code でこのプロジェクトフォルダを開きます。
+3. Command + Shift + P を押します。
+4. `Dev Containers: Rebuild and Reopen in Container` を選びます。
+5. コンテナ内ターミナルで次を確認します。
+
+```bash
+git --version
+node --version
+npm --version
+codex --version
+```
+
+### ローカル表示
+
+Dev Container 内で次を実行します。
+
+```bash
+npm run dev
+```
+
+VS Code が転送する `http://localhost:3000` をMac側ブラウザで開きます。Firebase Authentication の制約を避けるため、`file://` ではなくHTTP経由で確認してください。
+
+### Codex CLI
+
+Codex CLI はDev Containerイメージのビルド時にnpmから導入します。初回はコンテナ内で次を実行し、画面の案内に従ってログインします。
+
+```bash
+codex
+```
+
+Codex の認証情報はコンテナ専用のDocker Volumeに保存されます。Mac側の `~/.codex`、`~/.ssh`、ホームディレクトリ全体はDev Containerへマウントしていません。
+
+### 注意
+
+- 開発サーバーはポート3000だけを転送します。
+- Firebase本番データに対する追加、更新、削除の操作は、内容を確認してから実行してください。
+- Dev Containerを作り直してもCodex認証用Volumeは残ります。完全に消したい場合は、Docker Volume `dental-qa-app-codex` を削除します。
