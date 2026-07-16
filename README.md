@@ -26,8 +26,16 @@ Firebase で **Email/Password** を ON にしてください。
 ### 3. Firestore を有効化する
 Cloud Firestore を作成してください。
 
-### 4. Firestore ルールを反映する
-同梱の `firestore.rules` を使ってください。
+### 4. Firebase ルールを反映する
+同梱の `firestore.rules` と `storage.rules` を使ってください。Storageは `users/{uid}/...` 配下を、そのユーザー本人だけが読み書きできる設定です。
+
+Firebase CLIで反映する場合は、プロジェクトルートで次を実行します。
+
+```bash
+firebase deploy --only firestore:rules,storage
+```
+
+Cloud Storage for Firebaseを利用するには、FirebaseプロジェクトのBlazeプランと有効な請求先アカウントも必要です。課金アカウントが無効な場合、保存済み画像を含むStorageアクセスが402または403で失敗します。
 
 ### 5. 公開する
 GitHub Pages などに `index.html` を置けば使えます。

@@ -15,7 +15,7 @@
       iPhone版は「見て覚える」、iPad版は「書いて判定する」形式です。<br>
       問題管理、苦手復習、教科別進捗、Firebaseログイン連携までまとめています。
     </div>
-    <div class="sub" id="appVersionLabel">画像マスク改善版 v10.58（問題管理タグ出力カンマ修正）</div>
+    <div class="sub" id="appVersionLabel">画像マスク改善版 v10.59（Storageエラー診断改善）</div>
     <div class="banner" id="cloudStatus">Firebase接続を確認中です...</div>
   </div>
 
@@ -357,7 +357,7 @@ const firebaseConfig = {
   measurementId: "G-S9QQKJ93CR"
 };
 
-const APP_VERSION = "画像マスク改善版 v10.58（問題管理タグ出力カンマ修正）";
+const APP_VERSION = "画像マスク改善版 v10.59（Storageエラー診断改善）";
 
 
 let app = null;
@@ -3649,13 +3649,58 @@ function getSavedPdfPageImageUrl(page) {
   return page.imageUrl || page.url || page.downloadUrl || page.src || "";
 }
 
+function getPdfPageImagePath(page) {
+  if (!page) return "";
+  return page.imagePath || page.path || page.storagePath || "";
+}
+
+function classifyStorageError(error) {
+  const code = String(error?.code || "");
+  const details = [
+    code,
+    error?.message,
+    error?.customData?.serverResponse
+  ].filter(Boolean).join(" ");
+
+  if (/quota-exceeded|UserProjectAccountProblem|Spark pricing|billing account|Cloud Storage for Firebase no longer supports/i.test(details)) {
+    return "billing";
+  }
+  if (code === "storage/unauthorized") return "unauthorized";
+  if (code === "storage/object-not-found") return "not-found";
+  if (code === "storage/retry-limit-exceeded") return "retry-limit";
+  return code ? "storage-error" : "image-error";
+}
+
+function getPdfImageLoadFailureMessage(category, pageNumber) {
+  const prefix = `${Number(pageNumber || 1)}ページの画像を表示できません。`;
+
+  if (category === "billing") {
+    return prefix + " Firebase Storageの課金状態を確認してください。Blazeプランまたは請求先アカウントが無効な可能性があります。";
+  }
+  if (category === "unauthorized") {
+    return prefix + " Firebase Storageルールによりアクセスが拒否されました。ログイン状態とStorageルールを確認してください。";
+  }
+  if (category === "not-found") {
+    return prefix + " Storage上に画像ファイルが見つかりません。ファイルが削除されていないか確認してください。";
+  }
+  if (category === "retry-limit") {
+    return prefix + " Storageとの通信がタイムアウトしました。通信環境を確認して再読み込みしてください。";
+  }
+  if (category === "storage-error") {
+    return prefix + " Firebase StorageからURLを取得できません。Storageの設定とブラウザのコンソールを確認してください。";
+  }
+  return prefix + " 画像URLへのアクセスに失敗しました。Storageの課金状態、ファイルの存在、権限を確認してください。";
+}
+
 async function resolvePdfPageImageUrl(pdf, page) {
   if (!page) return "";
 
-  if (storage && page.imagePath) {
-    const refObj = storageRef(storage, page.imagePath);
+  const imagePath = getPdfPageImagePath(page);
+  if (storage && imagePath) {
+    const refObj = storageRef(storage, imagePath);
     const freshUrl = await getDownloadURL(refObj);
 
+    page.imagePath = imagePath;
     page.imageUrl = freshUrl;
     page.url = freshUrl;
 
@@ -3663,6 +3708,7 @@ async function resolvePdfPageImageUrl(pdf, page) {
     if (material && Array.isArray(material.pages)) {
       const targetPage = material.pages.find(item => String(item.page) === String(page.page));
       if (targetPage) {
+        targetPage.imagePath = imagePath;
         targetPage.imageUrl = freshUrl;
         targetPage.url = freshUrl;
       }
@@ -3682,10 +3728,13 @@ async function setPdfImageSource(img, pdf, page) {
       throw new Error("画像URLが空です。");
     }
 
+    img.dataset.storageErrorCategory = "";
     img.src = src;
     autoSaveToCloud();
   } catch (error) {
     console.error(error);
+    const category = classifyStorageError(error);
+    img.dataset.storageErrorCategory = category;
 
     const fallback = getSavedPdfPageImageUrl(page);
     if (fallback) {
@@ -3694,7 +3743,7 @@ async function setPdfImageSource(img, pdf, page) {
     }
 
     img.alt = "画像URLを取得できません";
-    setPdfStatus("画像URLを取得できません。Storageのファイル存在・権限を確認してください。");
+    setPdfStatus(getPdfImageLoadFailureMessage(category, page.page));
   }
 }
 
@@ -3766,9 +3815,8 @@ function renderPdfViewer(preserveScroll = false) {
       img.addEventListener("load", onLoadImage, { once: true });
 
       img.addEventListener("error", () => {
-        setPdfStatus(
-          "画像の読み込みに失敗しました。Storage上の画像が0バイト、または権限/URLに問題がある可能性があります。"
-        );
+        const category = img.dataset.storageErrorCategory || "image-error";
+        setPdfStatus(getPdfImageLoadFailureMessage(category, pageNumber));
       });
 
       pageWrap.appendChild(img);
