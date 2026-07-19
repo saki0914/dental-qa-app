@@ -269,6 +269,75 @@
       gap:10px;
       margin-bottom:12px;
     }
+    .image-memory-mode-switch{
+      display:grid;
+      grid-template-columns:repeat(2,minmax(0,1fr));
+      width:min(100%,420px);
+      gap:0;
+      margin:14px 0;
+      border:1px solid var(--line);
+      border-radius:8px;
+      overflow:hidden;
+      background:#fff;
+    }
+    .image-memory-mode-btn{
+      min-height:46px;
+      border:0;
+      border-right:1px solid var(--line);
+      background:#fff;
+      color:var(--text);
+      font-size:15px;
+      font-weight:700;
+      cursor:pointer;
+    }
+    .image-memory-mode-btn:last-child{border-right:0}
+    .image-memory-mode-btn.active{
+      background:var(--accent);
+      color:#fff;
+    }
+    .image-memory-view{min-width:0}
+    .pdf-editor-fields{
+      display:grid;
+      grid-template-columns:repeat(2,minmax(0,1fr));
+      gap:10px;
+    }
+    .pdf-editor-actions{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:10px;
+      margin:12px 0;
+    }
+    .pdf-edit-preview{
+      display:flex;
+      flex-direction:column;
+      gap:12px;
+      align-items:center;
+      min-height:120px;
+      max-height:58vh;
+      overflow:auto;
+      padding:12px;
+      border:1px solid var(--line);
+      border-radius:8px;
+      background:#f8fafc;
+    }
+    .pdf-edit-preview-page{
+      width:min(100%,920px);
+      border:1px solid var(--line);
+      border-radius:8px;
+      background:#fff;
+      overflow:hidden;
+    }
+    .pdf-edit-preview-page img{
+      display:block;
+      width:100%;
+      height:auto;
+    }
+    .pdf-material-meta{
+      margin-top:4px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.5;
+    }
     .pdf-mask-toolbar{
       display:grid;
       grid-template-columns:repeat(6,1fr);
@@ -441,6 +510,9 @@
       .grid2,.grid3,.grid4,.stats,.pdf-toolbar,.pdf-mask-toolbar{grid-template-columns:1fr}
       .question{font-size:26px}
       .pdf-viewer{max-height:68vh;padding:8px}
+      .pdf-editor-fields,
+      .pdf-editor-actions{grid-template-columns:1fr}
+      .image-memory-mode-switch{width:100%}
     }
 
     .pdf-mask-sticky-panel{

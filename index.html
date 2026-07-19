@@ -263,75 +263,132 @@
       <div class="banner hidden" id="pdfLockBanner">ログインすると画像暗記が使えます。</div>
       <h2>画像暗記</h2>
       <div class="sub">
-        PDFまたは画像を登録し、覚えたい部分を黒い四角で隠せます。PDFは欠けにくい設定でページごとの画像に変換して保存します。隠した部分をタッチすると表示され、確認済み状態がクラウド保存されます。<br>
-        「できる」「まだ」などの進捗とは別管理です。
+        教材を選んで画像上の隠し範囲を学習できます。教材の追加・更新・削除は「教材編集」で行います。
       </div>
 
-      <div class="pdf-toolbar">
-        <input id="pdfTitleInput" placeholder="教材タイトル 例: 歯科診療補助 第1章">
-        <input id="pdfFileInput" type="file" accept="application/pdf,image/*" multiple>
-        <button class="btn primary" id="addPdfBtn" type="button">PDF/画像追加</button>
-        <button class="btn soft" id="updatePdfBtn" type="button">教材更新</button>
-        <button class="btn ng" id="deletePdfBtn" type="button">教材削除</button>
+      <div class="image-memory-mode-switch" role="group" aria-label="画像暗記の表示切り替え">
+        <button class="image-memory-mode-btn active" id="pdfStudyModeBtn" type="button" aria-pressed="true">学習</button>
+        <button class="image-memory-mode-btn" id="pdfEditModeBtn" type="button" aria-pressed="false">教材編集</button>
       </div>
 
-      <div class="table-wrap" style="margin-top:12px;">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:42%;">画像教材</th>
-              <th style="width:16%;">隠し数</th>
-              <th style="width:16%;">確認済み</th>
-              <th>画像</th>
-            </tr>
-          </thead>
-          <tbody id="pdfTableBody"></tbody>
-        </table>
-      </div>
-
-      <div class="pdf-mask-sticky-panel" id="pdfMaskManagementPanel">
-        <h3>隠し範囲の管理</h3>
-        <div class="sub">
-          画像教材を選んでから「隠し範囲をドラッグ追加」を押し、画像上で隠したい場所を指やマウスでなぞってください。<br>
-          位置を細かく直したい場合は、下の数値を更新します。x/y/幅/高さは画像ページに対する割合です。
+      <div id="pdfStudyView" class="image-memory-view">
+        <div class="study-filter-grid pdf-filter-grid">
+          <label class="field-group">
+            <span>教材を検索</span>
+            <input id="pdfSearchInput" placeholder="教材名・教科・カテゴリ">
+          </label>
+          <label class="field-group">
+            <span>教科</span>
+            <select id="pdfSubjectFilterSelect"><option value="all">すべての教科</option></select>
+          </label>
+          <label class="field-group">
+            <span>カテゴリ</span>
+            <select id="pdfCategoryFilterSelect"><option value="">すべてのカテゴリ</option></select>
+          </label>
         </div>
-        <div class="pdf-mask-toolbar">
-          <input id="maskPageInput" type="number" min="1" placeholder="ページ">
-          <input id="maskXInput" type="number" min="0" max="100" step="0.1" placeholder="x %">
-          <input id="maskYInput" type="number" min="0" max="100" step="0.1" placeholder="y %">
-          <input id="maskWInput" type="number" min="0.1" max="100" step="0.1" placeholder="幅 %">
-          <input id="maskHInput" type="number" min="0.1" max="100" step="0.1" placeholder="高さ %">
-          <button class="btn soft" id="updateMaskBtn" type="button">隠し更新</button>
+
+        <div class="table-wrap" style="margin-top:12px;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:42%;">画像教材</th>
+                <th style="width:16%;">隠し数</th>
+                <th style="width:16%;">確認済み</th>
+                <th>画像</th>
+              </tr>
+            </thead>
+            <tbody id="pdfTableBody"></tbody>
+          </table>
         </div>
-        <div class="grid4 pdf-mask-compact-actions">
-          <button class="btn primary" id="addMaskModeBtn" type="button" title="隠し範囲をドラッグ追加">➕</button>
-          <button class="btn soft" id="selectAllMasksBtn" type="button" title="マスクを全選択">☑️</button>
-          <button class="btn warn" id="markWeakMaskBtn" type="button" title="選択した隠し範囲の苦手色を切り替え">!</button>
-          <button class="btn ok" id="showAllMasksBtn" type="button" title="マスクを全表示">👁️</button>
-          <button class="btn" id="clearMaskSelectionBtn" type="button" title="選択解除">✖️</button>
-          <button class="btn warn" id="resetPdfRevealBtn" type="button" title="表示状態リセット">↩️</button>
-          <button class="btn ng" id="deleteMaskBtn" type="button" title="隠し削除">🗑️</button>
+
+        <div id="pdfViewerArea" class="pdf-viewer" style="margin-top:12px;"></div>
+
+        <div class="pdf-mask-sticky-panel" id="pdfMaskManagementPanel">
+          <h3>隠し範囲の管理</h3>
+          <div class="sub">
+            画像教材を選んでから「隠し範囲をドラッグ追加」を押し、画像上で隠したい場所を指やマウスでなぞってください。<br>
+            位置を細かく直したい場合は、下の数値を更新します。x/y/幅/高さは画像ページに対する割合です。
+          </div>
+          <div class="pdf-mask-toolbar">
+            <input id="maskPageInput" type="number" min="1" placeholder="ページ">
+            <input id="maskXInput" type="number" min="0" max="100" step="0.1" placeholder="x %">
+            <input id="maskYInput" type="number" min="0" max="100" step="0.1" placeholder="y %">
+            <input id="maskWInput" type="number" min="0.1" max="100" step="0.1" placeholder="幅 %">
+            <input id="maskHInput" type="number" min="0.1" max="100" step="0.1" placeholder="高さ %">
+            <button class="btn soft" id="updateMaskBtn" type="button">隠し更新</button>
+          </div>
+          <div class="grid4 pdf-mask-compact-actions">
+            <button class="btn primary" id="addMaskModeBtn" type="button" title="隠し範囲をドラッグ追加">➕</button>
+            <button class="btn soft" id="selectAllMasksBtn" type="button" title="マスクを全選択">☑️</button>
+            <button class="btn warn" id="markWeakMaskBtn" type="button" title="選択した隠し範囲の苦手色を切り替え">!</button>
+            <button class="btn ok" id="showAllMasksBtn" type="button" title="マスクを全表示">👁️</button>
+            <button class="btn" id="clearMaskSelectionBtn" type="button" title="選択解除">✖️</button>
+            <button class="btn warn" id="resetPdfRevealBtn" type="button" title="表示状態リセット">↩️</button>
+            <button class="btn ng" id="deleteMaskBtn" type="button" title="隠し削除">🗑️</button>
+          </div>
+          <div class="pdf-status" id="pdfStatus" style="margin-top:10px;">画像教材を追加または選択してください。</div>
         </div>
-        <div class="pdf-status" id="pdfStatus" style="margin-top:10px;">画像教材を追加または選択してください。</div>
+
+        <div class="table-wrap pdf-mask-table-wrap" style="margin-top:12px;">
+          <table>
+            <thead>
+              <tr>
+                <th>ページ</th>
+                <th>x</th>
+                <th>y</th>
+                <th>幅</th>
+                <th>高さ</th>
+                <th>状態</th>
+              </tr>
+            </thead>
+            <tbody id="pdfMaskTableBody"></tbody>
+          </table>
+        </div>
       </div>
 
-      <div class="table-wrap pdf-mask-table-wrap" style="margin-top:12px;">
-        <table>
-          <thead>
-            <tr>
-              <th>ページ</th>
-              <th>x</th>
-              <th>y</th>
-              <th>幅</th>
-              <th>高さ</th>
-              <th>状態</th>
-            </tr>
-          </thead>
-          <tbody id="pdfMaskTableBody"></tbody>
-        </table>
-      </div>
+      <div id="pdfEditView" class="image-memory-view hidden">
+        <div class="pdf-editor-fields">
+          <label class="field-group">
+            <span>教材タイトル</span>
+            <input id="pdfTitleInput" placeholder="例: 歯科診療補助 第1章">
+          </label>
+          <label class="field-group">
+            <span>教科</span>
+            <input id="pdfSubjectInput" list="pdfSubjectOptions" placeholder="例: 歯科診療補助">
+            <datalist id="pdfSubjectOptions"></datalist>
+          </label>
+          <label class="field-group">
+            <span>カテゴリ</span>
+            <input id="pdfCategoryInput" list="pdfCategoryOptions" placeholder="複数は読点・カンマ区切り">
+            <datalist id="pdfCategoryOptions"></datalist>
+          </label>
+          <label class="field-group">
+            <span>PDF・画像</span>
+            <input id="pdfFileInput" type="file" accept="application/pdf,image/*" multiple>
+          </label>
+        </div>
+        <div class="pdf-editor-actions">
+          <button class="btn primary" id="addPdfBtn" type="button">教材追加</button>
+          <button class="btn soft" id="updatePdfBtn" type="button">教材更新</button>
+          <button class="btn ng" id="deletePdfBtn" type="button">教材削除</button>
+        </div>
+        <div class="pdf-status" id="pdfEditStatus">教材を選択するか、新しい教材を入力してください。</div>
 
-      <div id="pdfViewerArea" class="pdf-viewer" style="margin-top:12px;"></div>
+        <div class="table-wrap pdf-editor-table-wrap" style="margin-top:12px;">
+          <table>
+            <thead>
+              <tr>
+                <th>教材</th>
+                <th>教科</th>
+                <th>カテゴリ</th>
+                <th>画像</th>
+              </tr>
+            </thead>
+            <tbody id="pdfEditTableBody"></tbody>
+          </table>
+        </div>
+        <div id="pdfEditPreview" class="pdf-edit-preview" style="margin-top:12px;"></div>
+      </div>
     </div>
   </div>
 </div>

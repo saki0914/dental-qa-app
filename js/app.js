@@ -133,15 +133,29 @@ const el = {
   progressLockBanner: document.getElementById("progressLockBanner"),
   pdfLockBanner: document.getElementById("pdfLockBanner"),
   tabBtnPdf: document.getElementById("tabBtnPdf"),
+  pdfStudyModeBtn: document.getElementById("pdfStudyModeBtn"),
+  pdfEditModeBtn: document.getElementById("pdfEditModeBtn"),
+  pdfStudyView: document.getElementById("pdfStudyView"),
+  pdfEditView: document.getElementById("pdfEditView"),
+  pdfSearchInput: document.getElementById("pdfSearchInput"),
+  pdfSubjectFilterSelect: document.getElementById("pdfSubjectFilterSelect"),
+  pdfCategoryFilterSelect: document.getElementById("pdfCategoryFilterSelect"),
   pdfTitleInput: document.getElementById("pdfTitleInput"),
+  pdfSubjectInput: document.getElementById("pdfSubjectInput"),
+  pdfSubjectOptions: document.getElementById("pdfSubjectOptions"),
+  pdfCategoryInput: document.getElementById("pdfCategoryInput"),
+  pdfCategoryOptions: document.getElementById("pdfCategoryOptions"),
   pdfFileInput: document.getElementById("pdfFileInput"),
   addPdfBtn: document.getElementById("addPdfBtn"),
   updatePdfBtn: document.getElementById("updatePdfBtn"),
   deletePdfBtn: document.getElementById("deletePdfBtn"),
   pdfTableBody: document.getElementById("pdfTableBody"),
+  pdfEditTableBody: document.getElementById("pdfEditTableBody"),
+  pdfEditPreview: document.getElementById("pdfEditPreview"),
   pdfMaskTableBody: document.getElementById("pdfMaskTableBody"),
   pdfViewerArea: document.getElementById("pdfViewerArea"),
   pdfStatus: document.getElementById("pdfStatus"),
+  pdfEditStatus: document.getElementById("pdfEditStatus"),
   maskPageInput: document.getElementById("maskPageInput"),
   maskXInput: document.getElementById("maskXInput"),
   maskYInput: document.getElementById("maskYInput"),
@@ -184,6 +198,7 @@ const imageMemory = createImageMemory({
   el,
   getCurrentUser: () => currentUser,
   getStorage: () => storage,
+  getQuestionSubjects: () => getStudySubjects(allQuestions),
   requestAutoSave: options => autoSaveToCloud(options),
   requestSave: options => saveToCloud(options)
 });
@@ -192,10 +207,9 @@ function renderManageTable() { questionManager.render(); }
 function renderManageFilterUi() { questionManager.renderFilter(); }
 function resetBulkImportState() { questionManager.resetBulkImport(); }
 function renderPdfTable() { imageMemory.render(); }
-function renderPdfTagFilterSelect() { imageMemory.ensureFilterUi(); }
+function renderPdfFilterUi() { imageMemory.ensureFilterUi(); }
 function renderPdfMaskTable() { imageMemory.renderMasks(); }
 function renderPdfViewer(preserveScroll = false) { imageMemory.renderViewer(preserveScroll); }
-function ensurePdfTagUi() { imageMemory.ensureTagUi(); }
 
 
 function getCurrentQuestionAnswers(q) {
@@ -1139,7 +1153,8 @@ function updateLoginLockedUI() {
     "editSubject","searchInput","editQuestion","editAnswers","editExplanation","editOrderedAnswers","editImageFile","removeImageBtn","editImageName",
     "addBtn","updateBtn","deleteBtn","clearFormBtn","saveCloudBtn","loadCloudBtn","bulkImportFile","bulkImportImageFiles","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn","manageFullscreenBtn",
     "saveCloudBtn2","resetProgressBtn",
-    "pdfTitleInput","pdfFileInput","addPdfBtn","updatePdfBtn","deletePdfBtn",
+    "pdfStudyModeBtn","pdfEditModeBtn","pdfSearchInput","pdfSubjectFilterSelect","pdfCategoryFilterSelect",
+    "pdfTitleInput","pdfSubjectInput","pdfCategoryInput","pdfFileInput","addPdfBtn","updatePdfBtn","deletePdfBtn",
     "maskPageInput","maskXInput","maskYInput","maskWInput","maskHInput",
     "addMaskModeBtn","updateMaskBtn","deleteMaskBtn","clearMaskSelectionBtn","selectAllMasksBtn","markWeakMaskBtn","showAllMasksBtn","resetPdfRevealBtn"
   ], !loggedIn);
@@ -1268,7 +1283,9 @@ function buildSplitStates() {
       manageSubjectFilter: questionSettings.manageSubjectFilter,
       managePrimarySubcategory: questionSettings.managePrimarySubcategory,
       manageSelectedSubcategories: questionSettings.manageSelectedSubcategories,
-      pdfSelectedTagFilter: imageState.pdfSelectedTagFilter,
+      pdfSubjectFilter: imageState.pdfSubjectFilter,
+      pdfCategoryFilter: imageState.pdfCategoryFilter,
+      pdfViewMode: imageState.pdfViewMode,
       studyFilterVersion: "condition-groups-v3",
       schemaVersion: "split-v2",
       updatedAt: serverTimestamp()
@@ -1529,14 +1546,13 @@ function init() {
     try { renderProgressTable(); } catch (error) { console.error("renderProgressTable failed", error); }
     try { renderStudy(); } catch (error) { console.error("renderStudy failed", error); }
     try { renderPdfTable(); } catch (error) { console.error("renderPdfTable failed", error); }
-    try { renderPdfTagFilterSelect(); } catch (error) { console.error("renderPdfTagFilterSelect failed", error); }
+    try { renderPdfFilterUi(); } catch (error) { console.error("renderPdfFilterUi failed", error); }
     try { renderPdfMaskTable(); } catch (error) { console.error("renderPdfMaskTable failed", error); }
     try { renderPdfViewer(); } catch (error) { console.error("renderPdfViewer failed", error); }
     try { resetBulkImportState(); } catch (error) { console.error("resetBulkImportState failed", error); }
     try { updateLoginLockedUI(); } catch (error) { console.error("updateLoginLockedUI failed", error); }
     try { showTab("auth"); } catch (error) { console.error("showTab failed", error); }
     try { movePdfMaskManagementBelowViewer(); } catch (error) { console.error("movePdfMaskManagementBelowViewer failed", error); }
-    try { ensurePdfTagUi(); } catch (error) { console.error("ensurePdfTagUi failed", error); }
     if (el.forceResetStudyFiltersBtn) {
       el.forceResetStudyFiltersBtn.addEventListener("click", resetStudyFiltersToAll);
     }

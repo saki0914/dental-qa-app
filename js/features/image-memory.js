@@ -13,20 +13,30 @@ import {
   classifyStorageError,
   getPdfImageLoadFailureMessage
 } from "../core/storage-errors.js";
+import {
+  filterImageMemoryMaterials,
+  getImageMemoryCategories,
+  getImageMemorySubjects,
+  normalizeImageMaterial,
+  normalizeImageMemoryFilter
+} from "../core/image-memory-filters.js";
 
 export function createImageMemory(dependencies) {
   const {
     el,
     getCurrentUser,
     getStorage,
+    getQuestionSubjects = () => [],
     requestAutoSave,
     requestSave
   } = dependencies;
 
-  let pdfSelectedTagFilter = "";
   let pdfMaterials = [];
   let selectedPdfId = null;
   let pdfSearchQuery = "";
+  let pdfSubjectFilter = "all";
+  let pdfCategoryFilter = "";
+  let pdfViewMode = "study";
   let selectedMaskId = null;
   let selectedMaskIds = [];
   let pdfRevealStates = {};
@@ -53,6 +63,10 @@ function currentPdfMask() {
 
 function setPdfStatus(message) {
   if (el.pdfStatus) el.pdfStatus.textContent = message;
+}
+
+function setPdfEditStatus(message) {
+  if (el.pdfEditStatus) el.pdfEditStatus.textContent = message;
 }
 
 function getPdfRevealMap(pdfId) {
@@ -104,93 +118,102 @@ function fillPdfMaskForm(mask) {
 }
 
 
-function pdfTagsToText(tags) {
-  return normalizePdfTags(tags).join(",");
+function pdfCategoriesToText(categories) {
+  return normalizePdfTags(categories).join(",");
 }
 
-function ensurePdfTagUi() {
-  if (document.getElementById("pdfSearchInput")) return;
+function fillPdfEditorForm(pdf) {
+  if (el.pdfTitleInput) el.pdfTitleInput.value = pdf?.title || "";
+  if (el.pdfSubjectInput) el.pdfSubjectInput.value = pdf?.subject || "";
+  if (el.pdfCategoryInput) {
+    el.pdfCategoryInput.value = pdfCategoriesToText(pdf?.categories || pdf?.tags || []);
+  }
+  renderPdfEditorOptions();
+}
 
-  const toolbar = document.querySelector("#tab-pdf .pdf-toolbar");
-  if (!toolbar) return;
+function renderPdfEditorOptions() {
+  const subjects = [...new Set([
+    ...getQuestionSubjects(),
+    ...getImageMemorySubjects(pdfMaterials)
+  ].map(value => String(value || "").trim()).filter(Boolean))].sort();
+  if (el.pdfSubjectOptions) {
+    el.pdfSubjectOptions.innerHTML = subjects
+      .map(subject => `<option value="${escapeHtml(subject)}"></option>`)
+      .join("");
+  }
 
-  const box = document.createElement("div");
-  box.id = "pdfTagSearchBox";
-  box.innerHTML = `
-    <div class="study-filter-grid pdf-filter-grid">
-      <label class="field-group">
-        <span>教材を検索</span>
-        <input id="pdfSearchInput" placeholder="教材名・タグ名">
-      </label>
-      <label class="field-group">
-        <span>タグで絞り込み</span>
-        <select id="pdfTagFilterSelect"><option value="">すべてのタグ</option></select>
-      </label>
-    </div>
-    <label class="field-group pdf-tag-editor">
-      <span>選択中・新規教材のタグ</span>
-      <input id="pdfTagInput" placeholder="複数は読点・カンマ区切り">
-    </label>
-  `;
+  if (el.pdfCategoryOptions) {
+    const subject = String(el.pdfSubjectInput?.value || "").trim() || "all";
+    el.pdfCategoryOptions.innerHTML = getImageMemoryCategories(pdfMaterials, subject)
+      .map(category => `<option value="${escapeHtml(category)}"></option>`)
+      .join("");
+  }
+}
 
-  toolbar.insertAdjacentElement("afterend", box);
-
-  const searchInput = document.getElementById("pdfSearchInput");
-  searchInput.value = pdfSearchQuery || "";
-  searchInput.addEventListener("input", () => {
-    pdfSearchQuery = searchInput.value || "";
-    renderPdfTable();
+function renderPdfFilterUi() {
+  const normalized = normalizeImageMemoryFilter(pdfMaterials, {
+    subject: pdfSubjectFilter,
+    category: pdfCategoryFilter
   });
+  pdfSubjectFilter = normalized.subject;
+  pdfCategoryFilter = normalized.category;
 
-  document.getElementById("pdfTagFilterSelect").addEventListener("change", event => {
-    pdfSelectedTagFilter = event.currentTarget.value || "";
-    renderPdfTable();
-    requestAutoSave();
-  });
+  if (el.pdfSearchInput) el.pdfSearchInput.value = pdfSearchQuery;
+  if (el.pdfSubjectFilterSelect) {
+    el.pdfSubjectFilterSelect.innerHTML = '<option value="all">すべての教科</option>' +
+      getImageMemorySubjects(pdfMaterials)
+        .map(subject => `<option value="${escapeHtml(subject)}">${escapeHtml(subject)}</option>`)
+        .join("");
+    el.pdfSubjectFilterSelect.value = pdfSubjectFilter;
+  }
+  if (el.pdfCategoryFilterSelect) {
+    el.pdfCategoryFilterSelect.innerHTML = '<option value="">すべてのカテゴリ</option>' +
+      getImageMemoryCategories(pdfMaterials, pdfSubjectFilter)
+        .map(category => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`)
+        .join("");
+    el.pdfCategoryFilterSelect.value = pdfCategoryFilter;
+  }
+  renderPdfEditorOptions();
 }
 
-function getPdfTagInput() {
-  ensurePdfTagUi();
-  return document.getElementById("pdfTagInput");
+function renderPdfViewMode() {
+  const isStudy = pdfViewMode !== "edit";
+  el.pdfStudyView?.classList.toggle("hidden", !isStudy);
+  el.pdfEditView?.classList.toggle("hidden", isStudy);
+  el.pdfStudyModeBtn?.classList.toggle("active", isStudy);
+  el.pdfEditModeBtn?.classList.toggle("active", !isStudy);
+  el.pdfStudyModeBtn?.setAttribute("aria-pressed", String(isStudy));
+  el.pdfEditModeBtn?.setAttribute("aria-pressed", String(!isStudy));
 }
 
-function getPdfSearchInput() {
-  ensurePdfTagUi();
-  return document.getElementById("pdfSearchInput");
+function setPdfViewMode(mode, { save = true } = {}) {
+  pdfViewMode = mode === "edit" ? "edit" : "study";
+  renderPdfViewMode();
+  if (pdfViewMode === "edit") {
+    fillPdfEditorForm(currentPdfMaterial());
+    renderPdfEditPreview();
+  } else {
+    renderPdfViewer();
+  }
+  if (save) requestAutoSave();
 }
 
-function getAvailablePdfTags() {
-  return [...new Set(
-    pdfMaterials.flatMap(pdf => Array.isArray(pdf.tags) ? pdf.tags : []).filter(Boolean)
-  )].sort();
-}
-
-function getFilteredPdfMaterials() {
-  const query = (pdfSearchQuery || "").trim().toLowerCase();
-
-  return pdfMaterials.filter(pdf => {
-    const tags = Array.isArray(pdf.tags) ? pdf.tags : [];
-    const searchText = [
-      pdf.title || "",
-      pdf.pdfName || "",
-      pdf.sourceName || "",
-      tags.join(" ")
-    ].join(" ").toLowerCase();
-
-    const matchesQuery = !query || searchText.includes(query);
-    const matchesTag = !pdfSelectedTagFilter || tags.includes(pdfSelectedTagFilter);
-    return matchesQuery && matchesTag;
-  });
-}
-
-function renderPdfTagFilterSelect() {
-  ensurePdfTagUi();
-  const select = document.getElementById("pdfTagFilterSelect");
-  if (!select) return;
-  const tags = getAvailablePdfTags();
-  if (pdfSelectedTagFilter && !tags.includes(pdfSelectedTagFilter)) pdfSelectedTagFilter = "";
-  select.innerHTML = `<option value="">すべてのタグ</option>` +
-    tags.map(tag => `<option value="${escapeHtml(tag)}" ${tag === pdfSelectedTagFilter ? "selected" : ""}>${escapeHtml(tag)}</option>`).join("");
+function selectPdfMaterial(pdfId) {
+  selectedPdfId = pdfId;
+  selectedMaskId = null;
+  selectedMaskIds = [];
+  pdfAddMaskMode = false;
+  if (el.pdfViewerArea) el.pdfViewerArea.classList.remove("is-add-mask-mode");
+  fillPdfEditorForm(currentPdfMaterial());
+  fillPdfMaskForm(null);
+  renderPdfTable();
+  renderPdfMaskTable();
+  if (pdfViewMode === "edit") {
+    renderPdfEditPreview();
+  } else {
+    renderPdfViewer();
+  }
+  requestAutoSave();
 }
 
 
@@ -211,55 +234,56 @@ function renderPdfTagFilterSelect() {
 
 
 function renderPdfTable() {
-  if (!el.pdfTableBody) return;
+  renderPdfFilterUi();
+  renderPdfViewMode();
 
-  ensurePdfTagUi();
-  renderPdfTagFilterSelect();
-  const filteredMaterials = getFilteredPdfMaterials();
+  const filteredMaterials = filterImageMemoryMaterials(pdfMaterials, {
+    query: pdfSearchQuery,
+    subject: pdfSubjectFilter,
+    category: pdfCategoryFilter
+  });
 
-  if (!filteredMaterials.length) {
-    el.pdfTableBody.innerHTML = '<tr><td colspan="4">該当する画像教材がありません。</td></tr>';
-    return;
+  if (el.pdfTableBody) {
+    el.pdfTableBody.innerHTML = filteredMaterials.length
+      ? filteredMaterials.map(pdf => {
+          const revealMap = getPdfRevealMap(pdf.id);
+          const masks = Array.isArray(pdf.masks) ? pdf.masks : [];
+          const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
+          const revealed = masks.filter(mask => revealMap[mask.id]).length;
+          const fileLabel = pages.length ? `${pages.length}枚` : (pdf.pdfName || "旧PDF");
+          const detail = [pdf.subject, ...pdf.categories].filter(Boolean).join(" / ");
+          return `
+            <tr class="${selectedPdfId === pdf.id ? "selected" : ""}" data-pdf-id="${escapeHtml(pdf.id)}">
+              <td>${escapeHtml(pdf.title || "無題教材")}<div class="pdf-material-meta">${escapeHtml(detail)}</div></td>
+              <td>${masks.length}</td>
+              <td>${revealed}</td>
+              <td>${escapeHtml(fileLabel)}</td>
+            </tr>
+          `;
+        }).join("")
+      : '<tr><td colspan="4">該当する画像教材がありません。</td></tr>';
   }
 
-  el.pdfTableBody.innerHTML = filteredMaterials.map(pdf => {
-    const revealMap = getPdfRevealMap(pdf.id);
-    const masks = Array.isArray(pdf.masks) ? pdf.masks : [];
-    const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
-    const revealed = masks.filter(mask => revealMap[mask.id]).length;
-    const fileLabel = pages.length
-      ? `${pages.length}枚`
-      : (pdf.pdfName || "旧PDF");
-    const tags = normalizePdfTags(pdf.tags || []);
-    const tagHtml = tags.length
-      ? `<div style="font-size:12px;color:#6b7280;margin-top:4px;">${escapeHtml(tags.join(" / "))}</div>`
-      : "";
-    return `
-      <tr class="${selectedPdfId === pdf.id ? "selected" : ""}" data-pdf-id="${pdf.id}">
-        <td>${escapeHtml(pdf.title || "無題教材")}${tagHtml}</td>
-        <td>${masks.length}</td>
-        <td>${revealed}</td>
-        <td>${escapeHtml(fileLabel)}</td>
-      </tr>
-    `;
-  }).join("");
+  if (el.pdfEditTableBody) {
+    el.pdfEditTableBody.innerHTML = pdfMaterials.length
+      ? pdfMaterials.map(rawPdf => {
+          const pdf = normalizeImageMaterial(rawPdf);
+          const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
+          return `
+            <tr class="${selectedPdfId === pdf.id ? "selected" : ""}" data-pdf-id="${escapeHtml(pdf.id)}">
+              <td>${escapeHtml(pdf.title || "無題教材")}</td>
+              <td>${escapeHtml(pdf.subject)}</td>
+              <td>${escapeHtml(pdf.categories.join(" / ") || "未登録")}</td>
+              <td>${pages.length ? `${pages.length}枚` : "旧PDF"}</td>
+            </tr>
+          `;
+        }).join("")
+      : '<tr><td colspan="4">画像教材がありません。</td></tr>';
+  }
 
-  [...el.pdfTableBody.querySelectorAll("tr[data-pdf-id]")].forEach(row => {
-    row.addEventListener("click", () => {
-      selectedPdfId = row.dataset.pdfId;
-      selectedMaskId = null;
-      selectedMaskIds = [];
-      pdfAddMaskMode = false;
-      if (el.pdfViewerArea) el.pdfViewerArea.classList.remove("is-add-mask-mode");
-      const pdf = currentPdfMaterial();
-      el.pdfTitleInput.value = pdf?.title || "";
-      const tagInput = getPdfTagInput();
-      if (tagInput) tagInput.value = pdfTagsToText(pdf?.tags || []);
-      fillPdfMaskForm(null);
-      renderPdfTable();
-      renderPdfMaskTable();
-      renderPdfViewer();
-      requestAutoSave();
+  [el.pdfTableBody, el.pdfEditTableBody].filter(Boolean).forEach(body => {
+    [...body.querySelectorAll("tr[data-pdf-id]")].forEach(row => {
+      row.addEventListener("click", () => selectPdfMaterial(row.dataset.pdfId));
     });
   });
 }
@@ -478,117 +502,205 @@ function isImageFile(file) {
   return !!file && (!!file.type?.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(file.name || ""));
 }
 
+function readPdfEditorMetadata() {
+  const title = String(el.pdfTitleInput?.value || "").trim();
+  const subject = String(el.pdfSubjectInput?.value || "").trim();
+  const categories = normalizePdfTags(textToTagList(el.pdfCategoryInput?.value || ""));
+
+  if (!title) {
+    alert("教材タイトルを入力してください。");
+    return null;
+  }
+  if (!subject) {
+    alert("教科を入力してください。");
+    return null;
+  }
+  if (!categories.length) {
+    alert("カテゴリを1件以上入力してください。");
+    return null;
+  }
+
+  return { title, subject, categories, tags: categories };
+}
+
+async function prepareAndUploadPdfPages(pdfId, selectedFiles) {
+  const pdfFiles = selectedFiles.filter(isPdfFile);
+  const imageFiles = selectedFiles.filter(isImageFile);
+
+  if (pdfFiles.length + imageFiles.length !== selectedFiles.length) {
+    throw new Error("PDF、PNG、JPEG、WebPのいずれかを選んでください。");
+  }
+  if (pdfFiles.length && imageFiles.length) {
+    throw new Error("PDFと画像は同時に登録できません。PDFだけ、または画像だけを選んでください。");
+  }
+  if (pdfFiles.length > 1) {
+    throw new Error("PDFは1ファイルずつ登録してください。複数ページPDFは自動でページごとに画像化されます。");
+  }
+
+  let filesToUpload = imageFiles;
+  if (pdfFiles.length === 1) {
+    const pdfFile = pdfFiles[0];
+    setPdfEditStatus("PDFを画像に変換しています...");
+    filesToUpload = await convertPdfToImageFiles(pdfFile, (page, total, stage) => {
+      if (stage === "converting") {
+        setPdfEditStatus(`PDFを画像に変換しています... ${page}/${total}ページ`);
+      }
+    });
+  }
+
+  if (!filesToUpload.length) {
+    throw new Error("PDFまたは画像から登録用画像を作成できませんでした。");
+  }
+
+  const pages = [];
+  try {
+    setPdfEditStatus(`画像をアップロードしています... 0/${filesToUpload.length}`);
+    for (let index = 0; index < filesToUpload.length; index++) {
+      const pageNumber = index + 1;
+      const meta = await uploadPdfFile(pdfId, filesToUpload[index], pageNumber);
+      pages.push({ page: pageNumber, ...meta });
+      setPdfEditStatus(`画像をアップロードしています... ${pageNumber}/${filesToUpload.length}`);
+    }
+  } catch (error) {
+    await Promise.all(pages.map(page => deletePdfFileByPath(page.imagePath)));
+    throw error;
+  }
+
+  return {
+    pages,
+    sourceType: pdfFiles.length === 1 ? "pdf-converted" : "images",
+    sourceName: pdfFiles.length === 1 ? pdfFiles[0].name : ""
+  };
+}
+
 
 async function addPdfMaterial() {
   if (!getCurrentUser()) return;
 
-  ensurePdfTagUi();
-  const title = el.pdfTitleInput.value.trim();
-  const tagInput = getPdfTagInput();
-  const tags = normalizePdfTags(textToTagList(tagInput ? tagInput.value : ""));
+  const metadata = readPdfEditorMetadata();
+  if (!metadata) return;
   const selectedFiles = Array.from(el.pdfFileInput.files || []);
-
-  if (!title) {
-    alert("教材タイトルを入力してください。");
-    return;
-  }
   if (!selectedFiles.length) {
     alert("PDFまたは画像ファイルを選んでください。");
     return;
   }
 
-  const pdfFiles = selectedFiles.filter(file => file.type === "application/pdf" || /\.pdf$/i.test(file.name));
-  const imageFiles = selectedFiles.filter(file => file.type.startsWith("image/") || /\.(jpg|jpeg|png|webp)$/i.test(file.name));
-
-  if (pdfFiles.length && imageFiles.length) {
-    alert("PDFと画像は同時に登録できません。PDFだけ、または画像だけを選んでください。");
-    return;
-  }
-  if (pdfFiles.length > 1) {
-    alert("PDFは1ファイルずつ登録してください。複数ページPDFは自動でページごとに画像化されます。");
-    return;
-  }
-
   const pdfId = crypto.randomUUID();
-  let filesToUpload = [];
+  let uploadResult = null;
+  let added = false;
 
   try {
-    if (pdfFiles.length === 1) {
-      const pdfFile = pdfFiles[0];
-      setPdfStatus("PDFを画像に変換しています...");
-
-      filesToUpload = await convertPdfToImageFiles(pdfFile, (page, total, stage) => {
-        if (stage === "converting") {
-          setPdfStatus(`PDFを画像に変換しています... ${page}/${total}ページ`);
-        }
-      });
-
-      if (!filesToUpload.length) {
-        alert("PDFから画像を作成できませんでした。");
-        setPdfStatus("PDFから画像を作成できませんでした。");
-        return;
-      }
-    } else {
-      filesToUpload = imageFiles;
-    }
-
-    setPdfStatus(`画像をアップロードしています... 0/${filesToUpload.length}`);
-
-    const pages = [];
-    for (let index = 0; index < filesToUpload.length; index++) {
-      const pageNumber = index + 1;
-      const meta = await uploadPdfFile(pdfId, filesToUpload[index], pageNumber);
-      pages.push({ page: pageNumber, ...meta });
-      setPdfStatus(`画像をアップロードしています... ${pageNumber}/${filesToUpload.length}`);
-    }
-
-    pdfMaterials.push({
+    uploadResult = await prepareAndUploadPdfPages(pdfId, selectedFiles);
+    pdfMaterials.push(normalizeImageMaterial({
       id: pdfId,
-      title,
-      pages,
+      ...metadata,
+      ...uploadResult,
       masks: [],
-      tags,
-      sourceType: pdfFiles.length === 1 ? "pdf-converted" : "images",
-      sourceName: pdfFiles.length === 1 ? pdfFiles[0].name : ""
-    });
+    }));
+    added = true;
 
     selectedPdfId = pdfId;
     selectedMaskId = null;
     el.pdfFileInput.value = "";
     renderPdfTable();
     renderPdfMaskTable();
-    renderPdfViewer();
-    setPdfStatus("教材を追加しました。PDFは画像として保存済みです。隠したい範囲をドラッグで追加できます。");
-    requestAutoSave();
+    renderPdfEditPreview();
+    const saved = await requestSave({ showAlerts: true });
+    if (!saved) throw new Error("教材データをクラウド保存できませんでした。");
+    setPdfEditStatus("教材を追加しました。");
   } catch (error) {
+    if (added) pdfMaterials = pdfMaterials.filter(pdf => pdf.id !== pdfId);
+    if (uploadResult?.pages?.length) {
+      await Promise.all(uploadResult.pages.map(page => deletePdfFileByPath(page.imagePath)));
+    }
+    selectedPdfId = pdfMaterials[0]?.id || null;
+    renderPdfTable();
+    renderPdfMaskTable();
+    renderPdfEditPreview();
     console.error(error);
-    setPdfStatus("教材追加に失敗しました。\n" + (error.message || error));
+    setPdfEditStatus("教材追加に失敗しました。\n" + (error.message || error));
     alert("教材追加に失敗しました。\n\n" + (error.message || error));
   }
 }
 
-function updatePdfMaterialTitle() {
+async function updatePdfMaterial() {
   if (!getCurrentUser()) return;
   const pdf = currentPdfMaterial();
   if (!pdf) {
     alert("更新したい画像教材を選択してください。");
     return;
   }
-  const title = el.pdfTitleInput.value.trim();
-  if (!title) {
-    alert("画像教材タイトルを入力してください。");
+  const metadata = readPdfEditorMetadata();
+  if (!metadata) return;
+  const selectedFiles = Array.from(el.pdfFileInput.files || []);
+
+  if (!selectedFiles.length) {
+    Object.assign(pdf, metadata);
+    renderPdfTable();
+    setPdfEditStatus("教材情報を更新しました。");
+    requestAutoSave();
     return;
   }
 
-  ensurePdfTagUi();
-  const tagInput = getPdfTagInput();
+  const masks = Array.isArray(pdf.masks) ? pdf.masks : [];
+  if (masks.length && !confirm(
+    `画像を差し替えると、位置が合わなくなるため${masks.length}件の隠し範囲を削除します。\n\n画像を差し替えますか？`
+  )) return;
 
-  pdf.title = title;
-  pdf.tags = normalizePdfTags(textToTagList(tagInput ? tagInput.value : ""));
+  const previous = {
+    title: pdf.title,
+    subject: pdf.subject,
+    categories: pdf.categories,
+    tags: pdf.tags,
+    pages: pdf.pages,
+    masks: pdf.masks,
+    sourceType: pdf.sourceType,
+    sourceName: pdf.sourceName,
+    pdfUrl: pdf.pdfUrl,
+    pdfName: pdf.pdfName,
+    revealState: pdfRevealStates[pdf.id]
+  };
+  let uploadResult = null;
 
-  renderPdfTable();
-  setPdfStatus("画像教材タイトルとタグを更新しました。");
-  requestAutoSave();
+  try {
+    uploadResult = await prepareAndUploadPdfPages(pdf.id, selectedFiles);
+    Object.assign(pdf, metadata, uploadResult, { masks: [], pdfUrl: "", pdfName: "" });
+    pdfRevealStates[pdf.id] = {};
+    selectedMaskId = null;
+    selectedMaskIds = [];
+    el.pdfFileInput.value = "";
+    renderPdfTable();
+    renderPdfMaskTable();
+    renderPdfEditPreview();
+
+    const saved = await requestSave({ showAlerts: true });
+    if (!saved) throw new Error("更新した教材データをクラウド保存できませんでした。");
+    await Promise.all((previous.pages || []).map(page => deletePdfFileByPath(getPdfPageImagePath(page))));
+    setPdfEditStatus("教材情報と画像を更新しました。隠し範囲は初期化されています。");
+  } catch (error) {
+    Object.assign(pdf, {
+      title: previous.title,
+      subject: previous.subject,
+      categories: previous.categories,
+      tags: previous.tags,
+      pages: previous.pages,
+      masks: previous.masks,
+      sourceType: previous.sourceType,
+      sourceName: previous.sourceName,
+      pdfUrl: previous.pdfUrl,
+      pdfName: previous.pdfName
+    });
+    pdfRevealStates[pdf.id] = previous.revealState || {};
+    if (uploadResult?.pages?.length) {
+      await Promise.all(uploadResult.pages.map(page => deletePdfFileByPath(page.imagePath)));
+    }
+    renderPdfTable();
+    renderPdfMaskTable();
+    renderPdfEditPreview();
+    console.error(error);
+    setPdfEditStatus("教材更新に失敗しました。\n" + (error.message || error));
+    alert("教材更新に失敗しました。\n\n" + (error.message || error));
+  }
 }
 
 async function deletePdfMaterial() {
@@ -609,14 +721,10 @@ async function deletePdfMaterial() {
   );
   if (!ok) return;
 
-  try {
-    setPdfStatus("画像教材を削除しています...");
-    await deletePdfStorageFiles(pdf);
-  } catch (error) {
-    console.warn(error);
-  }
-
+  const previousIndex = pdfMaterials.findIndex(item => item.id === pdf.id);
+  const previousRevealState = pdfRevealStates[pdf.id];
   pdfMaterials = pdfMaterials.filter(item => item.id !== pdf.id);
+  delete pdfRevealStates[pdf.id];
 
   if (selectedPdfId === pdf.id) {
     selectedPdfId = pdfMaterials[0]?.id || null;
@@ -627,13 +735,30 @@ async function deletePdfMaterial() {
 
   renderPdfTable();
   renderPdfMaskTable();
-  renderPdfViewer();
-  setPdfStatus("画像教材を削除しました。");
+  renderPdfEditPreview();
+  fillPdfEditorForm(currentPdfMaterial());
+  setPdfEditStatus("画像教材を削除しています...");
 
-  await requestSave({
-    allowEmptyPdfMaterials: true,
-    showAlerts: true
-  });
+  try {
+    const saved = await requestSave({
+      allowEmptyPdfMaterials: true,
+      showAlerts: true
+    });
+    if (!saved) throw new Error("削除後の教材データをクラウド保存できませんでした。");
+    await deletePdfStorageFiles(pdf);
+    setPdfEditStatus("画像教材を削除しました。");
+  } catch (error) {
+    pdfMaterials.splice(previousIndex, 0, pdf);
+    if (previousRevealState) pdfRevealStates[pdf.id] = previousRevealState;
+    selectedPdfId = pdf.id;
+    fillPdfEditorForm(pdf);
+    renderPdfTable();
+    renderPdfMaskTable();
+    renderPdfEditPreview();
+    console.error(error);
+    setPdfEditStatus("教材削除に失敗しました。\n" + (error.message || error));
+    alert("教材削除に失敗しました。\n\n" + (error.message || error));
+  }
 }
 
 function updatePdfMaskFromForm() {
@@ -1329,7 +1454,13 @@ async function resolvePdfPageImageUrl(pdf, page) {
   return getSavedPdfPageImageUrl(page);
 }
 
-async function setPdfImageSource(img, pdf, page) {
+async function setPdfImageSource(
+  img,
+  pdf,
+  page,
+  setErrorStatus = setPdfStatus,
+  saveResolvedUrl = true
+) {
   try {
     const src = await resolvePdfPageImageUrl(pdf, page);
 
@@ -1339,7 +1470,7 @@ async function setPdfImageSource(img, pdf, page) {
 
     img.dataset.storageErrorCategory = "";
     img.src = src;
-    requestAutoSave();
+    if (saveResolvedUrl) requestAutoSave();
   } catch (error) {
     console.error(error);
     const category = classifyStorageError(error);
@@ -1352,8 +1483,58 @@ async function setPdfImageSource(img, pdf, page) {
     }
 
     img.alt = "画像URLを取得できません";
-    setPdfStatus(getPdfImageLoadFailureMessage(category, page.page));
+    setErrorStatus(getPdfImageLoadFailureMessage(category, page.page));
   }
+}
+
+function renderPdfEditPreview() {
+  if (!el.pdfEditPreview) return;
+  const pdf = currentPdfMaterial();
+  const renderToken = ++pdfRenderToken;
+
+  if (!pdf) {
+    el.pdfEditPreview.innerHTML = "<div>編集する画像教材を選択してください。</div>";
+    return;
+  }
+
+  const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
+  el.pdfEditPreview.innerHTML = "";
+
+  if (pages.length) {
+    pages.forEach(page => {
+      const pageWrap = document.createElement("div");
+      pageWrap.className = "pdf-edit-preview-page";
+
+      const img = document.createElement("img");
+      img.alt = page.imageName || `${page.page || 1}ページ`;
+      img.loading = "eager";
+      img.draggable = false;
+      img.addEventListener("error", () => {
+        if (renderToken === pdfRenderToken) {
+          const category = img.dataset.storageErrorCategory || "image-error";
+          setPdfEditStatus(getPdfImageLoadFailureMessage(category, page.page || 1));
+        }
+      });
+
+      pageWrap.appendChild(img);
+      el.pdfEditPreview.appendChild(pageWrap);
+      setPdfImageSource(img, pdf, page, setPdfEditStatus, false);
+    });
+    return;
+  }
+
+  if (pdf.pdfUrl) {
+    el.pdfEditPreview.innerHTML = `
+      <iframe
+        src="${escapeHtml(pdf.pdfUrl)}"
+        title="${escapeHtml(pdf.title || "旧PDF")}"
+        style="width:100%;height:58vh;border:0;background:#fff;">
+      </iframe>
+    `;
+    return;
+  }
+
+  el.pdfEditPreview.innerHTML = "<div>画像URLがありません。</div>";
 }
 
 async function deletePdfStorageFiles(pdf) {
@@ -1470,18 +1651,19 @@ function renderPdfViewer(preserveScroll = false) {
       selectedPdfId,
       selectedMaskId,
       pdfSearchQuery,
-      pdfSelectedTagFilter
+      pdfSubjectFilter,
+      pdfCategoryFilter,
+      pdfViewMode
     };
   }
 
   function apply(persistedState = {}) {
     pdfMaterials = Array.isArray(persistedState.pdfMaterials)
-      ? persistedState.pdfMaterials.map(pdf => ({
+      ? persistedState.pdfMaterials.map(pdf => normalizeImageMaterial({
           ...pdf,
           masks: Array.isArray(pdf.masks)
             ? pdf.masks.map(mask => ({ ...mask, weak: mask.weak === true }))
-            : [],
-          tags: normalizePdfTags(pdf.tags || [])
+            : []
         }))
       : [];
     selectedPdfId = persistedState.selectedPdfId || null;
@@ -1492,23 +1674,46 @@ function renderPdfViewer(preserveScroll = false) {
     const legacySelectedTags = Array.isArray(persistedState.selectedPdfTags)
       ? persistedState.selectedPdfTags
       : [];
-    pdfSelectedTagFilter = persistedState.pdfSelectedTagFilter || legacySelectedTags[0] || "";
+    pdfSubjectFilter = persistedState.pdfSubjectFilter || "all";
+    pdfCategoryFilter = persistedState.pdfCategoryFilter ||
+      persistedState.pdfSelectedTagFilter ||
+      legacySelectedTags[0] ||
+      "";
+    pdfViewMode = persistedState.pdfViewMode === "edit" ? "edit" : "study";
     pdfAddMaskMode = false;
     pdfDraft = null;
 
-    ensurePdfTagUi();
-    const searchInput = getPdfSearchInput();
-    if (searchInput) searchInput.value = pdfSearchQuery;
     if (selectedPdfId && !pdfMaterials.some(pdf => pdf.id === selectedPdfId)) {
       selectedPdfId = null;
       selectedMaskId = null;
     }
+    fillPdfEditorForm(currentPdfMaterial());
+    renderPdfViewMode();
   }
 
   function bindEvents() {
     el.addPdfBtn?.addEventListener("click", () => addPdfMaterial().catch(console.error));
-    el.updatePdfBtn?.addEventListener("click", updatePdfMaterialTitle);
+    el.updatePdfBtn?.addEventListener("click", () => updatePdfMaterial().catch(console.error));
     el.deletePdfBtn?.addEventListener("click", () => deletePdfMaterial().catch(console.error));
+    el.pdfStudyModeBtn?.addEventListener("click", () => setPdfViewMode("study"));
+    el.pdfEditModeBtn?.addEventListener("click", () => setPdfViewMode("edit"));
+    el.pdfSearchInput?.addEventListener("input", event => {
+      pdfSearchQuery = event.currentTarget.value || "";
+      renderPdfTable();
+      requestAutoSave();
+    });
+    el.pdfSubjectFilterSelect?.addEventListener("change", event => {
+      pdfSubjectFilter = event.currentTarget.value || "all";
+      pdfCategoryFilter = "";
+      renderPdfTable();
+      requestAutoSave();
+    });
+    el.pdfCategoryFilterSelect?.addEventListener("change", event => {
+      pdfCategoryFilter = event.currentTarget.value || "";
+      renderPdfTable();
+      requestAutoSave();
+    });
+    el.pdfSubjectInput?.addEventListener("input", renderPdfEditorOptions);
     el.addMaskModeBtn?.addEventListener("click", togglePdfAddMaskMode);
     el.updateMaskBtn?.addEventListener("click", updatePdfMaskFromForm);
     el.deleteMaskBtn?.addEventListener("click", deletePdfMask);
@@ -1522,10 +1727,10 @@ function renderPdfViewer(preserveScroll = false) {
   return {
     apply,
     bindEvents,
-    ensureFilterUi: renderPdfTagFilterSelect,
-    ensureTagUi: ensurePdfTagUi,
+    ensureFilterUi: renderPdfFilterUi,
     render: renderPdfTable,
     renderMasks: renderPdfMaskTable,
+    renderEditor: renderPdfEditPreview,
     renderViewer: renderPdfViewer,
     serialize
   };
