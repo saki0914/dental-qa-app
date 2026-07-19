@@ -43,14 +43,20 @@
       </div>
 
       <div class="study-filter-grid">
-        <label class="field-group">
-          <span>教科</span>
-          <select id="subjectFilter"></select>
-        </label>
-        <label class="field-group">
-          <span>章・大分類</span>
-          <select id="primarySubcategorySelect"></select>
-        </label>
+        <div class="field-group">
+          <span>教科（複数選択）</span>
+          <details class="filter-multiselect" id="subjectFilterDropdown">
+            <summary id="subjectFilterSummary">すべての教科</summary>
+            <div class="filter-multiselect-options" id="subjectFilterChecklist"></div>
+          </details>
+        </div>
+        <div class="field-group">
+          <span>章・大分類（複数選択）</span>
+          <details class="filter-multiselect" id="primarySubcategoryDropdown">
+            <summary id="primarySubcategorySummary">すべての章・大分類</summary>
+            <div class="filter-multiselect-options" id="primarySubcategoryChecklist"></div>
+          </details>
+        </div>
         <label class="field-group">
           <span>出題順</span>
           <select id="orderMode">
@@ -61,7 +67,7 @@
       </div>
 
       <div class="subcat-box" style="margin-bottom:12px;">
-        <div class="subcat-title">追加カテゴリ（複数選択はすべてを含む問題）</div>
+        <div class="subcat-title">追加カテゴリ（選択したカテゴリをすべて含む問題）</div>
         <div class="subcat-checkbox-list" id="relatedSubcategoryChecklist"></div>
       </div>
 

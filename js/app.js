@@ -57,9 +57,9 @@ let filteredQuestions = [];
 let currentIndex = 0;
 let wrongQuestionIds = [];
 let deviceMode = "iphone";
-let subjectFilter = "all";
+let selectedSubjects = [];
 let selectedSubcategories = [];
-let selectedPrimarySubcategory = "";
+let selectedPrimarySubcategories = [];
 let migratedLegacyStudyFilters = false;
 let orderMode = "sequential";
 let progress = {};
@@ -82,8 +82,12 @@ const el = {
   correctCount: document.getElementById("correctCount"),
   wrongCount: document.getElementById("wrongCount"),
   studyMeta: document.getElementById("studyMeta"),
-  subjectFilter: document.getElementById("subjectFilter"),
-  primarySubcategorySelect: document.getElementById("primarySubcategorySelect"),
+  subjectFilterDropdown: document.getElementById("subjectFilterDropdown"),
+  subjectFilterSummary: document.getElementById("subjectFilterSummary"),
+  subjectFilterChecklist: document.getElementById("subjectFilterChecklist"),
+  primarySubcategoryDropdown: document.getElementById("primarySubcategoryDropdown"),
+  primarySubcategorySummary: document.getElementById("primarySubcategorySummary"),
+  primarySubcategoryChecklist: document.getElementById("primarySubcategoryChecklist"),
   relatedSubcategoryChecklist: document.getElementById("relatedSubcategoryChecklist"),
   studyFilterMigrationNotice: document.getElementById("studyFilterMigrationNotice"),
   forceResetStudyFiltersBtn: document.getElementById("forceResetStudyFiltersBtn"),
@@ -208,31 +212,83 @@ function ensureCurrentQuestionAnswers(q) {
 
 
 function getPrimarySubcategories() {
-  return getStudyPrimaryCategories(allQuestions, subjectFilter);
+  return getStudyPrimaryCategories(allQuestions, selectedSubjects);
 }
 
-function getRelatedSubcategories(primary) {
-  return getStudyRelatedCategories(allQuestions, subjectFilter, primary);
+function getRelatedSubcategories() {
+  return getStudyRelatedCategories(allQuestions, selectedSubjects, selectedPrimarySubcategories);
 }
 
-function renderPrimarySubcategorySelect() {
-  const select = el.primarySubcategorySelect;
-  if (!select) return;
+function getFilterSelectionSummary(selectedItems, allLabel) {
+  if (!selectedItems.length) return allLabel;
+  if (selectedItems.length === 1) return selectedItems[0];
+  return `${selectedItems.length}件選択：${selectedItems.slice(0, 2).join("・")}${selectedItems.length > 2 ? "ほか" : ""}`;
+}
 
-  const primaryItems = getPrimarySubcategories();
+function renderFilterMultiselect({ checklist, summary, items, selectedItems, allLabel, onChange }) {
+  if (!checklist || !summary) return;
+  summary.textContent = getFilterSelectionSummary(selectedItems, allLabel);
 
-  if (!primaryItems.length) {
-    select.innerHTML = '<option value="">章・大分類は未登録です</option>';
-    select.value = "";
+  if (!items.length) {
+    checklist.innerHTML = '<div class="condition-group-help">選択できる項目がありません。</div>';
     return;
   }
 
-  select.innerHTML = `<option value="">章・大分類を選択してください</option>` +
-    primaryItems.map(item => `
-      <option value="${escapeHtml(item)}" ${item === selectedPrimarySubcategory ? "selected" : ""}>
-        ${escapeHtml(item)}
-      </option>
-    `).join("");
+  checklist.innerHTML = `
+    <label class="filter-multiselect-row ${selectedItems.length ? "" : "is-active"}">
+      <input type="checkbox" data-select-all="true" ${selectedItems.length ? "" : "checked"}>
+      <span>${escapeHtml(allLabel)}</span>
+    </label>
+  ` + items.map(item => {
+    const checked = selectedItems.includes(item);
+    return `
+      <label class="filter-multiselect-row ${checked ? "is-active" : ""}">
+        <input type="checkbox" value="${escapeHtml(item)}" ${checked ? "checked" : ""}>
+        <span>${escapeHtml(item)}</span>
+      </label>
+    `;
+  }).join("");
+
+  [...checklist.querySelectorAll("input[type='checkbox']")].forEach(input => {
+    input.addEventListener("change", () => {
+      if (input.dataset.selectAll === "true") {
+        onChange([]);
+        return;
+      }
+      const next = input.checked
+        ? [...selectedItems, input.value]
+        : selectedItems.filter(item => item !== input.value);
+      onChange([...new Set(next)]);
+    });
+  });
+}
+
+function renderSubjectFilterChecklist() {
+  renderFilterMultiselect({
+    checklist: el.subjectFilterChecklist,
+    summary: el.subjectFilterSummary,
+    items: getStudySubjects(allQuestions),
+    selectedItems: selectedSubjects,
+    allLabel: "すべての教科",
+    onChange: nextSubjects => {
+      selectedSubjects = nextSubjects;
+      applyStudyFilterChange();
+    }
+  });
+}
+
+function renderPrimarySubcategoryChecklist() {
+  renderFilterMultiselect({
+    checklist: el.primarySubcategoryChecklist,
+    summary: el.primarySubcategorySummary,
+    items: getPrimarySubcategories(),
+    selectedItems: selectedPrimarySubcategories,
+    allLabel: "すべての章・大分類",
+    onChange: nextCategories => {
+      selectedPrimarySubcategories = nextCategories;
+      applyStudyFilterChange();
+    }
+  });
 }
 
 function renderRelatedSubcategoryChecklist() {
@@ -244,15 +300,10 @@ function renderRelatedSubcategoryChecklist() {
     return;
   }
 
-  if (!selectedPrimarySubcategory) {
-    list.innerHTML = '<div class="condition-group-help">上のドロップダウンから章・大分類を選んでください。</div>';
-    return;
-  }
-
-  const related = getRelatedSubcategories(selectedPrimarySubcategory);
+  const related = getRelatedSubcategories();
 
   if (!related.length) {
-    list.innerHTML = '<div class="condition-group-help">この大分類には追加の関連カテゴリがありません。</div>';
+    list.innerHTML = '<div class="condition-group-help">対象の問題には追加カテゴリがありません。</div>';
     return;
   }
 
@@ -279,8 +330,9 @@ function renderRelatedSubcategoryChecklist() {
   });
 }
 
-function renderStudySubcategoryChips() {
-  renderPrimarySubcategorySelect();
+function renderStudyFilterControls() {
+  renderSubjectFilterChecklist();
+  renderPrimarySubcategoryChecklist();
   renderRelatedSubcategoryChecklist();
 }
 
@@ -362,12 +414,13 @@ function resetWrongQuestions() {
 
 
 function resetStudyFiltersToAll() {
-  subjectFilter = "all";
+  selectedSubjects = [];
   selectedSubcategories = [];
-  selectedPrimarySubcategory = "";
+  selectedPrimarySubcategories = [];
   currentIndex = 0;
 
-  if (el.subjectFilter) el.subjectFilter.value = "all";
+  if (el.subjectFilterDropdown) el.subjectFilterDropdown.open = false;
+  if (el.primarySubcategoryDropdown) el.primarySubcategoryDropdown.open = false;
 
   applyStudyFilterChange({ reshuffle: orderMode === "random" });
 }
@@ -375,8 +428,8 @@ function resetStudyFiltersToAll() {
 
 function getBaseStudyQuestions() {
   return filterQuestionsForStudy(allQuestions, {
-    subject: subjectFilter,
-    primaryCategory: selectedPrimarySubcategory,
+    selectedSubjects,
+    selectedPrimaryCategories: selectedPrimarySubcategories,
     selectedRelatedCategories: selectedSubcategories
   });
 }
@@ -430,12 +483,12 @@ function ensureProgressRow(subject) {
 
 function cleanupStaleStudyFilters() {
   const normalized = normalizeStudySelection(allQuestions, {
-    subject: subjectFilter,
-    primaryCategory: selectedPrimarySubcategory,
+    selectedSubjects,
+    selectedPrimaryCategories: selectedPrimarySubcategories,
     selectedRelatedCategories: selectedSubcategories
   });
-  subjectFilter = normalized.subject;
-  selectedPrimarySubcategory = normalized.primaryCategory;
+  selectedSubjects = normalized.selectedSubjects;
+  selectedPrimarySubcategories = normalized.selectedPrimaryCategories;
   selectedSubcategories = normalized.selectedRelatedCategories;
 
   if (currentIndex >= filteredQuestions.length) {
@@ -443,28 +496,17 @@ function cleanupStaleStudyFilters() {
   }
 
   if (!allQuestions.length) {
-    subjectFilter = "all";
+    selectedSubjects = [];
     selectedSubcategories = [];
-    selectedPrimarySubcategory = "";
+    selectedPrimarySubcategories = [];
     currentIndex = 0;
   }
 }
 
 
 function updateSubjectOptions() {
-  const subjects = getStudySubjects(allQuestions);
-
-  if (!el.subjectFilter) return;
-
-  el.subjectFilter.innerHTML =
-    '<option value="all">すべての教科</option>' +
-    subjects.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join("");
-
-  if (subjectFilter !== "all" && !subjects.includes(subjectFilter)) {
-    subjectFilter = "all";
-  }
-
-  el.subjectFilter.value = subjectFilter;
+  cleanupStaleStudyFilters();
+  renderSubjectFilterChecklist();
 }
 
 
@@ -482,8 +524,7 @@ function updateStudyStatsOnly() {
 
 function renderStudy({ reshuffle = false } = {}) {
   cleanupStaleStudyFilters();
-  updateSubjectOptions();
-  renderStudySubcategoryChips();
+  renderStudyFilterControls();
   buildFilteredQuestions({ reshuffle });
   updateStudyStatsOnly();
 
@@ -492,8 +533,8 @@ function renderStudy({ reshuffle = false } = {}) {
   el.iphoneArea.classList.toggle("hidden", deviceMode !== "iphone");
   el.ipadArea.classList.toggle("hidden", deviceMode !== "ipad");
 
-  const rangeText = subjectFilter === "all" ? "全教科" : subjectFilter;
-  const selectedCategoryLabels = [selectedPrimarySubcategory, ...selectedSubcategories].filter(Boolean);
+  const rangeText = selectedSubjects.length ? selectedSubjects.join("・") : "全教科";
+  const selectedCategoryLabels = [...selectedPrimarySubcategories, ...selectedSubcategories];
   const subcatText = selectedCategoryLabels.length ? ` / カテゴリ: ${selectedCategoryLabels.join("・")}` : "";
   const orderText = orderMode === "random" ? "ランダム" : "順番どおり";
   const modeText = studyMode === "wrongOnly"
@@ -948,7 +989,6 @@ function resetProgress() {
 }
 
 function applyStudyCondition() {
-  subjectFilter = el.subjectFilter.value;
   orderMode = el.orderMode.value;
   applyStudyFilterChange({ reshuffle: orderMode === "random" });
 }
@@ -992,11 +1032,16 @@ function applyState(state) {
     wrongQuestionIds = Array.isArray(state.wrongQuestionIds) ? state.wrongQuestionIds : [];
     currentIndex = Number.isInteger(state.currentIndex) ? state.currentIndex : 0;
     deviceMode = state.deviceMode || "iphone";
-    subjectFilter = state.subjectFilter || "all";
     const storedSubcategories = Array.isArray(state.selectedSubcategories) ? state.selectedSubcategories : [];
-    selectedPrimarySubcategory = state.selectedPrimarySubcategory || storedSubcategories[0] || "";
-    selectedSubcategories = storedSubcategories.filter(tag => tag !== selectedPrimarySubcategory);
-    migratedLegacyStudyFilters = state.studyFilterVersion !== "hierarchical-v1" &&
+    selectedSubjects = Array.isArray(state.selectedSubjects)
+      ? state.selectedSubjects
+      : (state.subjectFilter && state.subjectFilter !== "all" ? [state.subjectFilter] : []);
+    const legacyPrimarySubcategory = state.selectedPrimarySubcategory || storedSubcategories[0] || "";
+    selectedPrimarySubcategories = Array.isArray(state.selectedPrimarySubcategories)
+      ? state.selectedPrimarySubcategories
+      : (legacyPrimarySubcategory ? [legacyPrimarySubcategory] : []);
+    selectedSubcategories = storedSubcategories.filter(tag => !selectedPrimarySubcategories.includes(tag));
+    migratedLegacyStudyFilters = state.studyFilterVersion !== "multi-scope-v2" &&
       Array.isArray(state.subcategoryConditionGroups) && state.subcategoryConditionGroups.length > 0;
     orderMode = state.orderMode || "sequential";
     progress = state.progress || {};
@@ -1010,7 +1055,6 @@ function applyState(state) {
 
     allQuestions.forEach(q => ensureProgressRow(q.subject));
     updateSubjectOptions();
-    el.subjectFilter.value = subjectFilter;
     el.orderMode.value = orderMode;
     cleanupStaleStudyFilters();
     buildFilteredQuestions();
@@ -1023,7 +1067,7 @@ function applyState(state) {
     if (el.studyFilterMigrationNotice) {
       el.studyFilterMigrationNotice.classList.toggle("hidden", !migratedLegacyStudyFilters);
       el.studyFilterMigrationNotice.textContent = migratedLegacyStudyFilters
-        ? "以前の条件セット検索は、教科・大分類・関連カテゴリの絞り込みへ移行しました。条件を確認してください。"
+        ? "以前の条件セット検索は、複数教科・複数章・追加カテゴリの絞り込みへ移行しました。条件を確認してください。"
         : "";
     }
   } finally {
@@ -1058,10 +1102,13 @@ function updateLoginLockedUI() {
   el.pdfLockBanner.classList.toggle("hidden", loggedIn);
 
   setInteractiveDisabled([
-    "chooseIphone","chooseIpad","subjectFilter","primarySubcategorySelect","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn",
+    "chooseIphone","chooseIpad","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn",
     "userAnswer","judgeBtn","showAnswerBtnIpad","nextBtnIpad","showAnswerBtn","nextBtn",
     "knownBtn","unknownBtn","reviewWrongBtn","reviewUnansweredBtn","resetWrongQuestionsBtn"
   ], !loggedIn);
+
+  document.querySelectorAll("#subjectFilterChecklist input, #primarySubcategoryChecklist input, #relatedSubcategoryChecklist input")
+    .forEach(input => { input.disabled = !loggedIn; });
 
   setInteractiveDisabled([
     "editSubject","searchInput","editQuestion","editAnswers","editExplanation","editOrderedAnswers","editImageFile","removeImageBtn","editImageName",
@@ -1187,9 +1234,9 @@ function buildSplitStates() {
       filteredQuestionIds: filteredQuestions.map(q => q.id),
       currentIndex,
       deviceMode,
-      subjectFilter,
+      selectedSubjects,
       selectedSubcategories,
-      selectedPrimarySubcategory,
+      selectedPrimarySubcategories,
       subcategoryConditionGroups: [],
       selectedConditionGroupIndex: 0,
       orderMode,
@@ -1198,7 +1245,7 @@ function buildSplitStates() {
       managePrimarySubcategory: questionSettings.managePrimarySubcategory,
       manageSelectedSubcategories: questionSettings.manageSelectedSubcategories,
       pdfSelectedTagFilter: imageState.pdfSelectedTagFilter,
-      studyFilterVersion: "hierarchical-v1",
+      studyFilterVersion: "multi-scope-v2",
       schemaVersion: "split-v2",
       updatedAt: serverTimestamp()
     },
@@ -1381,16 +1428,23 @@ document.getElementById("chooseIpad").addEventListener("click", () => {
   autoSaveToCloud();
 });
 
-document.getElementById("subjectFilter").addEventListener("change", () => {
-  subjectFilter = el.subjectFilter.value;
-  selectedPrimarySubcategory = "";
-  selectedSubcategories = [];
-  applyStudyFilterChange();
+[el.subjectFilterDropdown, el.primarySubcategoryDropdown].forEach(dropdown => {
+  dropdown?.addEventListener("toggle", () => {
+    if (!dropdown.open) return;
+    [el.subjectFilterDropdown, el.primarySubcategoryDropdown]
+      .filter(other => other && other !== dropdown)
+      .forEach(other => { other.open = false; });
+    requestAnimationFrame(() => {
+      const options = dropdown.querySelector(".filter-multiselect-options");
+      const overflow = (options?.getBoundingClientRect().bottom || 0) - window.innerHeight + 16;
+      if (overflow > 0) window.scrollBy({ top: overflow, behavior: "auto" });
+    });
+  });
 });
-el.primarySubcategorySelect.addEventListener("change", () => {
-  selectedPrimarySubcategory = el.primarySubcategorySelect.value || "";
-  selectedSubcategories = [];
-  applyStudyFilterChange();
+document.addEventListener("click", event => {
+  [el.subjectFilterDropdown, el.primarySubcategoryDropdown].forEach(dropdown => {
+    if (dropdown?.open && !dropdown.contains(event.target)) dropdown.open = false;
+  });
 });
 el.orderMode.addEventListener("change", () => {
   orderMode = el.orderMode.value;
