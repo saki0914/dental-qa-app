@@ -186,7 +186,7 @@ function renderManageTable() { questionManager.render(); }
 function renderManageFilterUi() { questionManager.renderFilter(); }
 function resetBulkImportState() { questionManager.resetBulkImport(); }
 function renderPdfTable() { imageMemory.render(); }
-function renderPdfFilterDropdownUi() { imageMemory.ensureFilterUi(); }
+function renderPdfTagFilterSelect() { imageMemory.ensureFilterUi(); }
 function renderPdfMaskTable() { imageMemory.renderMasks(); }
 function renderPdfViewer(preserveScroll = false) { imageMemory.renderViewer(preserveScroll); }
 function ensurePdfTagUi() { imageMemory.ensureTagUi(); }
@@ -1175,7 +1175,6 @@ function buildSplitStates() {
       selectedPdfId: imageState.selectedPdfId,
       selectedMaskId: imageState.selectedMaskId,
       pdfSearchQuery: imageState.pdfSearchQuery,
-      selectedPdfTags: imageState.selectedPdfTags,
       updatedAt: serverTimestamp()
     },
     progress: {
@@ -1454,7 +1453,7 @@ function init() {
     try { renderProgressTable(); } catch (error) { console.error("renderProgressTable failed", error); }
     try { renderStudy(); } catch (error) { console.error("renderStudy failed", error); }
     try { renderPdfTable(); } catch (error) { console.error("renderPdfTable failed", error); }
-    try { if (typeof renderPdfFilterDropdownUi === "function") renderPdfFilterDropdownUi(); } catch (error) { console.error("renderPdfFilterDropdownUi failed", error); }
+    try { renderPdfTagFilterSelect(); } catch (error) { console.error("renderPdfTagFilterSelect failed", error); }
     try { renderPdfMaskTable(); } catch (error) { console.error("renderPdfMaskTable failed", error); }
     try { renderPdfViewer(); } catch (error) { console.error("renderPdfViewer failed", error); }
     try { resetBulkImportState(); } catch (error) { console.error("resetBulkImportState failed", error); }

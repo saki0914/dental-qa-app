@@ -27,7 +27,6 @@ export function createImageMemory(dependencies) {
   let pdfMaterials = [];
   let selectedPdfId = null;
   let pdfSearchQuery = "";
-  let selectedPdfTags = [];
   let selectedMaskId = null;
   let selectedMaskIds = [];
   let pdfRevealStates = {};
@@ -118,14 +117,20 @@ function ensurePdfTagUi() {
   const box = document.createElement("div");
   box.id = "pdfTagSearchBox";
   box.innerHTML = `
-    <div class="grid2" style="margin-bottom:10px;">
-      <input id="pdfSearchInput" placeholder="教材名・タグ名で検索">
-      <input id="pdfTagInput" placeholder="タグ名（複数は読点・カンマ区切り）">
+    <div class="study-filter-grid pdf-filter-grid">
+      <label class="field-group">
+        <span>教材を検索</span>
+        <input id="pdfSearchInput" placeholder="教材名・タグ名">
+      </label>
+      <label class="field-group">
+        <span>タグで絞り込み</span>
+        <select id="pdfTagFilterSelect"><option value="">すべてのタグ</option></select>
+      </label>
     </div>
-    <div class="subcat-box" style="margin-bottom:12px;">
-      <div class="subcat-title">タグを選択できます（未選択なら全件）</div>
-      <div class="subcat-list" id="pdfTagChipList"></div>
-    </div>
+    <label class="field-group pdf-tag-editor">
+      <span>選択中・新規教材のタグ</span>
+      <input id="pdfTagInput" placeholder="複数は読点・カンマ区切り">
+    </label>
   `;
 
   toolbar.insertAdjacentElement("afterend", box);
@@ -135,7 +140,12 @@ function ensurePdfTagUi() {
   searchInput.addEventListener("input", () => {
     pdfSearchQuery = searchInput.value || "";
     renderPdfTable();
-  renderPdfFilterDropdownUi();
+  });
+
+  document.getElementById("pdfTagFilterSelect").addEventListener("change", event => {
+    pdfSelectedTagFilter = event.currentTarget.value || "";
+    renderPdfTable();
+    requestAutoSave();
   });
 }
 
@@ -149,14 +159,9 @@ function getPdfSearchInput() {
   return document.getElementById("pdfSearchInput");
 }
 
-function getPdfTagChipList() {
-  ensurePdfTagUi();
-  return document.getElementById("pdfTagChipList");
-}
-
 function getAvailablePdfTags() {
   return [...new Set(
-    pdfMaterials.flatMap(pdf => Array.isArray(pdf.tags) ? pdf.tags : [])
+    pdfMaterials.flatMap(pdf => Array.isArray(pdf.tags) ? pdf.tags : []).filter(Boolean)
   )].sort();
 }
 
@@ -173,78 +178,19 @@ function getFilteredPdfMaterials() {
     ].join(" ").toLowerCase();
 
     const matchesQuery = !query || searchText.includes(query);
-    const matchesTags = !selectedPdfTags.length || selectedPdfTags.every(tag => tags.includes(tag));
-    return matchesQuery && matchesTags;
+    const matchesTag = !pdfSelectedTagFilter || tags.includes(pdfSelectedTagFilter);
+    return matchesQuery && matchesTag;
   });
 }
 
-function renderPdfTagChips() {
-  const chipList = getPdfTagChipList();
-  if (!chipList) return;
-
-  const tags = getAvailablePdfTags();
-  selectedPdfTags = selectedPdfTags.filter(tag => tags.includes(tag));
-
-  if (!tags.length) {
-    chipList.innerHTML = '<span class="subcat-title">タグなし</span>';
-    return;
-  }
-
-  chipList.innerHTML = tags.map(tag => `
-    <button type="button" class="subcat-chip ${selectedPdfTags.includes(tag) ? "active" : ""}" data-pdf-tag="${escapeHtml(tag)}">
-      ${escapeHtml(tag)}
-    </button>
-  `).join("");
-
-  [...chipList.querySelectorAll("[data-pdf-tag]")].forEach(btn => {
-    btn.addEventListener("click", () => {
-      const tag = btn.dataset.pdfTag;
-      if (selectedPdfTags.includes(tag)) {
-        selectedPdfTags = selectedPdfTags.filter(item => item !== tag);
-      } else {
-        selectedPdfTags = [...selectedPdfTags, tag];
-      }
-      renderPdfTagChips();
-      renderPdfTable();
-    });
-  });
-}
-
-
-
-function getAvailablePdfTagList() {
-  return [...new Set(pdfMaterials.flatMap(item => Array.isArray(item.tags) ? item.tags : []).filter(Boolean))].sort();
-}
-
-function ensurePdfFilterDropdownUi() {
-  if (document.getElementById("pdfTagFilterSelect")) return;
-  const table = el.pdfTableBody?.closest(".table-wrap") || el.pdfTableBody?.closest("table");
-  if (!table) return;
-  const panel = document.createElement("div");
-  panel.id = "pdfFilterPanel";
-  panel.className = "pdf-filter-panel";
-  panel.innerHTML = `<select id="pdfTagFilterSelect"><option value="">全タグ</option></select>`;
-  table.insertAdjacentElement("beforebegin", panel);
-  document.getElementById("pdfTagFilterSelect").addEventListener("change", () => {
-    pdfSelectedTagFilter = document.getElementById("pdfTagFilterSelect").value || "";
-    renderPdfTable();
-  });
-}
-
-function renderPdfFilterDropdownUi() {
-  ensurePdfFilterDropdownUi();
+function renderPdfTagFilterSelect() {
+  ensurePdfTagUi();
   const select = document.getElementById("pdfTagFilterSelect");
   if (!select) return;
-  const tags = getAvailablePdfTagList();
+  const tags = getAvailablePdfTags();
   if (pdfSelectedTagFilter && !tags.includes(pdfSelectedTagFilter)) pdfSelectedTagFilter = "";
-  select.innerHTML = `<option value="">全タグ</option>` +
+  select.innerHTML = `<option value="">すべてのタグ</option>` +
     tags.map(tag => `<option value="${escapeHtml(tag)}" ${tag === pdfSelectedTagFilter ? "selected" : ""}>${escapeHtml(tag)}</option>`).join("");
-}
-
-function pdfMatchesDropdownFilter(pdf) {
-  if (!pdfSelectedTagFilter) return true;
-  const tags = Array.isArray(pdf.tags) ? pdf.tags : [];
-  return tags.includes(pdfSelectedTagFilter);
 }
 
 
@@ -268,10 +214,8 @@ function renderPdfTable() {
   if (!el.pdfTableBody) return;
 
   ensurePdfTagUi();
-  renderPdfTagChips();
-
-  renderPdfFilterDropdownUi();
-  const filteredMaterials = getFilteredPdfMaterials().filter(pdfMatchesDropdownFilter);
+  renderPdfTagFilterSelect();
+  const filteredMaterials = getFilteredPdfMaterials();
 
   if (!filteredMaterials.length) {
     el.pdfTableBody.innerHTML = '<tr><td colspan="4">該当する画像教材がありません。</td></tr>';
@@ -643,7 +587,6 @@ function updatePdfMaterialTitle() {
   pdf.tags = normalizePdfTags(textToTagList(tagInput ? tagInput.value : ""));
 
   renderPdfTable();
-  renderPdfTagChips();
   setPdfStatus("画像教材タイトルとタグを更新しました。");
   requestAutoSave();
 }
@@ -1527,7 +1470,6 @@ function renderPdfViewer(preserveScroll = false) {
       selectedPdfId,
       selectedMaskId,
       pdfSearchQuery,
-      selectedPdfTags,
       pdfSelectedTagFilter
     };
   }
@@ -1547,8 +1489,10 @@ function renderPdfViewer(preserveScroll = false) {
     selectedMaskIds = [];
     pdfRevealStates = persistedState.pdfRevealStates || {};
     pdfSearchQuery = persistedState.pdfSearchQuery || "";
-    selectedPdfTags = Array.isArray(persistedState.selectedPdfTags) ? persistedState.selectedPdfTags : [];
-    pdfSelectedTagFilter = persistedState.pdfSelectedTagFilter || "";
+    const legacySelectedTags = Array.isArray(persistedState.selectedPdfTags)
+      ? persistedState.selectedPdfTags
+      : [];
+    pdfSelectedTagFilter = persistedState.pdfSelectedTagFilter || legacySelectedTags[0] || "";
     pdfAddMaskMode = false;
     pdfDraft = null;
 
@@ -1578,7 +1522,7 @@ function renderPdfViewer(preserveScroll = false) {
   return {
     apply,
     bindEvents,
-    ensureFilterUi: renderPdfFilterDropdownUi,
+    ensureFilterUi: renderPdfTagFilterSelect,
     ensureTagUi: ensurePdfTagUi,
     render: renderPdfTable,
     renderMasks: renderPdfMaskTable,

@@ -757,8 +757,7 @@
     }
 
 
-    .manage-filter-panel,
-    .pdf-filter-panel{
+    .manage-filter-panel{
       display:grid;
       gap:10px;
       margin:12px 0;
@@ -766,6 +765,12 @@
       border:1px solid var(--line);
       border-radius:16px;
       background:#f8fafc;
+    }
+    .pdf-filter-grid{
+      margin:12px 0 10px;
+    }
+    .pdf-tag-editor{
+      margin-bottom:12px;
     }
     .manage-check-list{
       display:grid;
