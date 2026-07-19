@@ -43,20 +43,14 @@
       </div>
 
       <div class="study-filter-grid">
-        <div class="field-group">
-          <span>教科（複数選択）</span>
-          <details class="filter-multiselect" id="subjectFilterDropdown">
-            <summary id="subjectFilterSummary">すべての教科</summary>
-            <div class="filter-multiselect-options" id="subjectFilterChecklist"></div>
-          </details>
-        </div>
-        <div class="field-group">
-          <span>章・大分類（複数選択）</span>
-          <details class="filter-multiselect" id="primarySubcategoryDropdown">
-            <summary id="primarySubcategorySummary">すべての章・大分類</summary>
-            <div class="filter-multiselect-options" id="primarySubcategoryChecklist"></div>
-          </details>
-        </div>
+        <label class="field-group">
+          <span>教科</span>
+          <select id="subjectFilter"></select>
+        </label>
+        <label class="field-group">
+          <span>章・大分類</span>
+          <select id="primarySubcategorySelect"></select>
+        </label>
         <label class="field-group">
           <span>出題順</span>
           <select id="orderMode">
@@ -67,8 +61,17 @@
       </div>
 
       <div class="subcat-box" style="margin-bottom:12px;">
-        <div class="subcat-title">追加カテゴリ（選択したカテゴリをすべて含む問題）</div>
+        <div class="subcat-title">追加カテゴリ（同じ条件内ではすべてを含む問題）</div>
         <div class="subcat-checkbox-list" id="relatedSubcategoryChecklist"></div>
+      </div>
+
+      <div class="condition-groups" id="conditionGroupBox">
+        <div class="study-condition-actions">
+          <button class="btn soft" id="addConditionGroupBtn" type="button">この選択を条件に追加</button>
+          <button class="btn" id="clearCurrentConditionBtn" type="button">現在の選択を解除</button>
+        </div>
+        <div class="subcat-title">追加済みの学習条件（条件同士はOR）</div>
+        <div id="conditionGroupList"></div>
       </div>
 
       <div class="study-filter-actions">

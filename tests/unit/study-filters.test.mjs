@@ -6,7 +6,9 @@ import {
   filterQuestionsForStudy,
   getStudyPrimaryCategories,
   getStudyRelatedCategories,
-  normalizeStudySelection
+  migrateStudyConditionGroups,
+  normalizeStudyCondition,
+  normalizeStudyConditionGroups
 } from "../../js/core/study-filters.js";
 
 const questions = [
@@ -16,57 +18,68 @@ const questions = [
   { id: "q4", subject: "補綴", subcategories: ["1章", "頻出"] }
 ];
 
-test("教科に属する章と追加カテゴリだけを返す", () => {
-  assert.deepEqual(getStudyPrimaryCategories(questions, ["保存"]), ["1章", "2章"]);
-  assert.deepEqual(getStudyRelatedCategories(questions, ["保存"], ["1章"]), ["基礎", "臨床", "頻出"]);
+test("選択中の教科と章に属する追加カテゴリだけを返す", () => {
+  assert.deepEqual(getStudyPrimaryCategories(questions, "保存"), ["1章", "2章"]);
+  assert.deepEqual(getStudyRelatedCategories(questions, "保存", "1章"), ["基礎", "臨床", "頻出"]);
 });
 
-test("複数教科・複数章をOR条件で横断する", () => {
+test("追加した条件同士をORで評価して教科と章を横断する", () => {
   const filtered = filterQuestionsForStudy(questions, {
-    selectedSubjects: ["保存", "補綴"],
-    selectedPrimaryCategories: ["2章", "1章"]
+    conditionGroups: [
+      { subject: "保存", primaryCategory: "2章", selectedRelatedCategories: [] },
+      { subject: "補綴", primaryCategory: "1章", selectedRelatedCategories: ["頻出"] }
+    ]
   });
-  assert.deepEqual(filtered.map(question => question.id), ["q1", "q2", "q3", "q4"]);
+  assert.deepEqual(filtered.map(question => question.id), ["q3", "q4"]);
 });
 
-test("追加カテゴリは複数教科・章の対象内でAND条件にする", () => {
+test("各条件内では章と追加カテゴリをANDで評価する", () => {
   const filtered = filterQuestionsForStudy(questions, {
-    selectedSubjects: ["保存", "補綴"],
-    selectedPrimaryCategories: ["1章", "2章"],
-    selectedRelatedCategories: ["基礎", "頻出"]
+    draftCondition: {
+      subject: "保存",
+      primaryCategory: "1章",
+      selectedRelatedCategories: ["基礎", "頻出"]
+    }
   });
   assert.deepEqual(filtered.map(question => question.id), ["q1"]);
-
-  const noMatches = filterQuestionsForStudy(questions, {
-    selectedSubjects: ["保存"],
-    selectedPrimaryCategories: ["1章"],
-    selectedRelatedCategories: ["臨床", "頻出"]
-  });
-  assert.deepEqual(noMatches, []);
 });
 
-test("教科変更後も有効な章を維持し、無効な条件だけ破棄する", () => {
-  assert.deepEqual(normalizeStudySelection(questions, {
-    selectedSubjects: ["補綴", "存在しない教科"],
-    selectedPrimaryCategories: ["1章", "2章"],
-    selectedRelatedCategories: ["頻出", "応用"]
-  }), {
-    selectedSubjects: ["補綴"],
-    selectedPrimaryCategories: ["1章"],
-    selectedRelatedCategories: ["頻出"]
+test("同名の章が別教科にあっても条件の教科を厳密に評価する", () => {
+  const filtered = filterQuestionsForStudy(questions, {
+    conditionGroups: [
+      { subject: "補綴", primaryCategory: "1章", selectedRelatedCategories: [] }
+    ]
   });
+  assert.deepEqual(filtered.map(question => question.id), ["q4"]);
 });
 
-test("旧単一選択形式を複数選択形式へ移行する", () => {
-  assert.deepEqual(normalizeStudySelection(questions, {
+test("無効な条件を破棄し重複条件を除去する", () => {
+  const condition = { subject: "保存", primaryCategory: "1章", selectedRelatedCategories: ["頻出"] };
+  assert.deepEqual(normalizeStudyConditionGroups(questions, [
+    condition,
+    condition,
+    { subject: "存在しない教科", primaryCategory: "1章", selectedRelatedCategories: [] },
+    { subject: "保存", primaryCategory: "存在しない章", selectedRelatedCategories: [] }
+  ]), [condition]);
+
+  assert.deepEqual(normalizeStudyCondition(questions, {
     subject: "保存",
     primaryCategory: "1章",
-    selectedRelatedCategories: ["基礎"]
-  }), {
-    selectedSubjects: ["保存"],
-    selectedPrimaryCategories: ["1章"],
-    selectedRelatedCategories: ["基礎"]
-  });
+    selectedRelatedCategories: ["頻出", "存在しないカテゴリ"]
+  }), condition);
+});
+
+test("mainの旧条件セットを教科付き条件へ移行する", () => {
+  assert.deepEqual(migrateStudyConditionGroups(questions, {
+    subjectFilter: "保存",
+    subcategoryConditionGroups: [
+      ["1章", "頻出"],
+      ["2章", "応用"]
+    ]
+  }), [
+    { subject: "保存", primaryCategory: "1章", selectedRelatedCategories: ["頻出"] },
+    { subject: "保存", primaryCategory: "2章", selectedRelatedCategories: ["応用"] }
+  ]);
 });
 
 test("表示対象だけからカウンターを計算する", () => {

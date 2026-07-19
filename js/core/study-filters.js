@@ -3,16 +3,11 @@ function normalizeValues(values) {
   return [...new Set(source.map(value => String(value || "").trim()).filter(Boolean))];
 }
 
-function normalizeSubjects(values) {
-  return normalizeValues(values).filter(value => value !== "all");
-}
-
-function questionsForSubjects(questions, selectedSubjects) {
+function questionsForSubject(questions, subject) {
   const source = Array.isArray(questions) ? questions : [];
-  const subjects = normalizeSubjects(selectedSubjects);
-  if (!subjects.length) return source;
-  const selected = new Set(subjects);
-  return source.filter(question => selected.has(String(question.subject || "").trim()));
+  return subject && subject !== "all"
+    ? source.filter(question => String(question.subject || "").trim() === subject)
+    : source;
 }
 
 export function getStudySubjects(questions) {
@@ -23,60 +18,105 @@ export function getStudySubjects(questions) {
   )].sort();
 }
 
-export function getStudyPrimaryCategories(questions, selectedSubjects = []) {
+export function getStudyPrimaryCategories(questions, subject = "all") {
   return [...new Set(
-    questionsForSubjects(questions, selectedSubjects)
+    questionsForSubject(questions, subject)
       .map(question => normalizeValues(question.subcategories)[0] || "")
       .filter(Boolean)
   )].sort();
 }
 
-export function getStudyRelatedCategories(questions, selectedSubjects = [], selectedPrimaryCategories = []) {
-  const primaryCategories = normalizeValues(selectedPrimaryCategories);
-  const selectedPrimary = new Set(primaryCategories);
+export function getStudyRelatedCategories(questions, subject = "all", primaryCategory = "") {
+  if (!primaryCategory) return [];
 
   return [...new Set(
-    questionsForSubjects(questions, selectedSubjects)
-      .filter(question => {
-        if (!selectedPrimary.size) return true;
-        const primary = normalizeValues(question.subcategories)[0] || "";
-        return selectedPrimary.has(primary);
-      })
+    questionsForSubject(questions, subject)
+      .filter(question => normalizeValues(question.subcategories)[0] === primaryCategory)
       .flatMap(question => normalizeValues(question.subcategories).slice(1))
   )].sort();
 }
 
-export function normalizeStudySelection(questions, selection = {}) {
+export function normalizeStudyCondition(questions, condition = {}) {
   const subjects = getStudySubjects(questions);
-  const requestedSubjects = selection.selectedSubjects ?? selection.subject ?? [];
-  const selectedSubjects = normalizeSubjects(requestedSubjects)
-    .filter(subject => subjects.includes(subject));
-
-  const primaryCategories = getStudyPrimaryCategories(questions, selectedSubjects);
-  const requestedPrimaryCategories = selection.selectedPrimaryCategories ?? selection.primaryCategory ?? [];
-  const selectedPrimaryCategories = normalizeValues(requestedPrimaryCategories)
-    .filter(category => primaryCategories.includes(category));
-
-  const relatedCategories = getStudyRelatedCategories(
-    questions,
-    selectedSubjects,
-    selectedPrimaryCategories
-  );
-  const selectedRelatedCategories = normalizeValues(selection.selectedRelatedCategories)
+  const requestedSubject = String(condition.subject || "all").trim();
+  const subject = requestedSubject !== "all" && subjects.includes(requestedSubject)
+    ? requestedSubject
+    : "all";
+  const primaryCategories = getStudyPrimaryCategories(questions, subject);
+  const primaryCategory = primaryCategories.includes(condition.primaryCategory)
+    ? condition.primaryCategory
+    : "";
+  const relatedCategories = getStudyRelatedCategories(questions, subject, primaryCategory);
+  const selectedRelatedCategories = normalizeValues(condition.selectedRelatedCategories)
     .filter(category => relatedCategories.includes(category));
 
-  return { selectedSubjects, selectedPrimaryCategories, selectedRelatedCategories };
+  return { subject, primaryCategory, selectedRelatedCategories };
+}
+
+export function normalizeStudyConditionGroups(questions, groups) {
+  const subjects = getStudySubjects(questions);
+  return (Array.isArray(groups) ? groups : [])
+    .filter(group => group && typeof group === "object" && !Array.isArray(group))
+    .filter(group => group.subject === "all" || subjects.includes(String(group.subject || "").trim()))
+    .map(group => normalizeStudyCondition(questions, group))
+    .filter(group => group.primaryCategory)
+    .filter((group, index, source) => {
+      const key = JSON.stringify(group);
+      return source.findIndex(item => JSON.stringify(item) === key) === index;
+    });
+}
+
+export function migrateStudyConditionGroups(questions, state = {}) {
+  if (Array.isArray(state.studyConditionGroups)) {
+    return normalizeStudyConditionGroups(questions, state.studyConditionGroups);
+  }
+
+  const legacyGroups = Array.isArray(state.subcategoryConditionGroups)
+    ? state.subcategoryConditionGroups
+    : [];
+  if (legacyGroups.length) {
+    const legacySubject = state.subjectFilter || "all";
+    return normalizeStudyConditionGroups(questions, legacyGroups
+      .filter(group => Array.isArray(group) && group.length)
+      .map(group => ({
+        subject: legacySubject,
+        primaryCategory: group[0] || "",
+        selectedRelatedCategories: group.slice(1)
+      })));
+  }
+
+  const storedSubjects = Array.isArray(state.selectedSubjects) ? state.selectedSubjects : [];
+  const storedPrimaryCategories = Array.isArray(state.selectedPrimarySubcategories)
+    ? state.selectedPrimarySubcategories
+    : [];
+  if (storedSubjects.length <= 1 && storedPrimaryCategories.length <= 1) return [];
+
+  const subjects = storedSubjects.length ? storedSubjects : ["all"];
+  return normalizeStudyConditionGroups(questions, subjects.flatMap(subject => storedPrimaryCategories
+    .filter(primaryCategory => getStudyPrimaryCategories(questions, subject).includes(primaryCategory))
+    .map(primaryCategory => ({
+      subject,
+      primaryCategory,
+      selectedRelatedCategories: Array.isArray(state.selectedSubcategories) ? state.selectedSubcategories : []
+    }))));
+}
+
+function questionMatchesCondition(question, condition) {
+  if (condition.subject !== "all" && question.subject !== condition.subject) return false;
+  const categories = normalizeValues(question.subcategories);
+  if (condition.primaryCategory && categories[0] !== condition.primaryCategory) return false;
+  return condition.selectedRelatedCategories.every(category => categories.includes(category));
 }
 
 export function filterQuestionsForStudy(questions, selection = {}) {
-  const normalized = normalizeStudySelection(questions, selection);
-  const selectedPrimary = new Set(normalized.selectedPrimaryCategories);
+  const source = Array.isArray(questions) ? questions : [];
+  const groups = normalizeStudyConditionGroups(questions, selection.conditionGroups);
+  if (groups.length) {
+    return source.filter(question => groups.some(group => questionMatchesCondition(question, group)));
+  }
 
-  return questionsForSubjects(questions, normalized.selectedSubjects).filter(question => {
-    const categories = normalizeValues(question.subcategories);
-    if (selectedPrimary.size && !selectedPrimary.has(categories[0] || "")) return false;
-    return normalized.selectedRelatedCategories.every(category => categories.includes(category));
-  });
+  const draft = normalizeStudyCondition(questions, selection.draftCondition || selection);
+  return source.filter(question => questionMatchesCondition(question, draft));
 }
 
 export function calculateStudyCounters(questions, currentIndex, questionStatuses = {}) {

@@ -22,7 +22,9 @@ import {
   getStudyPrimaryCategories,
   getStudyRelatedCategories,
   getStudySubjects,
-  normalizeStudySelection
+  migrateStudyConditionGroups,
+  normalizeStudyCondition,
+  normalizeStudyConditionGroups
 } from "./core/study-filters.js";
 import { createImageMemory } from "./features/image-memory.js";
 import { createQuestionManager } from "./features/question-manager.js";
@@ -57,9 +59,10 @@ let filteredQuestions = [];
 let currentIndex = 0;
 let wrongQuestionIds = [];
 let deviceMode = "iphone";
-let selectedSubjects = [];
+let subjectFilter = "all";
 let selectedSubcategories = [];
-let selectedPrimarySubcategories = [];
+let selectedPrimarySubcategory = "";
+let studyConditionGroups = [];
 let migratedLegacyStudyFilters = false;
 let orderMode = "sequential";
 let progress = {};
@@ -82,13 +85,12 @@ const el = {
   correctCount: document.getElementById("correctCount"),
   wrongCount: document.getElementById("wrongCount"),
   studyMeta: document.getElementById("studyMeta"),
-  subjectFilterDropdown: document.getElementById("subjectFilterDropdown"),
-  subjectFilterSummary: document.getElementById("subjectFilterSummary"),
-  subjectFilterChecklist: document.getElementById("subjectFilterChecklist"),
-  primarySubcategoryDropdown: document.getElementById("primarySubcategoryDropdown"),
-  primarySubcategorySummary: document.getElementById("primarySubcategorySummary"),
-  primarySubcategoryChecklist: document.getElementById("primarySubcategoryChecklist"),
+  subjectFilter: document.getElementById("subjectFilter"),
+  primarySubcategorySelect: document.getElementById("primarySubcategorySelect"),
   relatedSubcategoryChecklist: document.getElementById("relatedSubcategoryChecklist"),
+  conditionGroupList: document.getElementById("conditionGroupList"),
+  addConditionGroupBtn: document.getElementById("addConditionGroupBtn"),
+  clearCurrentConditionBtn: document.getElementById("clearCurrentConditionBtn"),
   studyFilterMigrationNotice: document.getElementById("studyFilterMigrationNotice"),
   forceResetStudyFiltersBtn: document.getElementById("forceResetStudyFiltersBtn"),
   editSubcategories: document.getElementById("editSubcategories"),
@@ -212,83 +214,28 @@ function ensureCurrentQuestionAnswers(q) {
 
 
 function getPrimarySubcategories() {
-  return getStudyPrimaryCategories(allQuestions, selectedSubjects);
+  return getStudyPrimaryCategories(allQuestions, subjectFilter);
 }
 
 function getRelatedSubcategories() {
-  return getStudyRelatedCategories(allQuestions, selectedSubjects, selectedPrimarySubcategories);
+  return getStudyRelatedCategories(allQuestions, subjectFilter, selectedPrimarySubcategory);
 }
 
-function getFilterSelectionSummary(selectedItems, allLabel) {
-  if (!selectedItems.length) return allLabel;
-  if (selectedItems.length === 1) return selectedItems[0];
-  return `${selectedItems.length}件選択：${selectedItems.slice(0, 2).join("・")}${selectedItems.length > 2 ? "ほか" : ""}`;
-}
+function renderPrimarySubcategorySelect() {
+  if (!el.primarySubcategorySelect) return;
+  const primaryItems = getPrimarySubcategories();
 
-function renderFilterMultiselect({ checklist, summary, items, selectedItems, allLabel, onChange }) {
-  if (!checklist || !summary) return;
-  summary.textContent = getFilterSelectionSummary(selectedItems, allLabel);
-
-  if (!items.length) {
-    checklist.innerHTML = '<div class="condition-group-help">選択できる項目がありません。</div>';
+  if (!primaryItems.length) {
+    el.primarySubcategorySelect.innerHTML = '<option value="">章・大分類は未登録です</option>';
     return;
   }
 
-  checklist.innerHTML = `
-    <label class="filter-multiselect-row ${selectedItems.length ? "" : "is-active"}">
-      <input type="checkbox" data-select-all="true" ${selectedItems.length ? "" : "checked"}>
-      <span>${escapeHtml(allLabel)}</span>
-    </label>
-  ` + items.map(item => {
-    const checked = selectedItems.includes(item);
-    return `
-      <label class="filter-multiselect-row ${checked ? "is-active" : ""}">
-        <input type="checkbox" value="${escapeHtml(item)}" ${checked ? "checked" : ""}>
-        <span>${escapeHtml(item)}</span>
-      </label>
-    `;
-  }).join("");
-
-  [...checklist.querySelectorAll("input[type='checkbox']")].forEach(input => {
-    input.addEventListener("change", () => {
-      if (input.dataset.selectAll === "true") {
-        onChange([]);
-        return;
-      }
-      const next = input.checked
-        ? [...selectedItems, input.value]
-        : selectedItems.filter(item => item !== input.value);
-      onChange([...new Set(next)]);
-    });
-  });
-}
-
-function renderSubjectFilterChecklist() {
-  renderFilterMultiselect({
-    checklist: el.subjectFilterChecklist,
-    summary: el.subjectFilterSummary,
-    items: getStudySubjects(allQuestions),
-    selectedItems: selectedSubjects,
-    allLabel: "すべての教科",
-    onChange: nextSubjects => {
-      selectedSubjects = nextSubjects;
-      applyStudyFilterChange();
-    }
-  });
-}
-
-function renderPrimarySubcategoryChecklist() {
-  renderFilterMultiselect({
-    checklist: el.primarySubcategoryChecklist,
-    summary: el.primarySubcategorySummary,
-    items: getPrimarySubcategories(),
-    selectedItems: selectedPrimarySubcategories,
-    allLabel: "すべての章・大分類",
-    onChange: nextCategories => {
-      selectedPrimarySubcategories = nextCategories;
-      applyStudyFilterChange();
-    }
-  });
+  el.primarySubcategorySelect.innerHTML = '<option value="">章・大分類を選択してください</option>' +
+    primaryItems.map(item => `
+      <option value="${escapeHtml(item)}" ${item === selectedPrimarySubcategory ? "selected" : ""}>
+        ${escapeHtml(item)}
+      </option>
+    `).join("");
 }
 
 function renderRelatedSubcategoryChecklist() {
@@ -297,6 +244,11 @@ function renderRelatedSubcategoryChecklist() {
 
   if (!allQuestions.length) {
     list.innerHTML = '<div class="condition-group-help">問題が0件です。問題管理タブから問題を追加、またはJSON一括登録してください。</div>';
+    return;
+  }
+
+  if (!selectedPrimarySubcategory) {
+    list.innerHTML = '<div class="condition-group-help">章・大分類を選択すると追加カテゴリが表示されます。</div>';
     return;
   }
 
@@ -331,9 +283,76 @@ function renderRelatedSubcategoryChecklist() {
 }
 
 function renderStudyFilterControls() {
-  renderSubjectFilterChecklist();
-  renderPrimarySubcategoryChecklist();
+  updateSubjectOptions();
+  renderPrimarySubcategorySelect();
   renderRelatedSubcategoryChecklist();
+  renderConditionGroups();
+}
+
+function clearCurrentStudyCondition({ resetSubject = false } = {}) {
+  if (resetSubject) subjectFilter = "all";
+  selectedPrimarySubcategory = "";
+  selectedSubcategories = [];
+}
+
+function getCurrentStudyCondition() {
+  return normalizeStudyCondition(allQuestions, {
+    subject: subjectFilter,
+    primaryCategory: selectedPrimarySubcategory,
+    selectedRelatedCategories: selectedSubcategories
+  });
+}
+
+function addCurrentStudyCondition() {
+  const condition = getCurrentStudyCondition();
+  if (!condition.primaryCategory) {
+    alert("条件に追加する章・大分類を選択してください。");
+    return;
+  }
+
+  const key = JSON.stringify(condition);
+  if (!studyConditionGroups.some(group => JSON.stringify(group) === key)) {
+    studyConditionGroups.push(condition);
+  }
+
+  clearCurrentStudyCondition();
+  applyStudyFilterChange();
+}
+
+function renderConditionGroups() {
+  if (!el.conditionGroupList) return;
+  studyConditionGroups = normalizeStudyConditionGroups(allQuestions, studyConditionGroups);
+
+  if (!studyConditionGroups.length) {
+    el.conditionGroupList.innerHTML = '<div class="condition-group-help">追加済みの条件はありません。</div>';
+    return;
+  }
+
+  el.conditionGroupList.innerHTML = studyConditionGroups.map((condition, index) => {
+    const labels = [
+      condition.subject === "all" ? "全教科" : condition.subject,
+      condition.primaryCategory,
+      ...condition.selectedRelatedCategories
+    ];
+    return `
+      <div class="condition-group-card">
+        <div class="condition-group-header">
+          <div class="condition-group-title">条件${index + 1}</div>
+          <button class="condition-group-remove" type="button" data-remove-condition="${index}" title="条件${index + 1}を削除" aria-label="条件${index + 1}を削除">×</button>
+        </div>
+        <div class="condition-group-tags">
+          ${labels.map(label => `<span class="condition-group-tag">${escapeHtml(label)}</span>`).join("")}
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  [...el.conditionGroupList.querySelectorAll("[data-remove-condition]")].forEach(button => {
+    button.addEventListener("click", () => {
+      studyConditionGroups.splice(Number(button.dataset.removeCondition), 1);
+      applyStudyFilterChange();
+    });
+  });
 }
 
 function applyStudyFilterChange({ reshuffle = orderMode === "random", save = true } = {}) {
@@ -414,13 +433,9 @@ function resetWrongQuestions() {
 
 
 function resetStudyFiltersToAll() {
-  selectedSubjects = [];
-  selectedSubcategories = [];
-  selectedPrimarySubcategories = [];
+  clearCurrentStudyCondition({ resetSubject: true });
+  studyConditionGroups = [];
   currentIndex = 0;
-
-  if (el.subjectFilterDropdown) el.subjectFilterDropdown.open = false;
-  if (el.primarySubcategoryDropdown) el.primarySubcategoryDropdown.open = false;
 
   applyStudyFilterChange({ reshuffle: orderMode === "random" });
 }
@@ -428,9 +443,8 @@ function resetStudyFiltersToAll() {
 
 function getBaseStudyQuestions() {
   return filterQuestionsForStudy(allQuestions, {
-    selectedSubjects,
-    selectedPrimaryCategories: selectedPrimarySubcategories,
-    selectedRelatedCategories: selectedSubcategories
+    draftCondition: getCurrentStudyCondition(),
+    conditionGroups: studyConditionGroups
   });
 }
 
@@ -482,31 +496,37 @@ function ensureProgressRow(subject) {
 
 
 function cleanupStaleStudyFilters() {
-  const normalized = normalizeStudySelection(allQuestions, {
-    selectedSubjects,
-    selectedPrimaryCategories: selectedPrimarySubcategories,
+  const normalized = normalizeStudyCondition(allQuestions, {
+    subject: subjectFilter,
+    primaryCategory: selectedPrimarySubcategory,
     selectedRelatedCategories: selectedSubcategories
   });
-  selectedSubjects = normalized.selectedSubjects;
-  selectedPrimarySubcategories = normalized.selectedPrimaryCategories;
+  subjectFilter = normalized.subject;
+  selectedPrimarySubcategory = normalized.primaryCategory;
   selectedSubcategories = normalized.selectedRelatedCategories;
+  studyConditionGroups = normalizeStudyConditionGroups(allQuestions, studyConditionGroups);
 
   if (currentIndex >= filteredQuestions.length) {
     currentIndex = 0;
   }
 
   if (!allQuestions.length) {
-    selectedSubjects = [];
+    subjectFilter = "all";
     selectedSubcategories = [];
-    selectedPrimarySubcategories = [];
+    selectedPrimarySubcategory = "";
+    studyConditionGroups = [];
     currentIndex = 0;
   }
 }
 
 
 function updateSubjectOptions() {
-  cleanupStaleStudyFilters();
-  renderSubjectFilterChecklist();
+  if (!el.subjectFilter) return;
+  const subjects = getStudySubjects(allQuestions);
+  if (subjectFilter !== "all" && !subjects.includes(subjectFilter)) subjectFilter = "all";
+  el.subjectFilter.innerHTML = '<option value="all">すべての教科</option>' +
+    subjects.map(subject => `<option value="${escapeHtml(subject)}">${escapeHtml(subject)}</option>`).join("");
+  el.subjectFilter.value = subjectFilter;
 }
 
 
@@ -533,9 +553,13 @@ function renderStudy({ reshuffle = false } = {}) {
   el.iphoneArea.classList.toggle("hidden", deviceMode !== "iphone");
   el.ipadArea.classList.toggle("hidden", deviceMode !== "ipad");
 
-  const rangeText = selectedSubjects.length ? selectedSubjects.join("・") : "全教科";
-  const selectedCategoryLabels = [...selectedPrimarySubcategories, ...selectedSubcategories];
-  const subcatText = selectedCategoryLabels.length ? ` / カテゴリ: ${selectedCategoryLabels.join("・")}` : "";
+  const rangeText = studyConditionGroups.length
+    ? `追加条件: ${studyConditionGroups.length}件`
+    : (subjectFilter === "all" ? "全教科" : subjectFilter);
+  const selectedCategoryLabels = [selectedPrimarySubcategory, ...selectedSubcategories].filter(Boolean);
+  const subcatText = !studyConditionGroups.length && selectedCategoryLabels.length
+    ? ` / カテゴリ: ${selectedCategoryLabels.join("・")}`
+    : "";
   const orderText = orderMode === "random" ? "ランダム" : "順番どおり";
   const modeText = studyMode === "wrongOnly"
     ? " / 苦手復習"
@@ -1033,16 +1057,17 @@ function applyState(state) {
     currentIndex = Number.isInteger(state.currentIndex) ? state.currentIndex : 0;
     deviceMode = state.deviceMode || "iphone";
     const storedSubcategories = Array.isArray(state.selectedSubcategories) ? state.selectedSubcategories : [];
-    selectedSubjects = Array.isArray(state.selectedSubjects)
-      ? state.selectedSubjects
-      : (state.subjectFilter && state.subjectFilter !== "all" ? [state.subjectFilter] : []);
-    const legacyPrimarySubcategory = state.selectedPrimarySubcategory || storedSubcategories[0] || "";
-    selectedPrimarySubcategories = Array.isArray(state.selectedPrimarySubcategories)
+    const storedSubjects = Array.isArray(state.selectedSubjects) ? state.selectedSubjects : [];
+    const storedPrimaryCategories = Array.isArray(state.selectedPrimarySubcategories)
       ? state.selectedPrimarySubcategories
-      : (legacyPrimarySubcategory ? [legacyPrimarySubcategory] : []);
-    selectedSubcategories = storedSubcategories.filter(tag => !selectedPrimarySubcategories.includes(tag));
-    migratedLegacyStudyFilters = state.studyFilterVersion !== "multi-scope-v2" &&
-      Array.isArray(state.subcategoryConditionGroups) && state.subcategoryConditionGroups.length > 0;
+      : [];
+    subjectFilter = state.subjectFilter || (storedSubjects.length === 1 ? storedSubjects[0] : "all");
+    selectedPrimarySubcategory = state.selectedPrimarySubcategory ||
+      (storedPrimaryCategories.length === 1 ? storedPrimaryCategories[0] : "");
+    selectedSubcategories = storedSubcategories.filter(tag => tag !== selectedPrimarySubcategory);
+    studyConditionGroups = migrateStudyConditionGroups(allQuestions, state);
+    migratedLegacyStudyFilters = state.studyFilterVersion !== "condition-groups-v3" &&
+      studyConditionGroups.length > 0;
     orderMode = state.orderMode || "sequential";
     progress = state.progress || {};
     questionStatuses = state.questionStatuses || {};
@@ -1067,7 +1092,7 @@ function applyState(state) {
     if (el.studyFilterMigrationNotice) {
       el.studyFilterMigrationNotice.classList.toggle("hidden", !migratedLegacyStudyFilters);
       el.studyFilterMigrationNotice.textContent = migratedLegacyStudyFilters
-        ? "以前の条件セット検索は、複数教科・複数章・追加カテゴリの絞り込みへ移行しました。条件を確認してください。"
+        ? "以前の学習条件を、教科を含む条件追加方式へ移行しました。追加済み条件を確認してください。"
         : "";
     }
   } finally {
@@ -1102,12 +1127,12 @@ function updateLoginLockedUI() {
   el.pdfLockBanner.classList.toggle("hidden", loggedIn);
 
   setInteractiveDisabled([
-    "chooseIphone","chooseIpad","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn",
+    "chooseIphone","chooseIpad","subjectFilter","primarySubcategorySelect","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn","addConditionGroupBtn","clearCurrentConditionBtn",
     "userAnswer","judgeBtn","showAnswerBtnIpad","nextBtnIpad","showAnswerBtn","nextBtn",
     "knownBtn","unknownBtn","reviewWrongBtn","reviewUnansweredBtn","resetWrongQuestionsBtn"
   ], !loggedIn);
 
-  document.querySelectorAll("#subjectFilterChecklist input, #primarySubcategoryChecklist input, #relatedSubcategoryChecklist input")
+  document.querySelectorAll("#relatedSubcategoryChecklist input")
     .forEach(input => { input.disabled = !loggedIn; });
 
   setInteractiveDisabled([
@@ -1234,18 +1259,17 @@ function buildSplitStates() {
       filteredQuestionIds: filteredQuestions.map(q => q.id),
       currentIndex,
       deviceMode,
-      selectedSubjects,
+      subjectFilter,
       selectedSubcategories,
-      selectedPrimarySubcategories,
-      subcategoryConditionGroups: [],
-      selectedConditionGroupIndex: 0,
+      selectedPrimarySubcategory,
+      studyConditionGroups,
       orderMode,
       studyMode,
       manageSubjectFilter: questionSettings.manageSubjectFilter,
       managePrimarySubcategory: questionSettings.managePrimarySubcategory,
       manageSelectedSubcategories: questionSettings.manageSelectedSubcategories,
       pdfSelectedTagFilter: imageState.pdfSelectedTagFilter,
-      studyFilterVersion: "multi-scope-v2",
+      studyFilterVersion: "condition-groups-v3",
       schemaVersion: "split-v2",
       updatedAt: serverTimestamp()
     },
@@ -1428,23 +1452,21 @@ document.getElementById("chooseIpad").addEventListener("click", () => {
   autoSaveToCloud();
 });
 
-[el.subjectFilterDropdown, el.primarySubcategoryDropdown].forEach(dropdown => {
-  dropdown?.addEventListener("toggle", () => {
-    if (!dropdown.open) return;
-    [el.subjectFilterDropdown, el.primarySubcategoryDropdown]
-      .filter(other => other && other !== dropdown)
-      .forEach(other => { other.open = false; });
-    requestAnimationFrame(() => {
-      const options = dropdown.querySelector(".filter-multiselect-options");
-      const overflow = (options?.getBoundingClientRect().bottom || 0) - window.innerHeight + 16;
-      if (overflow > 0) window.scrollBy({ top: overflow, behavior: "auto" });
-    });
-  });
+el.subjectFilter.addEventListener("change", () => {
+  subjectFilter = el.subjectFilter.value || "all";
+  selectedPrimarySubcategory = "";
+  selectedSubcategories = [];
+  applyStudyFilterChange();
 });
-document.addEventListener("click", event => {
-  [el.subjectFilterDropdown, el.primarySubcategoryDropdown].forEach(dropdown => {
-    if (dropdown?.open && !dropdown.contains(event.target)) dropdown.open = false;
-  });
+el.primarySubcategorySelect.addEventListener("change", () => {
+  selectedPrimarySubcategory = el.primarySubcategorySelect.value || "";
+  selectedSubcategories = [];
+  applyStudyFilterChange();
+});
+el.addConditionGroupBtn.addEventListener("click", addCurrentStudyCondition);
+el.clearCurrentConditionBtn.addEventListener("click", () => {
+  clearCurrentStudyCondition({ resetSubject: true });
+  applyStudyFilterChange();
 });
 el.orderMode.addEventListener("change", () => {
   orderMode = el.orderMode.value;
