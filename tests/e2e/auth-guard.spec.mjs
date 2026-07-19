@@ -31,6 +31,8 @@ test("dangerous controls are not actionable before login", async ({ page }) => {
   await expect(page.locator("#tabBtnManage")).toBeHidden();
   await expect(page.locator("#tabBtnProgress")).toBeHidden();
   await expect(page.locator("#tabBtnPdf")).toBeHidden();
+  await expect(page.locator("#signUpBtn")).toHaveCount(0);
+  await expect(page.locator("#passwordConfirmInput")).toHaveCount(0);
 
   await expect(page.locator("#tab-manage")).toBeHidden();
   await expect(page.locator("#tab-progress")).toBeHidden();

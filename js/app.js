@@ -1,5 +1,4 @@
 import {
-  createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged
@@ -13,12 +12,18 @@ import {
   escapeHtml,
   formatDisplayText,
   normalizeAnswerList,
-  normalizeConditionGroup,
-  normalizeConditionGroups,
   normalizeQuestionAnswers,
   normalizeSubcategories,
   normalizeToken
 } from "./core/text-utils.js";
+import {
+  calculateStudyCounters,
+  filterQuestionsForStudy,
+  getStudyPrimaryCategories,
+  getStudyRelatedCategories,
+  getStudySubjects,
+  normalizeStudySelection
+} from "./core/study-filters.js";
 import { createImageMemory } from "./features/image-memory.js";
 import { createQuestionManager } from "./features/question-manager.js";
 import {
@@ -55,8 +60,7 @@ let deviceMode = "iphone";
 let subjectFilter = "all";
 let selectedSubcategories = [];
 let selectedPrimarySubcategory = "";
-let subcategoryConditionGroups = [];
-let selectedConditionGroupIndex = 0;
+let migratedLegacyStudyFilters = false;
 let orderMode = "sequential";
 let progress = {};
 let questionStatuses = {};
@@ -79,7 +83,9 @@ const el = {
   wrongCount: document.getElementById("wrongCount"),
   studyMeta: document.getElementById("studyMeta"),
   subjectFilter: document.getElementById("subjectFilter"),
-  studySubcategoryList: document.getElementById("studySubcategoryList"),
+  primarySubcategorySelect: document.getElementById("primarySubcategorySelect"),
+  relatedSubcategoryChecklist: document.getElementById("relatedSubcategoryChecklist"),
+  studyFilterMigrationNotice: document.getElementById("studyFilterMigrationNotice"),
   forceResetStudyFiltersBtn: document.getElementById("forceResetStudyFiltersBtn"),
   editSubcategories: document.getElementById("editSubcategories"),
   orderMode: document.getElementById("orderMode"),
@@ -95,7 +101,6 @@ const el = {
   searchInput: document.getElementById("searchInput"),
   emailInput: document.getElementById("emailInput"),
   passwordInput: document.getElementById("passwordInput"),
-  passwordConfirmInput: document.getElementById("passwordConfirmInput"),
   authStatus: document.getElementById("authStatus"),
   questionImageWrap: document.getElementById("questionImageWrap"),
   questionImage: document.getElementById("questionImage"),
@@ -106,10 +111,13 @@ const el = {
   imagePreview: document.getElementById("imagePreview"),
   imageStatusText: document.getElementById("imageStatusText"),
   bulkImportFile: document.getElementById("bulkImportFile"),
+  bulkImportImageFiles: document.getElementById("bulkImportImageFiles"),
   bulkImportValidateBtn: document.getElementById("bulkImportValidateBtn"),
   bulkImportExecuteBtn: document.getElementById("bulkImportExecuteBtn"),
   bulkImportResetBtn: document.getElementById("bulkImportResetBtn"),
   bulkImportStatus: document.getElementById("bulkImportStatus"),
+  managePanel: document.getElementById("tab-manage"),
+  manageFullscreenBtn: document.getElementById("manageFullscreenBtn"),
   tabBtnStudy: document.getElementById("tabBtnStudy"),
   tabBtnManage: document.getElementById("tabBtnManage"),
   tabBtnAuth: document.getElementById("tabBtnAuth"),
@@ -139,6 +147,7 @@ const el = {
   clearMaskSelectionBtn: document.getElementById("clearMaskSelectionBtn"),
   resetPdfRevealBtn: document.getElementById("resetPdfRevealBtn"),
   selectAllMasksBtn: document.getElementById("selectAllMasksBtn"),
+  markWeakMaskBtn: document.getElementById("markWeakMaskBtn"),
   showAllMasksBtn: document.getElementById("showAllMasksBtn"),
   studyCard: document.querySelector(".card"),
   studyActions: document.getElementById("studyActions"),
@@ -161,7 +170,8 @@ const questionManager = createQuestionManager({
   buildFilteredQuestions,
   renderProgressTable,
   renderStudy,
-  requestAutoSave: options => autoSaveToCloud(options)
+  requestAutoSave: options => autoSaveToCloud(options),
+  requestSave: options => saveToCloud(options)
 });
 
 const imageMemory = createImageMemory({
@@ -198,75 +208,18 @@ function ensureCurrentQuestionAnswers(q) {
 
 
 function getPrimarySubcategories() {
-  const source = subjectFilter === "all"
-    ? allQuestions
-    : allQuestions.filter(q => q.subject === subjectFilter);
-
-  return [...new Set(
-    source
-      .map(q => Array.isArray(q.subcategories) ? q.subcategories[0] : "")
-      .filter(Boolean)
-  )].sort();
+  return getStudyPrimaryCategories(allQuestions, subjectFilter);
 }
 
 function getRelatedSubcategories(primary) {
-  if (!primary) return [];
-
-  const source = subjectFilter === "all"
-    ? allQuestions
-    : allQuestions.filter(q => q.subject === subjectFilter);
-
-  return [...new Set(
-    source
-      .filter(q => Array.isArray(q.subcategories) && q.subcategories[0] === primary)
-      .flatMap(q => q.subcategories || [])
-      .filter(Boolean)
-  )].sort();
-}
-
-function ensureSubcategoryDropdownUi() {
-  if (document.getElementById("primarySubcategorySelect")) return;
-
-  if (!el.studySubcategoryList) return;
-
-  const panel = document.createElement("div");
-  panel.id = "subcatFilterPanel";
-  panel.className = "subcat-filter-panel";
-  panel.innerHTML = `
-    <select id="primarySubcategorySelect">
-      <option value="">章・大分類を選択してください</option>
-    </select>
-    <div class="subcat-checkbox-list" id="relatedSubcategoryChecklist">
-      <div class="condition-group-help">上のドロップダウンから章・大分類を選んでください。</div>
-    </div>
-  `;
-
-  el.studySubcategoryList.style.display = "none";
-  el.studySubcategoryList.insertAdjacentElement("afterend", panel);
-
-  document.getElementById("primarySubcategorySelect").addEventListener("change", () => {
-    selectedPrimarySubcategory = document.getElementById("primarySubcategorySelect").value || "";
-    selectedSubcategories = selectedPrimarySubcategory ? [selectedPrimarySubcategory] : [];
-    renderStudySubcategoryChips();
-    buildFilteredQuestions();
-    cleanupStaleStudyFilters();
-    renderStudy();
-    autoSaveToCloud();
-  });
+  return getStudyRelatedCategories(allQuestions, subjectFilter, primary);
 }
 
 function renderPrimarySubcategorySelect() {
-  ensureSubcategoryDropdownUi();
-
-  const select = document.getElementById("primarySubcategorySelect");
+  const select = el.primarySubcategorySelect;
   if (!select) return;
 
   const primaryItems = getPrimarySubcategories();
-
-  if (selectedPrimarySubcategory && !primaryItems.includes(selectedPrimarySubcategory)) {
-    selectedPrimarySubcategory = "";
-    selectedSubcategories = [];
-  }
 
   if (!primaryItems.length) {
     select.innerHTML = '<option value="">章・大分類は未登録です</option>';
@@ -283,9 +236,7 @@ function renderPrimarySubcategorySelect() {
 }
 
 function renderRelatedSubcategoryChecklist() {
-  ensureSubcategoryDropdownUi();
-
-  const list = document.getElementById("relatedSubcategoryChecklist");
+  const list = el.relatedSubcategoryChecklist;
   if (!list) return;
 
   if (!allQuestions.length) {
@@ -301,12 +252,8 @@ function renderRelatedSubcategoryChecklist() {
   const related = getRelatedSubcategories(selectedPrimarySubcategory);
 
   if (!related.length) {
-    list.innerHTML = '<div class="condition-group-help">関連サブカテゴリがありません。</div>';
+    list.innerHTML = '<div class="condition-group-help">この大分類には追加の関連カテゴリがありません。</div>';
     return;
-  }
-
-  if (!selectedSubcategories.includes(selectedPrimarySubcategory)) {
-    selectedSubcategories.unshift(selectedPrimarySubcategory);
   }
 
   list.innerHTML = related.map(tag => {
@@ -327,69 +274,22 @@ function renderRelatedSubcategoryChecklist() {
       } else {
         selectedSubcategories = selectedSubcategories.filter(tag => tag !== value);
       }
-
-      if (selectedPrimarySubcategory && !selectedSubcategories.includes(selectedPrimarySubcategory)) {
-        selectedSubcategories.unshift(selectedPrimarySubcategory);
-      }
-
-      renderRelatedSubcategoryChecklist();
-      renderConditionGroups();
-      buildFilteredQuestions();
-      renderStudy();
-      autoSaveToCloud();
+      applyStudyFilterChange();
     });
   });
 }
 
-
-function getAvailableSubcategories() {
-  const source = subjectFilter === "all"
-    ? allQuestions
-    : allQuestions.filter(q => q.subject === subjectFilter);
-
-  return [...new Set(
-    source.flatMap(q => Array.isArray(q.subcategories) ? q.subcategories : [])
-  )].sort();
-}
-
 function renderStudySubcategoryChips() {
-  const items = getAvailableSubcategories();
-
-  if (!items.length) {
-    el.studySubcategoryList.innerHTML = '<span class="subcat-title">サブカテゴリなし</span>';
-  } else {
-    el.studySubcategoryList.innerHTML = items.map(name => `
-      <button type="button" class="subcat-chip ${selectedSubcategories.includes(name) ? "active" : ""}" data-subcat="${escapeHtml(name)}">
-        ${escapeHtml(name)}
-      </button>
-    `).join("");
-
-    [...el.studySubcategoryList.querySelectorAll("[data-subcat]")].forEach(btn => {
-      btn.addEventListener("click", () => {
-        const value = btn.dataset.subcat;
-        if (selectedSubcategories.includes(value)) {
-          selectedSubcategories = selectedSubcategories.filter(item => item !== value);
-        } else {
-          selectedSubcategories = [...selectedSubcategories, value];
-        }
-        renderStudySubcategoryChips();
-        buildFilteredQuestions();
-        renderStudy();
-        autoSaveToCloud();
-      });
-    });
-  }
-
-  if (!selectedPrimarySubcategory && selectedSubcategories.length) {
-    const primaryItems = getPrimarySubcategories();
-    const first = selectedSubcategories.find(tag => primaryItems.includes(tag));
-    if (first) selectedPrimarySubcategory = first;
-  }
-
   renderPrimarySubcategorySelect();
   renderRelatedSubcategoryChecklist();
-  ensureConditionGroupUi();
-  renderConditionGroups();
+}
+
+function applyStudyFilterChange({ reshuffle = orderMode === "random", save = true } = {}) {
+  cleanupStaleStudyFilters();
+  studyMode = "normal";
+  currentIndex = 0;
+  renderStudy({ reshuffle });
+  if (save) autoSaveToCloud();
 }
 
 function getQuestionState(qid) {
@@ -465,96 +365,49 @@ function resetStudyFiltersToAll() {
   subjectFilter = "all";
   selectedSubcategories = [];
   selectedPrimarySubcategory = "";
-  subcategoryConditionGroups = [];
-  selectedConditionGroupIndex = 0;
   currentIndex = 0;
 
   if (el.subjectFilter) el.subjectFilter.value = "all";
 
-  const primarySelect = document.getElementById("primarySubcategorySelect");
-  if (primarySelect) primarySelect.value = "";
-
-  cleanupStaleStudyFilters();
-  renderStudySubcategoryChips();
-  renderConditionGroups();
-  buildFilteredQuestions();
-  renderStudy();
-  autoSaveToCloud();
-}
-
-function recoverStudyFiltersIfEmpty() {
-  if (!allQuestions.length) return false;
-
-  const beforeCount = filteredQuestions.length;
-  if (beforeCount > 0) return false;
-
-  const hadAnyFilter =
-    subjectFilter !== "all" ||
-    selectedSubcategories.length ||
-    selectedPrimarySubcategory ||
-    subcategoryConditionGroups.length;
-
-  if (!hadAnyFilter) return false;
-
-  subjectFilter = "all";
-  selectedSubcategories = [];
-  selectedPrimarySubcategory = "";
-  subcategoryConditionGroups = [];
-  selectedConditionGroupIndex = 0;
-  currentIndex = 0;
-
-  return true;
+  applyStudyFilterChange({ reshuffle: orderMode === "random" });
 }
 
 
 function getBaseStudyQuestions() {
-  let base = subjectFilter === "all"
-    ? [...allQuestions]
-    : allQuestions.filter(q => q.subject === subjectFilter);
-
-  const activeGroups = normalizeConditionGroups(subcategoryConditionGroups);
-  const currentGroup = normalizeConditionGroup(selectedSubcategories);
-
-  if (activeGroups.length || currentGroup.length) {
-    base = base.filter(q => {
-      const tags = Array.isArray(q.subcategories) ? q.subcategories : [];
-
-      const matchesSavedGroups = activeGroups.length
-        ? activeGroups.some(group => group.every(tag => tags.includes(tag)))
-        : false;
-
-      const matchesCurrentGroup = currentGroup.length
-        ? currentGroup.every(tag => tags.includes(tag))
-        : false;
-
-      // 条件セットがある場合: 保存済み条件セット OR 現在選択中の条件。
-      // 条件セットがない場合: 現在選択中の条件だけでAND検索。
-      // When condition groups exist: saved groups OR current selected group.
-      // When no condition group exists: use current selected group as normal AND search.
-      return activeGroups.length
-        ? (matchesSavedGroups || matchesCurrentGroup)
-        : matchesCurrentGroup;
-    });
-  }
-  return base;
+  return filterQuestionsForStudy(allQuestions, {
+    subject: subjectFilter,
+    primaryCategory: selectedPrimarySubcategory,
+    selectedRelatedCategories: selectedSubcategories
+  });
 }
 
-function getUnansweredQuestionsFromBase() {
-  return getBaseStudyQuestions().filter(q => getQuestionState(q.id) === null);
-}
-
-function applyCurrentStudyMode() {
+function applyCurrentStudyMode({ reshuffle = false } = {}) {
   const base = getBaseStudyQuestions();
+  let nextQuestions;
 
   if (studyMode === "wrongOnly") {
     const wrongSet = new Set(wrongQuestionIds);
-    filteredQuestions = base.filter(q => wrongSet.has(q.id));
+    nextQuestions = base.filter(q => wrongSet.has(q.id));
   } else if (studyMode === "unansweredOnly") {
-    filteredQuestions = base.filter(q => getQuestionState(q.id) === null);
+    nextQuestions = base.filter(q => getQuestionState(q.id) === null);
   } else {
-    filteredQuestions = orderMode === "random" ? shuffle(base) : base;
+    nextQuestions = base;
   }
 
+  if (orderMode === "random") {
+    if (reshuffle || !filteredQuestions.length) {
+      nextQuestions = shuffle(nextQuestions);
+    } else {
+      const nextById = new Map(nextQuestions.map(question => [question.id, question]));
+      const retained = filteredQuestions
+        .map(question => nextById.get(question.id))
+        .filter(Boolean);
+      const retainedIds = new Set(retained.map(question => question.id));
+      nextQuestions = [...retained, ...nextQuestions.filter(question => !retainedIds.has(question.id))];
+    }
+  }
+
+  filteredQuestions = nextQuestions;
   if (currentIndex >= filteredQuestions.length) currentIndex = 0;
 }
 
@@ -575,39 +428,15 @@ function ensureProgressRow(subject) {
 }
 
 
-function getAvailableSubcategorySetForCurrentSubject() {
-  const source = subjectFilter === "all"
-    ? allQuestions
-    : allQuestions.filter(q => q.subject === subjectFilter);
-
-  return new Set(
-    source.flatMap(q => Array.isArray(q.subcategories) ? q.subcategories : []).filter(Boolean)
-  );
-}
-
 function cleanupStaleStudyFilters() {
-  const subjects = [...new Set(allQuestions.map(q => q.subject).filter(Boolean))];
-
-  if (subjectFilter !== "all" && !subjects.includes(subjectFilter)) {
-    subjectFilter = "all";
-  }
-
-  const availableTags = getAvailableSubcategorySetForCurrentSubject();
-
-  selectedSubcategories = selectedSubcategories.filter(tag => availableTags.has(tag));
-
-  const primaryItems = getPrimarySubcategories();
-  if (selectedPrimarySubcategory && !primaryItems.includes(selectedPrimarySubcategory)) {
-    selectedPrimarySubcategory = "";
-  }
-
-  subcategoryConditionGroups = normalizeConditionGroups(subcategoryConditionGroups)
-    .map(group => group.filter(tag => availableTags.has(tag)))
-    .filter(group => group.length);
-
-  if (selectedConditionGroupIndex < 0 || selectedConditionGroupIndex >= subcategoryConditionGroups.length) {
-    selectedConditionGroupIndex = 0;
-  }
+  const normalized = normalizeStudySelection(allQuestions, {
+    subject: subjectFilter,
+    primaryCategory: selectedPrimarySubcategory,
+    selectedRelatedCategories: selectedSubcategories
+  });
+  subjectFilter = normalized.subject;
+  selectedPrimarySubcategory = normalized.primaryCategory;
+  selectedSubcategories = normalized.selectedRelatedCategories;
 
   if (currentIndex >= filteredQuestions.length) {
     currentIndex = 0;
@@ -617,15 +446,13 @@ function cleanupStaleStudyFilters() {
     subjectFilter = "all";
     selectedSubcategories = [];
     selectedPrimarySubcategory = "";
-    subcategoryConditionGroups = [];
-    selectedConditionGroupIndex = 0;
     currentIndex = 0;
   }
 }
 
 
 function updateSubjectOptions() {
-  const subjects = [...new Set(allQuestions.map(q => q.subject).filter(Boolean))].sort();
+  const subjects = getStudySubjects(allQuestions);
 
   if (!el.subjectFilter) return;
 
@@ -641,180 +468,24 @@ function updateSubjectOptions() {
 }
 
 
-function ensureConditionGroupUi() {
-  if (document.getElementById("conditionGroupBox")) return;
-
-  const subcatList =
-    document.getElementById("subcatFilterPanel") ||
-    document.getElementById("studySubcategoryList") ||
-    document.getElementById("subcategoryList") ||
-    document.getElementById("subCategoryList") ||
-    document.getElementById("subcatList") ||
-    document.querySelector("#tab-study .subcat-list") ||
-    [...document.querySelectorAll(".subcat-list")].find(node => node.querySelector(".subcat-chip"));
-
-  if (!subcatList) return;
-
-  const box = document.createElement("div");
-  box.id = "conditionGroupBox";
-  box.className = "condition-groups";
-  box.innerHTML = `
-    <div class="condition-group-help">
-条件セット検索：
-選択中のサブカテゴリを「条件セット」として追加できます。
-条件セット内はAND、条件セット同士はORです。
-
-例：
-条件1：2章_医療安全と感染予防 ＋ 分類
-条件2：3章_滅菌・消毒 ＋ 数値
-→ 条件1 または 条件2 に当てはまる問題を出題します。
-    </div>
-    <div class="grid3">
-      <button class="btn soft" id="addConditionGroupBtn" type="button">現在の選択を条件セット追加</button>
-      <button class="btn" id="clearCurrentSubcatBtn" type="button">現在の選択を解除</button>
-    </div>
-    <div id="conditionGroupList"></div>
-  `;
-
-  subcatList.insertAdjacentElement("afterend", box);
-
-  document.getElementById("addConditionGroupBtn").addEventListener("click", addCurrentSubcategoriesAsConditionGroup);
-  document.getElementById("clearCurrentSubcatBtn").addEventListener("click", () => {
-    selectedSubcategories = [];
-    selectedPrimarySubcategory = "";
-    renderStudySubcategoryChips();
-    renderConditionGroups();
-    buildFilteredQuestions();
-    renderStudy();
-    autoSaveToCloud();
-  });
-
-  renderConditionGroups();
-}
-
-function addCurrentSubcategoriesAsConditionGroup() {
-  const group = normalizeConditionGroup(selectedSubcategories);
-  if (!group.length) {
-    alert("条件セットに追加するサブカテゴリを選択してください。");
-    return;
-  }
-
-  const key = JSON.stringify(group);
-  const exists = subcategoryConditionGroups.some(existing => JSON.stringify(normalizeConditionGroup(existing)) === key);
-  if (!exists) {
-    subcategoryConditionGroups.push(group);
-    selectedConditionGroupIndex = subcategoryConditionGroups.length - 1;
-  } else {
-    selectedConditionGroupIndex = subcategoryConditionGroups.findIndex(existing => JSON.stringify(normalizeConditionGroup(existing)) === key);
-  }
-
-  // 次の条件を作れるように、現在の選択状態を完全に空にする。
-  // Clear the current selection completely so the next condition can be created.
-  selectedSubcategories = [];
-  selectedPrimarySubcategory = "";
-
-  renderStudySubcategoryChips();
-  renderConditionGroups();
-  buildFilteredQuestions();
-  renderStudy();
-  autoSaveToCloud();
-}
-
-function renderConditionGroups() {
-  const list = document.getElementById("conditionGroupList");
-  if (!list) return;
-
-  subcategoryConditionGroups = normalizeConditionGroups(subcategoryConditionGroups);
-
-  if (!subcategoryConditionGroups.length) {
-    selectedConditionGroupIndex = 0;
-    list.innerHTML = '<div class="condition-group-help">条件セットは未設定です。必要な場合は現在の選択を条件セットとして追加できます。</div>';
-    return;
-  }
-
-  if (selectedConditionGroupIndex < 0 || selectedConditionGroupIndex >= subcategoryConditionGroups.length) {
-    selectedConditionGroupIndex = 0;
-  }
-
-  const selectedGroup = subcategoryConditionGroups[selectedConditionGroupIndex] || [];
-
-  list.innerHTML = `
-    <select id="conditionGroupSelect" style="margin-bottom:10px;">
-      ${subcategoryConditionGroups.map((group, index) => `
-        <option value="${index}" ${index === selectedConditionGroupIndex ? "selected" : ""}>
-          条件${index + 1}：${escapeHtml(group.join(" ＋ "))}
-        </option>
-      `).join("")}
-    </select>
-
-    <div class="condition-group-card">
-      <div class="condition-group-title">条件${selectedConditionGroupIndex + 1}</div>
-      <div class="condition-group-tags">
-        ${selectedGroup.map(tag => `<span class="condition-group-tag">${escapeHtml(tag)}</span>`).join("")}
-      </div>
-      <button class="btn ng" type="button" id="removeSelectedConditionGroupBtn">この条件を削除</button>
-    </div>
-  `;
-
-  document.getElementById("conditionGroupSelect").addEventListener("change", event => {
-    selectedConditionGroupIndex = Number(event.target.value || 0);
-    renderConditionGroups();
-    autoSaveToCloud();
-  });
-
-  document.getElementById("removeSelectedConditionGroupBtn").addEventListener("click", () => {
-    subcategoryConditionGroups.splice(selectedConditionGroupIndex, 1);
-    if (selectedConditionGroupIndex >= subcategoryConditionGroups.length) {
-      selectedConditionGroupIndex = Math.max(0, subcategoryConditionGroups.length - 1);
-    }
-    renderConditionGroups();
-    buildFilteredQuestions();
-    renderStudy();
-    autoSaveToCloud();
-  });
-}
-
-function questionMatchesConditionGroups(q) {
-  const groups = normalizeConditionGroups(subcategoryConditionGroups);
-  if (!groups.length) return true;
-
-  const tags = Array.isArray(q.subcategories) ? q.subcategories : [];
-
-  // 条件セット内はAND、条件セット同士はOR。
-  // Inside each condition group is AND, between groups is OR.
-  return groups.some(group => group.every(tag => tags.includes(tag)));
-}
-
-
-function buildFilteredQuestions() {
-  applyCurrentStudyMode();
-
-  if (recoverStudyFiltersIfEmpty()) {
-    filteredQuestions = getBaseStudyQuestions();
-  }
+function buildFilteredQuestions(options = {}) {
+  applyCurrentStudyMode(options);
 }
 
 function updateStudyStatsOnly() {
-  el.totalCount.textContent = String(filteredQuestions.length);
-  el.currentCount.textContent = String(filteredQuestions.length ? currentIndex + 1 : 0);
-  el.correctCount.textContent = String(filteredQuestions.filter(q => getQuestionState(q.id) === 1).length);
-  el.wrongCount.textContent = String(filteredQuestions.filter(q => getQuestionState(q.id) === 2).length);
+  const counters = calculateStudyCounters(filteredQuestions, currentIndex, questionStatuses);
+  el.totalCount.textContent = String(counters.total);
+  el.currentCount.textContent = String(counters.current);
+  el.correctCount.textContent = String(counters.known);
+  el.wrongCount.textContent = String(counters.weak);
 }
 
-function renderStudy() {
-  if (allQuestions.length && filteredQuestions.length === 0 && recoverStudyFiltersIfEmpty()) buildFilteredQuestions();
+function renderStudy({ reshuffle = false } = {}) {
   cleanupStaleStudyFilters();
   updateSubjectOptions();
   renderStudySubcategoryChips();
-  buildFilteredQuestions();
-
-  el.totalCount.textContent = String(filteredQuestions.length);
-  el.currentCount.textContent = String(filteredQuestions.length ? currentIndex + 1 : 0);
-  const filteredIds = new Set(filteredQuestions.map(q => q.id));
-  const wrongCount = filteredQuestions.filter(q => questionStatuses[q.id] === "unknown").length;
-  const correctCount = filteredQuestions.filter(q => questionStatuses[q.id] === "known").length;
-  el.wrongCount.textContent = String(filteredQuestions.filter(q => getQuestionState(q.id) === 2).length);
-  el.correctCount.textContent = String(filteredQuestions.filter(q => getQuestionState(q.id) === 1).length);
+  buildFilteredQuestions({ reshuffle });
+  updateStudyStatsOnly();
 
   el.chooseIphone.classList.toggle("active", deviceMode === "iphone");
   el.chooseIpad.classList.toggle("active", deviceMode === "ipad");
@@ -822,7 +493,8 @@ function renderStudy() {
   el.ipadArea.classList.toggle("hidden", deviceMode !== "ipad");
 
   const rangeText = subjectFilter === "all" ? "全教科" : subjectFilter;
-  const subcatText = selectedSubcategories.length ? ` / サブカテゴリ: ${selectedSubcategories.join("・")}` : "";
+  const selectedCategoryLabels = [selectedPrimarySubcategory, ...selectedSubcategories].filter(Boolean);
+  const subcatText = selectedCategoryLabels.length ? ` / カテゴリ: ${selectedCategoryLabels.join("・")}` : "";
   const orderText = orderMode === "random" ? "ランダム" : "順番どおり";
   const modeText = studyMode === "wrongOnly"
     ? " / 苦手復習"
@@ -833,12 +505,13 @@ function renderStudy() {
 
   const q = currentQuestion();
   if (!q) {
-    el.question.textContent = "問題がありません。";
+    el.question.textContent = allQuestions.length ? "条件に合う問題がありません。" : "問題がありません。";
     renderQuestionImage(null);
     el.answerBox.style.display = "none";
     el.explainBox.style.display = "none";
     clearIpadAnswerInputs();
     clearJudgeStatus();
+    updateStudyNavigationButtons();
     return;
   }
 
@@ -1276,12 +949,8 @@ function resetProgress() {
 
 function applyStudyCondition() {
   subjectFilter = el.subjectFilter.value;
-  selectedSubcategories = selectedSubcategories.filter(name => getAvailableSubcategories().includes(name));
   orderMode = el.orderMode.value;
-  studyMode = "normal";
-  currentIndex = 0;
-  renderStudy();
-  autoSaveToCloud();
+  applyStudyFilterChange({ reshuffle: orderMode === "random" });
 }
 
 function shuffle(arr) {
@@ -1324,10 +993,11 @@ function applyState(state) {
     currentIndex = Number.isInteger(state.currentIndex) ? state.currentIndex : 0;
     deviceMode = state.deviceMode || "iphone";
     subjectFilter = state.subjectFilter || "all";
-    selectedSubcategories = Array.isArray(state.selectedSubcategories) ? state.selectedSubcategories : [];
-    selectedPrimarySubcategory = state.selectedPrimarySubcategory || selectedSubcategories[0] || "";
-    subcategoryConditionGroups = normalizeConditionGroups(state.subcategoryConditionGroups);
-    selectedConditionGroupIndex = Number.isInteger(state.selectedConditionGroupIndex) ? state.selectedConditionGroupIndex : 0;
+    const storedSubcategories = Array.isArray(state.selectedSubcategories) ? state.selectedSubcategories : [];
+    selectedPrimarySubcategory = state.selectedPrimarySubcategory || storedSubcategories[0] || "";
+    selectedSubcategories = storedSubcategories.filter(tag => tag !== selectedPrimarySubcategory);
+    migratedLegacyStudyFilters = state.studyFilterVersion !== "hierarchical-v1" &&
+      Array.isArray(state.subcategoryConditionGroups) && state.subcategoryConditionGroups.length > 0;
     orderMode = state.orderMode || "sequential";
     progress = state.progress || {};
     questionStatuses = state.questionStatuses || {};
@@ -1342,7 +1012,7 @@ function applyState(state) {
     updateSubjectOptions();
     el.subjectFilter.value = subjectFilter;
     el.orderMode.value = orderMode;
-    selectedSubcategories = selectedSubcategories.filter(name => getAvailableSubcategories().includes(name));
+    cleanupStaleStudyFilters();
     buildFilteredQuestions();
     renderManageTable();
     renderProgressTable();
@@ -1350,6 +1020,12 @@ function applyState(state) {
     renderPdfTable();
     renderPdfMaskTable();
     renderPdfViewer();
+    if (el.studyFilterMigrationNotice) {
+      el.studyFilterMigrationNotice.classList.toggle("hidden", !migratedLegacyStudyFilters);
+      el.studyFilterMigrationNotice.textContent = migratedLegacyStudyFilters
+        ? "以前の条件セット検索は、教科・大分類・関連カテゴリの絞り込みへ移行しました。条件を確認してください。"
+        : "";
+    }
   } finally {
     isApplyingCloudState = false;
   }
@@ -1382,18 +1058,18 @@ function updateLoginLockedUI() {
   el.pdfLockBanner.classList.toggle("hidden", loggedIn);
 
   setInteractiveDisabled([
-    "chooseIphone","chooseIpad","subjectFilter","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn",
+    "chooseIphone","chooseIpad","subjectFilter","primarySubcategorySelect","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn",
     "userAnswer","judgeBtn","showAnswerBtnIpad","nextBtnIpad","showAnswerBtn","nextBtn",
     "knownBtn","unknownBtn","reviewWrongBtn","reviewUnansweredBtn","resetWrongQuestionsBtn"
   ], !loggedIn);
 
   setInteractiveDisabled([
     "editSubject","searchInput","editQuestion","editAnswers","editExplanation","editOrderedAnswers","editImageFile","removeImageBtn","editImageName",
-    "addBtn","updateBtn","deleteBtn","clearFormBtn","saveCloudBtn","loadCloudBtn","bulkImportFile","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn",
+    "addBtn","updateBtn","deleteBtn","clearFormBtn","saveCloudBtn","loadCloudBtn","bulkImportFile","bulkImportImageFiles","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn","manageFullscreenBtn",
     "saveCloudBtn2","resetProgressBtn",
     "pdfTitleInput","pdfFileInput","addPdfBtn","updatePdfBtn","deletePdfBtn",
     "maskPageInput","maskXInput","maskYInput","maskWInput","maskHInput",
-    "addMaskModeBtn","updateMaskBtn","deleteMaskBtn","clearMaskSelectionBtn","resetPdfRevealBtn"
+    "addMaskModeBtn","updateMaskBtn","deleteMaskBtn","clearMaskSelectionBtn","selectAllMasksBtn","markWeakMaskBtn","showAllMasksBtn","resetPdfRevealBtn"
   ], !loggedIn);
 
   if (!loggedIn) {
@@ -1452,33 +1128,6 @@ async function initFirebase() {
     console.error(error);
     el.cloudStatus.textContent = "Firebase接続エラーです。\n" + (error.message || error);
     alert("Firebase接続エラーです。\n\n" + (error.message || error));
-  }
-}
-
-async function signUpUser() {
-  if (!auth) {
-    alert("Firebase未接続です。");
-    return;
-  }
-  const email = el.emailInput.value.trim();
-  const password = el.passwordInput.value;
-  const confirmPassword = el.passwordConfirmInput.value;
-
-  if (!email || !password) {
-    alert("メールアドレスとパスワードを入力してください。");
-    return;
-  }
-  if (password !== confirmPassword) {
-    alert("確認用パスワードが一致していません。");
-    return;
-  }
-
-  try {
-    await createUserWithEmailAndPassword(auth, email, password);
-    el.cloudStatus.textContent = "新規登録に成功しました。";
-  } catch (error) {
-    console.error(error);
-    alert("新規登録に失敗しました: " + error.message);
   }
 }
 
@@ -1542,19 +1191,20 @@ function buildSplitStates() {
       subjectFilter,
       selectedSubcategories,
       selectedPrimarySubcategory,
-      subcategoryConditionGroups,
-      selectedConditionGroupIndex,
+      subcategoryConditionGroups: [],
+      selectedConditionGroupIndex: 0,
       orderMode,
       studyMode,
       manageSubjectFilter: questionSettings.manageSubjectFilter,
       managePrimarySubcategory: questionSettings.managePrimarySubcategory,
       manageSelectedSubcategories: questionSettings.manageSelectedSubcategories,
       pdfSelectedTagFilter: imageState.pdfSelectedTagFilter,
-      schemaVersion: "split-v1",
+      studyFilterVersion: "hierarchical-v1",
+      schemaVersion: "split-v2",
       updatedAt: serverTimestamp()
     },
     main: {
-      schemaVersion: "split-v1",
+      schemaVersion: "split-v2",
       updatedAt: serverTimestamp()
     }
   };
@@ -1734,32 +1384,25 @@ document.getElementById("chooseIpad").addEventListener("click", () => {
 
 document.getElementById("subjectFilter").addEventListener("change", () => {
   subjectFilter = el.subjectFilter.value;
-  selectedSubcategories = selectedSubcategories.filter(name => getAvailableSubcategories().includes(name));
-  renderStudySubcategoryChips();
+  selectedPrimarySubcategory = "";
+  selectedSubcategories = [];
+  applyStudyFilterChange();
+});
+el.primarySubcategorySelect.addEventListener("change", () => {
+  selectedPrimarySubcategory = el.primarySubcategorySelect.value || "";
+  selectedSubcategories = [];
+  applyStudyFilterChange();
+});
+el.orderMode.addEventListener("change", () => {
+  orderMode = el.orderMode.value;
+  applyStudyFilterChange({ reshuffle: orderMode === "random" });
 });
 document.getElementById("applyStudyBtn").addEventListener("click", applyStudyCondition);
 document.getElementById("shuffleBtn").addEventListener("click", () => {
-  filteredQuestions = shuffle(filteredQuestions);
   currentIndex = 0;
-  renderStudyCurrentOnlyAfterShuffle();
+  renderStudy({ reshuffle: true });
   autoSaveToCloud();
 });
-
-function renderStudyCurrentOnlyAfterShuffle() {
-  el.totalCount.textContent = String(filteredQuestions.length);
-  el.currentCount.textContent = String(filteredQuestions.length ? currentIndex + 1 : 0);
-  const q = currentQuestion();
-  if (!q) return;
-  el.question.textContent = formatDisplayText(q.question);
-  renderQuestionImage(q);
-  el.answerBox.innerHTML = `<b>正解</b><br>${ensureCurrentQuestionAnswers(q).map(escapeDisplayText).join("\n")}`;
-  el.explainBox.innerHTML = `<b>解説</b><br>${escapeDisplayText(q.explanation || "解説なし")}`;
-  el.answerBox.style.display = "none";
-  el.explainBox.style.display = "none";
-  if (el.studyActions) el.studyActions.classList.remove("is-floating");
-  el.userAnswer.value = "";
-  clearJudgeStatus();
-}
 
 document.getElementById("showAnswerBtn").addEventListener("click", showAnswerAndExplanation);
 document.getElementById("showAnswerBtnIpad").addEventListener("click", showAnswerAndExplanation);
@@ -1783,7 +1426,6 @@ document.getElementById("resetProgressBtn").addEventListener("click", resetProgr
 questionManager.bindEvents();
 imageMemory.bindEvents();
 
-document.getElementById("signUpBtn").addEventListener("click", signUpUser);
 document.getElementById("signInBtn").addEventListener("click", signInUser);
 document.getElementById("signOutBtn").addEventListener("click", signOutUser);
 
@@ -1820,8 +1462,6 @@ function init() {
     try { showTab("auth"); } catch (error) { console.error("showTab failed", error); }
     try { movePdfMaskManagementBelowViewer(); } catch (error) { console.error("movePdfMaskManagementBelowViewer failed", error); }
     try { ensurePdfTagUi(); } catch (error) { console.error("ensurePdfTagUi failed", error); }
-    try { ensureConditionGroupUi(); } catch (error) { console.error("ensureConditionGroupUi failed", error); }
-
     if (el.forceResetStudyFiltersBtn) {
       el.forceResetStudyFiltersBtn.addEventListener("click", resetStudyFiltersToAll);
     }

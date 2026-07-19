@@ -15,7 +15,7 @@
       iPhone版は「見て覚える」、iPad版は「書いて判定する」形式です。<br>
       問題管理、苦手復習、教科別進捗、Firebaseログイン連携までまとめています。
     </div>
-    <div class="sub" id="appVersionLabel">画像マスク改善版 v10.60（テスト基盤・モジュール分割）</div>
+    <div class="sub" id="appVersionLabel">学習操作改善版 v10.61</div>
     <div class="banner" id="cloudStatus">Firebase接続を確認中です...</div>
   </div>
 
@@ -42,27 +42,40 @@
         </button>
       </div>
 
-      <div class="grid4" style="margin-bottom:12px;">
-        <select id="subjectFilter"></select>
-        <select id="orderMode">
-          <option value="sequential">順番どおり</option>
-          <option value="random">ランダム</option>
-        </select>
-        <button class="btn soft" id="applyStudyBtn" type="button">この条件で学習開始</button>
-        <button class="btn" id="shuffleBtn" type="button">今の範囲でシャッフル</button>
-        <button class="btn warn" id="forceResetStudyFiltersBtn" type="button">学習条件リセット</button>
-        <div class="helper" id="studyResetHelp">教科・章大分類・チェック済みサブカテゴリ・条件セット・現在位置をすべて初期化します。</div>
+      <div class="study-filter-grid">
+        <label class="field-group">
+          <span>教科</span>
+          <select id="subjectFilter"></select>
+        </label>
+        <label class="field-group">
+          <span>章・大分類</span>
+          <select id="primarySubcategorySelect"></select>
+        </label>
+        <label class="field-group">
+          <span>出題順</span>
+          <select id="orderMode">
+            <option value="sequential">順番どおり</option>
+            <option value="random">ランダム</option>
+          </select>
+        </label>
       </div>
 
       <div class="subcat-box" style="margin-bottom:12px;">
-        <div class="subcat-title">章・大分類を選ぶと、関連するサブカテゴリだけをチェックできます（複数選択時はすべて含む問題だけ表示 / 未選択なら全件）</div>
-        <div class="subcat-list" id="studySubcategoryList"></div>
+        <div class="subcat-title">追加カテゴリ（複数選択はすべてを含む問題）</div>
+        <div class="subcat-checkbox-list" id="relatedSubcategoryChecklist"></div>
       </div>
+
+      <div class="study-filter-actions">
+        <button class="btn soft" id="applyStudyBtn" type="button">先頭から学習</button>
+        <button class="btn" id="shuffleBtn" type="button">現在の対象をシャッフル</button>
+        <button class="btn warn" id="forceResetStudyFiltersBtn" type="button">条件をすべて解除</button>
+      </div>
+      <div class="banner hidden" id="studyFilterMigrationNotice"></div>
 
       <div class="stats">
         <div class="stat"><span class="k">学習中の問題数</span><span class="v" id="totalCount">0</span></div>
         <div class="stat"><span class="k">現在</span><span class="v" id="currentCount">0</span></div>
-        <div class="stat"><span class="k">解答済</span><span class="v" id="correctCount">0</span></div>
+        <div class="stat"><span class="k">できる</span><span class="v" id="correctCount">0</span></div>
         <div class="stat"><span class="k">苦手</span><span class="v" id="wrongCount">0</span></div>
       </div>
 
@@ -114,7 +127,10 @@
 
     <div id="tab-manage" class="hidden">
       <div class="banner hidden" id="manageLockBanner">ログインすると問題管理が使えます。</div>
-      <h2>問題管理</h2>
+      <div class="section-heading">
+        <h2>問題管理</h2>
+        <button class="icon-btn" id="manageFullscreenBtn" type="button" title="問題管理を全画面表示" aria-label="問題管理を全画面表示" aria-pressed="false">⛶</button>
+      </div>
       <div class="sub">
         検索・追加・更新・削除ができます。<br>
         形式は「教科 / サブカテゴリ / 問題 / 答え / 解説」です。答えが複数あるときは改行、または「，」（全角カンマ）で区切ってください。サブカテゴリは従来通り読点などで区切れます。
@@ -173,10 +189,11 @@
         <div class="sub">
           JSONファイルを読み込んで問題をまとめて追加できます。<br>
           追加前にバリデーションと整合性チェックを行い、問題がある行はダイアログで指摘します。<br>
-          現在は <b>配列形式</b> または <b>{"allQuestions":[...]}</b> のJSONに対応しています。
+          <b>配列形式</b> または <b>{"allQuestions":[...]}</b> のJSONに対応し、imageFileで指定した画像も同時に保存します。
         </div>
         <div class="grid4">
           <input id="bulkImportFile" type="file" accept=".json,application/json">
+          <input id="bulkImportImageFiles" type="file" accept="image/*" multiple title="JSONのimageFileで参照する画像を複数選択">
           <button class="btn" id="bulkImportValidateBtn" type="button">検証する</button>
           <button class="btn primary" id="bulkImportExecuteBtn" type="button">検証OKデータを一括追加</button>
           <button class="btn" id="bulkImportResetBtn" type="button">検証結果をクリア</button>
@@ -196,13 +213,11 @@
         同じメールアドレス / パスワードで iPhone と iPad の両方からログインすると、同じ人物としてデータを共有できます。<br>
         ログイン後はクラウド保存データを自動で読み込みます。
       </div>
-      <div class="grid3">
+      <div class="grid2">
         <input id="emailInput" type="email" placeholder="メールアドレス">
         <input id="passwordInput" type="password" placeholder="パスワード">
-        <input id="passwordConfirmInput" type="password" placeholder="新規登録時のみ確認用">
       </div>
-      <div class="grid3" style="margin-top:10px;">
-        <button class="btn primary" id="signUpBtn" type="button">新規登録</button>
+      <div class="grid2" style="margin-top:10px;">
         <button class="btn soft" id="signInBtn" type="button">ログイン</button>
         <button class="btn" id="signOutBtn" type="button">ログアウト</button>
       </div>
@@ -282,6 +297,7 @@
         <div class="grid4 pdf-mask-compact-actions">
           <button class="btn primary" id="addMaskModeBtn" type="button" title="隠し範囲をドラッグ追加">➕</button>
           <button class="btn soft" id="selectAllMasksBtn" type="button" title="マスクを全選択">☑️</button>
+          <button class="btn warn" id="markWeakMaskBtn" type="button" title="選択した隠し範囲の苦手色を切り替え">!</button>
           <button class="btn ok" id="showAllMasksBtn" type="button" title="マスクを全表示">👁️</button>
           <button class="btn" id="clearMaskSelectionBtn" type="button" title="選択解除">✖️</button>
           <button class="btn warn" id="resetPdfRevealBtn" type="button" title="表示状態リセット">↩️</button>
@@ -299,6 +315,7 @@
               <th>y</th>
               <th>幅</th>
               <th>高さ</th>
+              <th>状態</th>
             </tr>
           </thead>
           <tbody id="pdfMaskTableBody"></tbody>

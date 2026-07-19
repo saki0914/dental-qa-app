@@ -1,7 +1,7 @@
 import {
   doc,
   getDoc,
-  setDoc
+  writeBatch
 } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
 
 export function getSplitDocRefs(db, userId) {
@@ -38,10 +38,10 @@ export async function readLegacyDocument(db, userId) {
 
 export async function writeSplitDocuments(db, userId, splitState) {
   const refs = getSplitDocRefs(db, userId);
-  await Promise.all([
-    setDoc(refs.questions, splitState.questions),
-    setDoc(refs.pdfMaterials, splitState.pdfMaterials),
-    setDoc(refs.progress, splitState.progress),
-    setDoc(refs.settings, splitState.settings)
-  ]);
+  const batch = writeBatch(db);
+  batch.set(refs.questions, splitState.questions);
+  batch.set(refs.pdfMaterials, splitState.pdfMaterials);
+  batch.set(refs.progress, splitState.progress);
+  batch.set(refs.settings, splitState.settings);
+  await batch.commit();
 }

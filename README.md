@@ -23,6 +23,10 @@
 ### 2. Authentication を有効化する
 Firebase で **Email/Password** を ON にしてください。
 
+このアプリは既存ユーザー専用のため、新規登録画面を提供していません。ただし、画面を隠すだけではFirebase Authentication APIからの登録を防げません。Google Cloud Consoleの **Identity Platform > 設定 > User actions** で、エンドユーザーによるアカウント作成を無効にしてください。既存アカウントでのログインは引き続き利用できます。
+
+参考: [Identity Platformでユーザー操作を無効にする](https://docs.cloud.google.com/identity-platform/docs/concepts-manage-users#disable_user_actions)
+
 ### 3. Firestore を有効化する
 Cloud Firestore を作成してください。
 
@@ -44,6 +48,8 @@ Cloud Storage for Firebaseを利用するには、FirebaseプロジェクトのB
 - `js/core/`: テキスト正規化やエラー分類などのブラウザ非依存ロジック
 - `js/features/`: 問題管理と画像暗記の画面・状態・操作
 - `js/services/`: Firestoreの読込・書込
+
+画像付き問題の一括登録形式とMac/iPhone/iPadでの運用は、[`docs/QUESTION_IMPORT.md`](docs/QUESTION_IMPORT.md)を参照してください。
 
 ### 5. 公開する
 GitHub Pages などに `index.html` を置けば使えます。

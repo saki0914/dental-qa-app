@@ -39,8 +39,8 @@ export function createImageMemory(dependencies) {
   let pdfPinchStartZoom = 1;
   let pdfZoomEventsAttached = false;
   let pdfGestureStartZoom = 1;
-  let pdfPinchStartCenter = null;
-  let pdfPinchStartViewerScroll = null;
+  let pdfPinchAnchor = null;
+  let pdfGestureAnchor = null;
 
 function currentPdfMaterial() {
   return pdfMaterials.find(pdf => pdf.id === selectedPdfId) || null;
@@ -324,12 +324,12 @@ function renderPdfMaskTable() {
   if (!el.pdfMaskTableBody) return;
   const pdf = currentPdfMaterial();
   if (!pdf) {
-    el.pdfMaskTableBody.innerHTML = '<tr><td colspan="5">画像教材を選択してください。</td></tr>';
+    el.pdfMaskTableBody.innerHTML = '<tr><td colspan="6">画像教材を選択してください。</td></tr>';
     return;
   }
   const masks = Array.isArray(pdf.masks) ? pdf.masks : [];
   if (!masks.length) {
-    el.pdfMaskTableBody.innerHTML = '<tr><td colspan="5">隠し範囲がありません。</td></tr>';
+    el.pdfMaskTableBody.innerHTML = '<tr><td colspan="6">隠し範囲がありません。</td></tr>';
     return;
   }
 
@@ -340,6 +340,7 @@ function renderPdfMaskTable() {
       <td>${formatPercent(mask.y)}%</td>
       <td>${formatPercent(mask.width)}%</td>
       <td>${formatPercent(mask.height)}%</td>
+      <td>${mask.weak ? "苦手" : "通常"}</td>
     </tr>
   `).join("");
 
@@ -775,6 +776,32 @@ function selectAllMasks() {
   setPdfStatus(`マスクを全選択しました。${selectedMaskIds.length}件`);
 }
 
+function toggleWeakMasks() {
+  const pdf = currentPdfMaterial();
+  if (!pdf) {
+    alert("画像教材を選択してください。");
+    return;
+  }
+
+  const targetIds = selectedMaskIds.length
+    ? [...selectedMaskIds]
+    : (selectedMaskId ? [selectedMaskId] : []);
+  if (!targetIds.length) {
+    alert("苦手色を付ける隠し範囲を選択してください。");
+    return;
+  }
+
+  const targetSet = new Set(targetIds);
+  const targets = (pdf.masks || []).filter(mask => targetSet.has(mask.id));
+  const nextWeak = targets.some(mask => !mask.weak);
+  targets.forEach(mask => { mask.weak = nextWeak; });
+
+  renderPdfMaskTable();
+  updatePdfMaskElementsOnly();
+  setPdfStatus(`${targets.length}件を${nextWeak ? "苦手色にしました" : "通常色に戻しました"}。`);
+  requestAutoSave();
+}
+
 function showAllMasks() {
   const pdf = currentPdfMaterial();
   if (!pdf) {
@@ -838,10 +865,67 @@ function getTouchCenter(touches) {
 
 function applyPdfZoom() {
   if (!el.pdfViewerArea) return;
-  el.pdfViewerArea.querySelectorAll(".pdf-page-wrap").forEach(pageWrap => {
+  const pageWraps = [...el.pdfViewerArea.querySelectorAll(".pdf-page-wrap")];
+  const viewerStyle = getComputedStyle(el.pdfViewerArea);
+  const horizontalPadding = parseFloat(viewerStyle.paddingLeft) + parseFloat(viewerStyle.paddingRight);
+  const contentWidth = Math.max(0, el.pdfViewerArea.clientWidth - horizontalPadding);
+
+  pageWraps.forEach(pageWrap => {
     pageWrap.style.width = `${pdfZoom * 100}%`;
     pageWrap.style.maxWidth = `${920 * pdfZoom}px`;
+    const baseWidth = Math.min(contentWidth, 920);
+    pageWrap.style.marginRight = `${Math.max(0, contentWidth - baseWidth)}px`;
+    pageWrap.style.marginBottom = "0px";
   });
+}
+
+function getViewerCenter() {
+  const rect = el.pdfViewerArea.getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+function capturePdfZoomAnchor(clientX, clientY) {
+  if (!el.pdfViewerArea) return null;
+  let pageWrap = document.elementFromPoint(clientX, clientY)?.closest?.(".pdf-page-wrap");
+  if (!pageWrap || !el.pdfViewerArea.contains(pageWrap)) {
+    const pages = [...el.pdfViewerArea.querySelectorAll(".pdf-page-wrap")];
+    pageWrap = pages.find(page => {
+      const rect = page.getBoundingClientRect();
+      return clientY >= rect.top && clientY <= rect.bottom;
+    }) || pages[0];
+  }
+  if (!pageWrap) return null;
+
+  const rect = pageWrap.getBoundingClientRect();
+  return {
+    pageNumber: pageWrap.dataset.page,
+    xRatio: Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)),
+    yRatio: Math.min(1, Math.max(0, (clientY - rect.top) / rect.height))
+  };
+}
+
+function restorePdfZoomAnchor(anchor, clientX, clientY) {
+  if (!anchor || !el.pdfViewerArea) return;
+  const pageWrap = el.pdfViewerArea.querySelector(`.pdf-page-wrap[data-page="${anchor.pageNumber}"]`);
+  if (!pageWrap) return;
+  const rect = pageWrap.getBoundingClientRect();
+  const anchoredClientX = rect.left + rect.width * anchor.xRatio;
+  const anchoredClientY = rect.top + rect.height * anchor.yRatio;
+  el.pdfViewerArea.scrollLeft += anchoredClientX - clientX;
+  el.pdfViewerArea.scrollTop += anchoredClientY - clientY;
+
+  const adjustedRect = pageWrap.getBoundingClientRect();
+  const residualY = adjustedRect.top + adjustedRect.height * anchor.yRatio - clientY;
+  if (Math.abs(residualY) > 0.5) window.scrollBy(0, residualY);
+}
+
+function zoomPdfAt(nextZoom, clientX, clientY, anchor = null) {
+  const clampedZoom = clampPdfZoom(nextZoom);
+  if (clampedZoom === pdfZoom) return;
+  const resolvedAnchor = anchor || capturePdfZoomAnchor(clientX, clientY);
+  pdfZoom = clampedZoom;
+  applyPdfZoom();
+  restorePdfZoomAnchor(resolvedAnchor, clientX, clientY);
 }
 
 function attachPdfViewerZoomEvents() {
@@ -852,71 +936,67 @@ function attachPdfViewerZoomEvents() {
     if (event.touches.length === 2) {
       event.preventDefault();
       pdfPinchStartDistance = getTouchDistance(event.touches);
-      pdfPinchStartCenter = getTouchCenter(event.touches);
       pdfPinchStartZoom = pdfZoom;
-      pdfPinchStartViewerScroll = {
-        top: el.pdfViewerArea.scrollTop,
-        left: el.pdfViewerArea.scrollLeft
-      };
+      const center = getTouchCenter(event.touches);
+      pdfPinchAnchor = capturePdfZoomAnchor(center.x, center.y);
     }
   }, { passive: false });
 
   el.pdfViewerArea.addEventListener("touchmove", (event) => {
-    if (event.touches.length === 2 && pdfPinchStartDistance && pdfPinchStartCenter && pdfPinchStartViewerScroll) {
+    if (event.touches.length === 2 && pdfPinchStartDistance && pdfPinchAnchor) {
       event.preventDefault();
       event.stopPropagation();
 
       const currentDistance = getTouchDistance(event.touches);
       const currentCenter = getTouchCenter(event.touches);
 
-      pdfZoom = clampPdfZoom(pdfPinchStartZoom * (currentDistance / pdfPinchStartDistance));
-      applyPdfZoom();
-
-      // 2本指のまま動かした分だけ画像表示エリアを移動する。
-      // Move the viewer while two fingers are moving.
-      el.pdfViewerArea.scrollLeft = pdfPinchStartViewerScroll.left - (currentCenter.x - pdfPinchStartCenter.x);
-      el.pdfViewerArea.scrollTop = pdfPinchStartViewerScroll.top - (currentCenter.y - pdfPinchStartCenter.y);
+      zoomPdfAt(
+        pdfPinchStartZoom * (currentDistance / pdfPinchStartDistance),
+        currentCenter.x,
+        currentCenter.y,
+        pdfPinchAnchor
+      );
     }
   }, { passive: false });
 
   el.pdfViewerArea.addEventListener("touchend", (event) => {
     if (event.touches.length < 2) {
       pdfPinchStartDistance = null;
-      pdfPinchStartCenter = null;
-      pdfPinchStartViewerScroll = null;
+      pdfPinchAnchor = null;
       pdfPinchStartZoom = pdfZoom;
     }
   }, { passive: false });
 
   el.pdfViewerArea.addEventListener("touchcancel", () => {
     pdfPinchStartDistance = null;
-    pdfPinchStartCenter = null;
-    pdfPinchStartViewerScroll = null;
+    pdfPinchAnchor = null;
     pdfPinchStartZoom = pdfZoom;
   }, { passive: false });
 
   el.pdfViewerArea.addEventListener("gesturestart", (event) => {
     event.preventDefault();
     pdfGestureStartZoom = pdfZoom;
+    const center = getViewerCenter();
+    pdfGestureAnchor = capturePdfZoomAnchor(center.x, center.y);
   }, { passive: false });
 
   el.pdfViewerArea.addEventListener("gesturechange", (event) => {
     event.preventDefault();
-    pdfZoom = clampPdfZoom(pdfGestureStartZoom * event.scale);
-    applyPdfZoom();
+    const center = getViewerCenter();
+    zoomPdfAt(pdfGestureStartZoom * event.scale, center.x, center.y, pdfGestureAnchor);
   }, { passive: false });
 
   el.pdfViewerArea.addEventListener("gestureend", (event) => {
     event.preventDefault();
     pdfGestureStartZoom = pdfZoom;
+    pdfGestureAnchor = null;
   }, { passive: false });
 
   el.pdfViewerArea.addEventListener("wheel", (event) => {
     if (!event.ctrlKey && !event.metaKey) return;
     event.preventDefault();
     const direction = event.deltaY > 0 ? -0.08 : 0.08;
-    pdfZoom = clampPdfZoom(pdfZoom + direction);
-    applyPdfZoom();
+    zoomPdfAt(pdfZoom + direction, event.clientX, event.clientY);
   }, { passive: false });
 }
 
@@ -994,7 +1074,8 @@ function finishMaskDrag(pageNumber, startPoint, currentPoint) {
     x: Number(x.toFixed(2)),
     y: Number(y.toFixed(2)),
     width: Number(width.toFixed(2)),
-    height: Number(height.toFixed(2))
+    height: Number(height.toFixed(2)),
+    weak: false
   };
 
   if (!Array.isArray(pdf.masks)) pdf.masks = [];
@@ -1183,6 +1264,7 @@ function createPdfMaskElement(pageWrap, pdf, mask) {
   maskEl.type = "button";
   maskEl.className = "pdf-mask";
   if (revealMap[mask.id]) maskEl.classList.add("revealed");
+  if (mask.weak) maskEl.classList.add("is-weak");
   if (selectedMaskId === mask.id) maskEl.classList.add("selected");
   maskEl.style.left = `${mask.x}%`;
   maskEl.style.top = `${mask.y}%`;
@@ -1240,10 +1322,12 @@ function updatePdfMaskElementsOnly() {
   const pdf = currentPdfMaterial();
   if (!pdf || !el.pdfViewerArea) return;
   const revealMap = getPdfRevealMap(pdf.id);
+  const masksById = new Map((pdf.masks || []).map(mask => [mask.id, mask]));
 
   el.pdfViewerArea.querySelectorAll(".pdf-mask").forEach(maskEl => {
     const id = maskEl.dataset.maskId;
     maskEl.classList.toggle("revealed", !!revealMap[id]);
+    maskEl.classList.toggle("is-weak", !!masksById.get(id)?.weak);
     maskEl.classList.toggle("selected", selectedMaskId === id || selectedMaskIds.includes(id));
   });
 }
@@ -1452,7 +1536,9 @@ function renderPdfViewer(preserveScroll = false) {
     pdfMaterials = Array.isArray(persistedState.pdfMaterials)
       ? persistedState.pdfMaterials.map(pdf => ({
           ...pdf,
-          masks: Array.isArray(pdf.masks) ? pdf.masks : [],
+          masks: Array.isArray(pdf.masks)
+            ? pdf.masks.map(mask => ({ ...mask, weak: mask.weak === true }))
+            : [],
           tags: normalizePdfTags(pdf.tags || [])
         }))
       : [];
@@ -1484,6 +1570,7 @@ function renderPdfViewer(preserveScroll = false) {
     el.deleteMaskBtn?.addEventListener("click", deletePdfMask);
     el.clearMaskSelectionBtn?.addEventListener("click", clearPdfMaskSelection);
     el.selectAllMasksBtn?.addEventListener("click", selectAllMasks);
+    el.markWeakMaskBtn?.addEventListener("click", toggleWeakMasks);
     el.showAllMasksBtn?.addEventListener("click", showAllMasks);
     el.resetPdfRevealBtn?.addEventListener("click", resetPdfRevealState);
   }

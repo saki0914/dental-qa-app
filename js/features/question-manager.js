@@ -13,6 +13,11 @@ import {
   textToAnswers,
   textToTagList
 } from "../core/text-utils.js";
+import {
+  QUESTION_DOCUMENT_MAX_BYTES,
+  estimateQuestionDocumentBytes,
+  resolveImportImageFile
+} from "../core/question-import.js";
 
 export function createQuestionManager(dependencies) {
   const {
@@ -28,7 +33,8 @@ export function createQuestionManager(dependencies) {
     buildFilteredQuestions,
     renderProgressTable,
     renderStudy,
-    requestAutoSave
+    requestAutoSave,
+    requestSave
   } = dependencies;
 
   const shared = {};
@@ -71,10 +77,23 @@ function buildQuestionIdentity(item) {
   return [subject, question, answers.join("|")].join("::");
 }
 
+function isImageFile(file) {
+  return !!file && (
+    String(file.type || "").startsWith("image/") ||
+    /\.(?:avif|gif|heic|heif|jpe?g|png|webp)$/i.test(file.name || "")
+  );
+}
+
+function stripPendingImportFields(item) {
+  const { _pendingImageFile, _imageFileReference, ...question } = item;
+  return question;
+}
+
 function validateBulkImportItems(rawItems) {
   const issues = [];
   const warnings = [];
   const prepared = [];
+  const imageFiles = Array.from(el.bulkImportImageFiles?.files || []);
   const seenImport = new Set();
   const existingIds = new Set(shared.allQuestions.map(buildQuestionIdentity));
 
@@ -109,6 +128,16 @@ function validateBulkImportItems(rawItems) {
       issues.push(`行${rowNo}: orderedAnswers は true または false で指定してください。`);
     }
 
+    const imageFileReference = String(raw.imageFile || "").trim();
+    const resolvedImage = resolveImportImageFile(imageFileReference, imageFiles);
+    if (resolvedImage.error === "missing") {
+      issues.push(`行${rowNo}: imageFile「${imageFileReference}」に対応する画像が選択されていません。`);
+    } else if (resolvedImage.error === "ambiguous") {
+      issues.push(`行${rowNo}: imageFile「${imageFileReference}」と同名の画像が複数あります。ファイル名を一意にしてください。`);
+    } else if (resolvedImage.file && !isImageFile(resolvedImage.file)) {
+      issues.push(`行${rowNo}: imageFile「${imageFileReference}」は画像ファイルではありません。`);
+    }
+
     const preparedItem = {
       id: crypto.randomUUID(),
       subject,
@@ -119,7 +148,9 @@ function validateBulkImportItems(rawItems) {
       imageUrl: typeof raw.imageUrl === "string" ? raw.imageUrl.trim() : "",
       imagePath: typeof raw.imagePath === "string" ? raw.imagePath.trim() : "",
       imageName: typeof raw.imageName === "string" ? raw.imageName.trim() : "",
-      orderedAnswers: raw.orderedAnswers === true
+      orderedAnswers: raw.orderedAnswers === true,
+      _pendingImageFile: resolvedImage.file,
+      _imageFileReference: imageFileReference
     };
 
     const identity = buildQuestionIdentity(preparedItem);
@@ -137,7 +168,18 @@ function validateBulkImportItems(rawItems) {
     prepared.push(preparedItem);
   });
 
-  return { issues, warnings, prepared };
+  const estimatedBytes = estimateQuestionDocumentBytes([
+    ...shared.allQuestions,
+    ...prepared.map(stripPendingImportFields)
+  ]);
+  if (estimatedBytes > QUESTION_DOCUMENT_MAX_BYTES) {
+    issues.push(
+      `保存データの見積もりが${Math.ceil(estimatedBytes / 1000)}KBです。` +
+      `安全上限${Math.ceil(QUESTION_DOCUMENT_MAX_BYTES / 1000)}KBを超えるため分割してください。`
+    );
+  }
+
+  return { issues, warnings, prepared, estimatedBytes, selectedImageCount: imageFiles.length };
 }
 
 async function runBulkImportValidation() {
@@ -164,6 +206,8 @@ async function runBulkImportValidation() {
       `選択ファイル: ${file.name}`,
       `JSON件数: ${rawItems.length}件`,
       `追加候補: ${result.prepared.length}件`,
+      `選択画像: ${result.selectedImageCount}件`,
+      `保存サイズ見積もり: ${Math.ceil(result.estimatedBytes / 1000)}KB`,
       `エラー: ${result.issues.length}件`,
       `警告: ${result.warnings.length}件`
     ];
@@ -203,17 +247,55 @@ async function executeBulkImport() {
     return;
   }
 
-  shared.allQuestions = [...shared.allQuestions, ...bulkImportPreparedItems];
-  bulkImportPreparedItems.forEach(q => ensureProgressRow(q.subject));
-  selectedQuestionId = null;
-  afterQuestionMutation();
-  setBulkImportStatus((el.bulkImportStatus?.textContent || "") + `\n一括追加完了: ${bulkImportPreparedItems.length}件`);
-  alert(`一括追加が完了しました。\n${bulkImportPreparedItems.length}件を追加しました。`);
+  const beforeQuestions = shared.allQuestions;
+  const uploadedPaths = [];
+
+  try {
+    const uploadedItems = [];
+    for (const [index, item] of bulkImportPreparedItems.entries()) {
+      let imageMeta = {
+        imageUrl: item.imageUrl || "",
+        imagePath: item.imagePath || "",
+        imageName: item.imageName || ""
+      };
+      if (item._pendingImageFile) {
+        setBulkImportStatus(
+          `${el.bulkImportStatus?.textContent || ""}\n画像をアップロード中: ${index + 1}/${bulkImportPreparedItems.length}`
+        );
+        imageMeta = await uploadQuestionImage(
+          item.id,
+          item._pendingImageFile,
+          path => uploadedPaths.push(path)
+        );
+      }
+      uploadedItems.push({ ...stripPendingImportFields(item), ...imageMeta });
+    }
+
+    shared.allQuestions = [...beforeQuestions, ...uploadedItems];
+    uploadedItems.forEach(question => ensureProgressRow(question.subject));
+    selectedQuestionId = null;
+    renderAfterQuestionMutation();
+
+    const saved = await requestSave({ showAlerts: false });
+    if (!saved) throw new Error("クラウド保存が完了しませんでした。");
+
+    bulkImportPreparedItems = [];
+    setBulkImportStatus((el.bulkImportStatus?.textContent || "") + `\n一括追加・保存完了: ${uploadedItems.length}件`);
+    alert(`一括追加が完了しました。\n${uploadedItems.length}件を画像とともに保存しました。`);
+  } catch (error) {
+    shared.allQuestions = beforeQuestions;
+    await Promise.all(uploadedPaths.map(path => deleteQuestionImageByPath(path)));
+    recalcProgressFromQuestionStates();
+    renderAfterQuestionMutation();
+    setBulkImportStatus((el.bulkImportStatus?.textContent || "") + `\n一括追加を取り消しました: ${error.message}`);
+    alert("一括追加を取り消しました。追加途中の画像も削除しました。\n\n" + error.message);
+  }
 }
 
 function resetBulkImportState() {
   bulkImportPreparedItems = [];
   if (el.bulkImportFile) el.bulkImportFile.value = "";
+  if (el.bulkImportImageFiles) el.bulkImportImageFiles.value = "";
   setBulkImportStatus("JSONファイルを選択して「検証する」を押してください。");
 }
 
@@ -256,7 +338,10 @@ function getManagePrimarySubcategories() {
 function getManageRelatedSubcategories(primary) {
   if (!primary) return [];
   const source = manageSubjectFilter === "all" ? shared.allQuestions : shared.allQuestions.filter(q => q.subject === manageSubjectFilter);
-  return [...new Set(source.filter(q => Array.isArray(q.subcategories) && q.subcategories[0] === primary).flatMap(q => q.subcategories || []).filter(Boolean))].sort();
+  return [...new Set(source
+    .filter(q => Array.isArray(q.subcategories) && q.subcategories[0] === primary)
+    .flatMap(q => (q.subcategories || []).slice(1))
+    .filter(Boolean))].sort();
 }
 
 function ensureManageFilterUi() {
@@ -286,7 +371,7 @@ function ensureManageFilterUi() {
 
   document.getElementById("managePrimarySubcategorySelect").addEventListener("change", () => {
     managePrimarySubcategory = document.getElementById("managePrimarySubcategorySelect").value || "";
-    manageSelectedSubcategories = managePrimarySubcategory ? [managePrimarySubcategory] : [];
+    manageSelectedSubcategories = [];
     renderManageFilterUi();
     renderManageTable();
   });
@@ -341,10 +426,6 @@ function renderManageFilterUi() {
 
   const related = getManageRelatedSubcategories(managePrimarySubcategory);
 
-  if (!manageSelectedSubcategories.includes(managePrimarySubcategory)) {
-    manageSelectedSubcategories.unshift(managePrimarySubcategory);
-  }
-
   checklist.innerHTML = related.map(tag => {
     const checked = manageSelectedSubcategories.includes(tag);
     return `
@@ -364,10 +445,6 @@ function renderManageFilterUi() {
         }
       } else {
         manageSelectedSubcategories = manageSelectedSubcategories.filter(tag => tag !== value);
-      }
-
-      if (managePrimarySubcategory && !manageSelectedSubcategories.includes(managePrimarySubcategory)) {
-        manageSelectedSubcategories.unshift(managePrimarySubcategory);
       }
 
       renderManageFilterUi();
@@ -684,10 +761,11 @@ function renderManageTable() {
 }
 
 
-async function uploadQuestionImage(questionId, file) {
+async function uploadQuestionImage(questionId, file, onPathCreated = null) {
   if (!getStorage() || !getCurrentUser() || !file) return { imageUrl: "", imagePath: "", imageName: "" };
   const safeName = (file.name || "image").replace(/[^a-zA-Z0-9._-]/g, "_");
   const path = `users/${getCurrentUser().uid}/questions/${questionId}/${Date.now()}_${safeName}`;
+  if (onPathCreated) onPathCreated(path);
   const refObj = storageRef(getStorage(), path);
   await uploadBytes(refObj, file, { contentType: file.type || "image/jpeg" });
   const url = await getDownloadURL(refObj);
@@ -757,10 +835,9 @@ async function updateQuestion() {
   }
 
   if (pendingImageFile) {
-    if (before.imagePath) {
-      await deleteQuestionImageByPath(before.imagePath);
-    }
-    imageMeta = await uploadQuestionImage(selectedQuestionId, pendingImageFile);
+    const nextImageMeta = await uploadQuestionImage(selectedQuestionId, pendingImageFile);
+    if (before.imagePath) await deleteQuestionImageByPath(before.imagePath);
+    imageMeta = nextImageMeta;
   }
 
   shared.allQuestions[index] = { ...before, ...payload, subcategories: normalizeSubcategories(payload.subcategories), ...imageMeta };
@@ -813,12 +890,28 @@ function clearEditorForm() {
 }
 
 function afterQuestionMutation() {
+  renderAfterQuestionMutation();
+  requestAutoSave();
+}
+
+function renderAfterQuestionMutation() {
   cleanupStaleStudyFilters();
   updateSubjectOptions();
   renderManageTable();
   renderProgressTable();
   renderStudy();
-  requestAutoSave();
+}
+
+function setManageFullscreen(active) {
+  if (!el.managePanel || !el.manageFullscreenBtn) return;
+  el.managePanel.classList.toggle("is-manage-fullscreen", active);
+  document.body.classList.toggle("has-modal-surface", active);
+  el.manageFullscreenBtn.setAttribute("aria-pressed", String(active));
+  el.manageFullscreenBtn.setAttribute(
+    "aria-label",
+    active ? "問題管理の全画面表示を終了" : "問題管理を全画面表示"
+  );
+  el.manageFullscreenBtn.title = active ? "全画面表示を終了" : "問題管理を全画面表示";
 }
 
 
@@ -836,7 +929,7 @@ function afterQuestionMutation() {
     manageSubjectFilter = persistedState.manageSubjectFilter || "all";
     managePrimarySubcategory = persistedState.managePrimarySubcategory || "";
     manageSelectedSubcategories = Array.isArray(persistedState.manageSelectedSubcategories)
-      ? persistedState.manageSelectedSubcategories
+      ? persistedState.manageSelectedSubcategories.filter(tag => tag !== managePrimarySubcategory)
       : [];
     selectedQuestionId = null;
     manageDeleteSelectedIds = [];
@@ -847,6 +940,14 @@ function afterQuestionMutation() {
     el.bulkImportValidateBtn?.addEventListener("click", () => runBulkImportValidation().catch(console.error));
     el.bulkImportExecuteBtn?.addEventListener("click", () => executeBulkImport().catch(console.error));
     el.bulkImportResetBtn?.addEventListener("click", resetBulkImportState);
+    el.manageFullscreenBtn?.addEventListener("click", () => {
+      setManageFullscreen(!el.managePanel.classList.contains("is-manage-fullscreen"));
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && el.managePanel?.classList.contains("is-manage-fullscreen")) {
+        setManageFullscreen(false);
+      }
+    });
     document.getElementById("addBtn")?.addEventListener("click", () => addQuestion().catch(console.error));
     document.getElementById("updateBtn")?.addEventListener("click", () => updateQuestion().catch(console.error));
     document.getElementById("deleteBtn")?.addEventListener("click", deleteQuestion);
