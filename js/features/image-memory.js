@@ -209,9 +209,23 @@ function setPdfViewMode(mode, { save = true } = {}) {
   if (save) requestAutoSave();
 }
 
+function movePdfMaskActionsForFullscreen(active) {
+  if (!el.pdfMaskCompactActions || !el.pdfFullscreenMaskControls || !el.pdfMaskActionsHome) return;
+
+  if (active) {
+    el.pdfFullscreenMaskControls.append(el.pdfMaskCompactActions);
+    el.pdfFullscreenMaskControls.classList.remove("hidden");
+    return;
+  }
+
+  el.pdfMaskActionsHome.after(el.pdfMaskCompactActions);
+  el.pdfFullscreenMaskControls.classList.add("hidden");
+}
+
 function setPdfViewerFullscreen(active) {
   if (!el.pdfViewerShell || !el.pdfFullscreenBtn) return;
   pdfViewerFullscreen = active === true;
+  movePdfMaskActionsForFullscreen(pdfViewerFullscreen);
   el.pdfViewerShell.classList.toggle("is-fullscreen", pdfViewerFullscreen);
   document.body.classList.toggle("has-pdf-viewer-fullscreen", pdfViewerFullscreen);
   el.pdfFullscreenBtn.setAttribute("aria-pressed", String(pdfViewerFullscreen));
@@ -1832,6 +1846,7 @@ function renderPdfViewer(preserveScroll = false) {
       "";
     pdfViewMode = persistedState.pdfViewMode === "edit" ? "edit" : "study";
     pdfViewerFullscreen = false;
+    movePdfMaskActionsForFullscreen(false);
     el.pdfViewerShell?.classList.remove("is-fullscreen");
     document.body.classList.remove("has-pdf-viewer-fullscreen");
     if (el.pdfFullscreenBtn) {

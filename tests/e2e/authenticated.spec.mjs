@@ -269,13 +269,20 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
   await expect(page.locator("#pdfViewerShell")).toHaveClass(/is-fullscreen/);
   await expect(page.locator("body")).toHaveClass(/has-pdf-viewer-fullscreen/);
   await expect(page.locator("#pdfFullscreenBtn")).toHaveAttribute("aria-pressed", "true");
-  await captureVisualPair(page, "image-memory-viewer-fullscreen");
-  await page.locator("#pdfFullscreenBtn").click();
-  await expect(page.locator("#pdfViewerShell")).not.toHaveClass(/is-fullscreen/);
-  await expect(page.locator("body")).not.toHaveClass(/has-pdf-viewer-fullscreen/);
-  await page.locator("#pdfFullscreenBtn").click();
-  await page.keyboard.press("Escape");
-  await expect(page.locator("#pdfViewerShell")).not.toHaveClass(/is-fullscreen/);
+  const fullscreenMaskControls = page.locator("#pdfFullscreenMaskControls");
+  await expect(fullscreenMaskControls).toBeVisible();
+  await expect(fullscreenMaskControls.locator("#pdfMaskCompactActions > .btn")).toHaveCount(7);
+  for (const buttonId of [
+    "addMaskModeBtn",
+    "selectAllMasksBtn",
+    "markWeakMaskBtn",
+    "showAllMasksBtn",
+    "clearMaskSelectionBtn",
+    "resetPdfRevealBtn",
+    "deleteMaskBtn"
+  ]) {
+    await expect(fullscreenMaskControls.locator(`#${buttonId}`)).toBeVisible();
+  }
 
   await page.locator("#addMaskModeBtn").click();
   const pageWrap = page.locator(".pdf-page-wrap").first();
@@ -304,9 +311,24 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
   });
   await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).toHaveCount(1);
   await page.locator("#addMaskModeBtn").click();
+  await page.locator("#clearMaskSelectionBtn").click();
+  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).not.toHaveClass(/selected/);
+  await page.locator("#selectAllMasksBtn").click();
+  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).toHaveClass(/selected/);
   await page.locator("#markWeakMaskBtn").click();
   await expect(page.locator("#pdfMaskTableBody")).toContainText("苦手");
   await expect(page.locator(".pdf-mask")).toHaveClass(/is-weak/);
+  await captureVisualPair(page, "image-memory-viewer-fullscreen");
+  await page.locator("#pdfFullscreenBtn").click();
+  await expect(page.locator("#pdfViewerShell")).not.toHaveClass(/is-fullscreen/);
+  await expect(page.locator("body")).not.toHaveClass(/has-pdf-viewer-fullscreen/);
+  await expect(page.locator("#pdfFullscreenMaskControls")).toBeHidden();
+  await expect(page.locator("#pdfMaskManagementPanel #pdfMaskCompactActions")).toBeVisible();
+  await page.locator("#pdfFullscreenBtn").click();
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#pdfViewerShell")).not.toHaveClass(/is-fullscreen/);
+  await expect(page.locator("#pdfMaskManagementPanel #pdfMaskCompactActions")).toBeVisible();
+
   const touchAction = await page.locator(".pdf-page-wrap").evaluate(node => getComputedStyle(node).touchAction);
   expect(touchAction).toContain("pan-x");
   await captureVisualPair(page, "image-memory-study");

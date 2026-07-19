@@ -727,6 +727,18 @@
       background:var(--bg);
     }
     .pdf-viewer-shell.is-fullscreen .pdf-viewer-toolbar{flex:0 0 auto}
+    .pdf-viewer-shell.is-fullscreen .pdf-fullscreen-mask-controls{
+      flex:0 0 auto;
+      margin-bottom:8px;
+    }
+    .pdf-viewer-shell.is-fullscreen .pdf-fullscreen-mask-controls .pdf-mask-compact-actions{
+      grid-template-columns:repeat(7,minmax(0,1fr))!important;
+      gap:6px!important;
+    }
+    .pdf-viewer-shell.is-fullscreen .pdf-fullscreen-mask-controls .pdf-mask-compact-actions .btn{
+      min-height:44px!important;
+      padding:6px 2px!important;
+    }
     .pdf-viewer-shell.is-fullscreen .pdf-viewer{
       flex:1 1 auto;
       min-height:0;
