@@ -201,39 +201,6 @@
       gap:10px;
       margin-bottom:12px;
     }
-    .section-heading{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:12px;
-      margin-bottom:8px;
-    }
-    .section-heading h2{margin:0}
-    .icon-btn{
-      width:44px;
-      height:44px;
-      min-width:44px;
-      border:1px solid var(--line);
-      border-radius:8px;
-      background:#fff;
-      color:var(--text);
-      font-size:23px;
-      cursor:pointer;
-    }
-    body.has-modal-surface{overflow:hidden}
-    #tab-manage.is-manage-fullscreen{
-      position:fixed;
-      inset:0;
-      z-index:100;
-      display:block!important;
-      overflow:auto;
-      padding:16px max(16px,calc((100vw - 1100px) / 2));
-      padding-bottom:calc(16px + env(safe-area-inset-bottom));
-      background:var(--bg);
-      overscroll-behavior:contain;
-      -webkit-overflow-scrolling:touch;
-    }
-
     .study-actions{
       display:grid;
       grid-template-columns:repeat(5,1fr);
@@ -717,6 +684,58 @@
       touch-action:none!important;
     }
 
+    body.has-pdf-viewer-fullscreen{overflow:hidden}
+    .pdf-viewer-shell{
+      min-width:0;
+      margin-top:12px;
+    }
+    .pdf-viewer-toolbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      margin-bottom:8px;
+    }
+    .pdf-viewer-toolbar h3{
+      margin:0;
+      font-size:16px;
+    }
+    .pdf-fullscreen-btn{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      width:44px;
+      height:44px;
+      min-width:44px;
+      padding:0;
+      border:1px solid var(--line);
+      border-radius:8px;
+      background:#fff;
+      color:var(--text);
+      font-size:23px;
+      line-height:1;
+      cursor:pointer;
+    }
+    .pdf-viewer-shell.is-fullscreen{
+      position:fixed;
+      inset:0;
+      z-index:120;
+      display:flex;
+      flex-direction:column;
+      margin:0;
+      padding:max(10px,env(safe-area-inset-top)) max(10px,env(safe-area-inset-right)) max(10px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left));
+      background:var(--bg);
+    }
+    .pdf-viewer-shell.is-fullscreen .pdf-viewer-toolbar{flex:0 0 auto}
+    .pdf-viewer-shell.is-fullscreen .pdf-viewer{
+      flex:1 1 auto;
+      min-height:0;
+      max-height:none!important;
+      height:auto;
+      padding:8px!important;
+      border-radius:8px;
+    }
+
 
     .multi-answer-area{
       display:grid;
@@ -1033,9 +1052,5 @@
       .study-filter-actions,
       .import-box .grid4{
         grid-template-columns:1fr;
-      }
-      #tab-manage.is-manage-fullscreen{
-        padding:12px;
-        padding-bottom:calc(12px + env(safe-area-inset-bottom));
       }
     }

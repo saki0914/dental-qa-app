@@ -136,10 +136,7 @@
 
     <div id="tab-manage" class="hidden">
       <div class="banner hidden" id="manageLockBanner">ログインすると問題管理が使えます。</div>
-      <div class="section-heading">
-        <h2>問題管理</h2>
-        <button class="icon-btn" id="manageFullscreenBtn" type="button" title="問題管理を全画面表示" aria-label="問題管理を全画面表示" aria-pressed="false">⛶</button>
-      </div>
+      <h2>問題管理</h2>
       <div class="sub">
         検索・追加・更新・削除ができます。<br>
         形式は「教科 / サブカテゴリ / 問題 / 答え / 解説」です。答えが複数あるときは改行、または「，」（全角カンマ）で区切ってください。サブカテゴリは従来通り読点などで区切れます。
@@ -301,7 +298,20 @@
           </table>
         </div>
 
-        <div id="pdfViewerArea" class="pdf-viewer" style="margin-top:12px;"></div>
+        <div id="pdfViewerShell" class="pdf-viewer-shell">
+          <div class="pdf-viewer-toolbar">
+            <h3>教材画像</h3>
+            <button
+              class="pdf-fullscreen-btn"
+              id="pdfFullscreenBtn"
+              type="button"
+              title="教材画像を全画面表示"
+              aria-label="教材画像を全画面表示"
+              aria-pressed="false"
+            >⛶</button>
+          </div>
+          <div id="pdfViewerArea" class="pdf-viewer"></div>
+        </div>
 
         <div class="pdf-mask-sticky-panel" id="pdfMaskManagementPanel">
           <h3>隠し範囲の管理</h3>

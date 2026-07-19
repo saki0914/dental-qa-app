@@ -122,8 +122,6 @@ const el = {
   bulkImportExecuteBtn: document.getElementById("bulkImportExecuteBtn"),
   bulkImportResetBtn: document.getElementById("bulkImportResetBtn"),
   bulkImportStatus: document.getElementById("bulkImportStatus"),
-  managePanel: document.getElementById("tab-manage"),
-  manageFullscreenBtn: document.getElementById("manageFullscreenBtn"),
   tabBtnStudy: document.getElementById("tabBtnStudy"),
   tabBtnManage: document.getElementById("tabBtnManage"),
   tabBtnAuth: document.getElementById("tabBtnAuth"),
@@ -156,7 +154,9 @@ const el = {
   pdfEditTableBody: document.getElementById("pdfEditTableBody"),
   pdfEditPreview: document.getElementById("pdfEditPreview"),
   pdfMaskTableBody: document.getElementById("pdfMaskTableBody"),
+  pdfViewerShell: document.getElementById("pdfViewerShell"),
   pdfViewerArea: document.getElementById("pdfViewerArea"),
+  pdfFullscreenBtn: document.getElementById("pdfFullscreenBtn"),
   pdfStatus: document.getElementById("pdfStatus"),
   pdfEditStatus: document.getElementById("pdfEditStatus"),
   maskPageInput: document.getElementById("maskPageInput"),
@@ -1154,9 +1154,9 @@ function updateLoginLockedUI() {
 
   setInteractiveDisabled([
     "editSubject","searchInput","editQuestion","editAnswers","editExplanation","editOrderedAnswers","editImageFile","removeImageBtn","editImageName",
-    "addBtn","updateBtn","deleteBtn","clearFormBtn","saveCloudBtn","loadCloudBtn","bulkImportFile","bulkImportImageFiles","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn","manageFullscreenBtn",
+    "addBtn","updateBtn","deleteBtn","clearFormBtn","saveCloudBtn","loadCloudBtn","bulkImportFile","bulkImportImageFiles","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn",
     "saveCloudBtn2","resetProgressBtn",
-    "pdfStudyModeBtn","pdfEditModeBtn","pdfSearchInput","pdfSubjectFilterSelect","pdfCategoryFilterSelect",
+    "pdfStudyModeBtn","pdfEditModeBtn","pdfSearchInput","pdfSubjectFilterSelect","pdfCategoryFilterSelect","pdfFullscreenBtn",
     "pdfTitleInput","pdfSubjectInput","pdfCategoryInput","pdfFileInput","addPdfBtn","updatePdfBtn","clearPdfEditorBtn",
     "pdfSelectAllDeleteBtn","pdfClearDeleteSelectionBtn","pdfDeleteCheckedBtn",
     "maskPageInput","maskXInput","maskYInput","maskWInput","maskHInput",
@@ -1170,15 +1170,6 @@ function updateLoginLockedUI() {
   }
 }
 
-
-function movePdfMaskManagementBelowViewer() {
-  const panel = document.getElementById("pdfMaskManagementPanel");
-  const viewer = document.getElementById("pdfViewerArea");
-  if (!panel || !viewer) return;
-  if (viewer.nextElementSibling !== panel) {
-    viewer.parentNode.insertBefore(panel, viewer.nextSibling);
-  }
-}
 
 async function initFirebase() {
   try {
@@ -1556,7 +1547,6 @@ function init() {
     try { resetBulkImportState(); } catch (error) { console.error("resetBulkImportState failed", error); }
     try { updateLoginLockedUI(); } catch (error) { console.error("updateLoginLockedUI failed", error); }
     try { showTab("auth"); } catch (error) { console.error("showTab failed", error); }
-    try { movePdfMaskManagementBelowViewer(); } catch (error) { console.error("movePdfMaskManagementBelowViewer failed", error); }
     if (el.forceResetStudyFiltersBtn) {
       el.forceResetStudyFiltersBtn.addEventListener("click", resetStudyFiltersToAll);
     }

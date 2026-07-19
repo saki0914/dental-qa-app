@@ -39,6 +39,7 @@ export function createImageMemory(dependencies) {
   let pdfSubjectFilter = "all";
   let pdfCategoryFilter = "";
   let pdfViewMode = "study";
+  let pdfViewerFullscreen = false;
   let selectedMaskId = null;
   let selectedMaskIds = [];
   let pdfRevealStates = {};
@@ -206,6 +207,27 @@ function setPdfViewMode(mode, { save = true } = {}) {
     }
   }
   if (save) requestAutoSave();
+}
+
+function setPdfViewerFullscreen(active) {
+  if (!el.pdfViewerShell || !el.pdfFullscreenBtn) return;
+  pdfViewerFullscreen = active === true;
+  el.pdfViewerShell.classList.toggle("is-fullscreen", pdfViewerFullscreen);
+  document.body.classList.toggle("has-pdf-viewer-fullscreen", pdfViewerFullscreen);
+  el.pdfFullscreenBtn.setAttribute("aria-pressed", String(pdfViewerFullscreen));
+  el.pdfFullscreenBtn.setAttribute(
+    "aria-label",
+    pdfViewerFullscreen ? "教材画像の全画面表示を終了" : "教材画像を全画面表示"
+  );
+  el.pdfFullscreenBtn.title = pdfViewerFullscreen
+    ? "全画面表示を終了"
+    : "教材画像を全画面表示";
+  el.pdfFullscreenBtn.textContent = pdfViewerFullscreen ? "✕" : "⛶";
+
+  requestAnimationFrame(() => {
+    applyPdfZoom();
+    el.pdfFullscreenBtn.focus({ preventScroll: true });
+  });
 }
 
 function selectPdfMaterial(pdfId) {
@@ -1063,11 +1085,12 @@ function applyPdfZoom() {
   const viewerStyle = getComputedStyle(el.pdfViewerArea);
   const horizontalPadding = parseFloat(viewerStyle.paddingLeft) + parseFloat(viewerStyle.paddingRight);
   const contentWidth = Math.max(0, el.pdfViewerArea.clientWidth - horizontalPadding);
+  const maximumBaseWidth = pdfViewerFullscreen ? contentWidth : 920;
 
   pageWraps.forEach(pageWrap => {
     pageWrap.style.width = `${pdfZoom * 100}%`;
-    pageWrap.style.maxWidth = `${920 * pdfZoom}px`;
-    const baseWidth = Math.min(contentWidth, 920);
+    pageWrap.style.maxWidth = `${maximumBaseWidth * pdfZoom}px`;
+    const baseWidth = Math.min(contentWidth, maximumBaseWidth);
     pageWrap.style.marginRight = `${Math.max(0, contentWidth - baseWidth)}px`;
     pageWrap.style.marginBottom = "0px";
   });
@@ -1808,6 +1831,15 @@ function renderPdfViewer(preserveScroll = false) {
       legacySelectedTags[0] ||
       "";
     pdfViewMode = persistedState.pdfViewMode === "edit" ? "edit" : "study";
+    pdfViewerFullscreen = false;
+    el.pdfViewerShell?.classList.remove("is-fullscreen");
+    document.body.classList.remove("has-pdf-viewer-fullscreen");
+    if (el.pdfFullscreenBtn) {
+      el.pdfFullscreenBtn.setAttribute("aria-pressed", "false");
+      el.pdfFullscreenBtn.setAttribute("aria-label", "教材画像を全画面表示");
+      el.pdfFullscreenBtn.title = "教材画像を全画面表示";
+      el.pdfFullscreenBtn.textContent = "⛶";
+    }
     pdfAddMaskMode = false;
     pdfDraft = null;
 
@@ -1834,6 +1866,14 @@ function renderPdfViewer(preserveScroll = false) {
       renderPdfTable();
     });
     el.pdfDeleteCheckedBtn?.addEventListener("click", () => deleteCheckedPdfMaterials().catch(console.error));
+    el.pdfFullscreenBtn?.addEventListener("click", () => {
+      setPdfViewerFullscreen(!pdfViewerFullscreen);
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && pdfViewerFullscreen) {
+        setPdfViewerFullscreen(false);
+      }
+    });
     el.pdfStudyModeBtn?.addEventListener("click", () => setPdfViewMode("study"));
     el.pdfEditModeBtn?.addEventListener("click", () => setPdfViewMode("edit"));
     el.pdfSearchInput?.addEventListener("input", event => {

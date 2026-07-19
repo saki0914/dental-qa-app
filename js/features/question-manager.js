@@ -902,21 +902,6 @@ function renderAfterQuestionMutation() {
   renderStudy();
 }
 
-function setManageFullscreen(active) {
-  if (!el.managePanel || !el.manageFullscreenBtn) return;
-  el.managePanel.classList.toggle("is-manage-fullscreen", active);
-  document.body.classList.toggle("has-modal-surface", active);
-  el.manageFullscreenBtn.setAttribute("aria-pressed", String(active));
-  el.manageFullscreenBtn.setAttribute(
-    "aria-label",
-    active ? "問題管理の全画面表示を終了" : "問題管理を全画面表示"
-  );
-  el.manageFullscreenBtn.title = active ? "全画面表示を終了" : "問題管理を全画面表示";
-}
-
-
-
-
   function serialize() {
     return {
       manageSubjectFilter,
@@ -940,14 +925,6 @@ function setManageFullscreen(active) {
     el.bulkImportValidateBtn?.addEventListener("click", () => runBulkImportValidation().catch(console.error));
     el.bulkImportExecuteBtn?.addEventListener("click", () => executeBulkImport().catch(console.error));
     el.bulkImportResetBtn?.addEventListener("click", resetBulkImportState);
-    el.manageFullscreenBtn?.addEventListener("click", () => {
-      setManageFullscreen(!el.managePanel.classList.contains("is-manage-fullscreen"));
-    });
-    document.addEventListener("keydown", event => {
-      if (event.key === "Escape" && el.managePanel?.classList.contains("is-manage-fullscreen")) {
-        setManageFullscreen(false);
-      }
-    });
     document.getElementById("addBtn")?.addEventListener("click", () => addQuestion().catch(console.error));
     document.getElementById("updateBtn")?.addEventListener("click", () => updateQuestion().catch(console.error));
     document.getElementById("deleteBtn")?.addEventListener("click", deleteQuestion);
