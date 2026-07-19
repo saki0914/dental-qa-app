@@ -148,7 +148,10 @@ const el = {
   pdfFileInput: document.getElementById("pdfFileInput"),
   addPdfBtn: document.getElementById("addPdfBtn"),
   updatePdfBtn: document.getElementById("updatePdfBtn"),
-  deletePdfBtn: document.getElementById("deletePdfBtn"),
+  clearPdfEditorBtn: document.getElementById("clearPdfEditorBtn"),
+  pdfSelectAllDeleteBtn: document.getElementById("pdfSelectAllDeleteBtn"),
+  pdfClearDeleteSelectionBtn: document.getElementById("pdfClearDeleteSelectionBtn"),
+  pdfDeleteCheckedBtn: document.getElementById("pdfDeleteCheckedBtn"),
   pdfTableBody: document.getElementById("pdfTableBody"),
   pdfEditTableBody: document.getElementById("pdfEditTableBody"),
   pdfEditPreview: document.getElementById("pdfEditPreview"),
@@ -1154,7 +1157,8 @@ function updateLoginLockedUI() {
     "addBtn","updateBtn","deleteBtn","clearFormBtn","saveCloudBtn","loadCloudBtn","bulkImportFile","bulkImportImageFiles","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn","manageFullscreenBtn",
     "saveCloudBtn2","resetProgressBtn",
     "pdfStudyModeBtn","pdfEditModeBtn","pdfSearchInput","pdfSubjectFilterSelect","pdfCategoryFilterSelect",
-    "pdfTitleInput","pdfSubjectInput","pdfCategoryInput","pdfFileInput","addPdfBtn","updatePdfBtn","deletePdfBtn",
+    "pdfTitleInput","pdfSubjectInput","pdfCategoryInput","pdfFileInput","addPdfBtn","updatePdfBtn","clearPdfEditorBtn",
+    "pdfSelectAllDeleteBtn","pdfClearDeleteSelectionBtn","pdfDeleteCheckedBtn",
     "maskPageInput","maskXInput","maskYInput","maskWInput","maskHInput",
     "addMaskModeBtn","updateMaskBtn","deleteMaskBtn","clearMaskSelectionBtn","selectAllMasksBtn","markWeakMaskBtn","showAllMasksBtn","resetPdfRevealBtn"
   ], !loggedIn);

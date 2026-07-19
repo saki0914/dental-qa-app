@@ -363,25 +363,32 @@
             <datalist id="pdfCategoryOptions"></datalist>
           </label>
           <label class="field-group">
-            <span>PDF・画像</span>
+            <span>PDF・画像（更新時は差し替え）</span>
             <input id="pdfFileInput" type="file" accept="application/pdf,image/*" multiple>
           </label>
         </div>
         <div class="pdf-editor-actions">
           <button class="btn primary" id="addPdfBtn" type="button">教材追加</button>
           <button class="btn soft" id="updatePdfBtn" type="button">教材更新</button>
-          <button class="btn ng" id="deletePdfBtn" type="button">教材削除</button>
+          <button class="btn" id="clearPdfEditorBtn" type="button">入力クリア</button>
         </div>
         <div class="pdf-status" id="pdfEditStatus">教材を選択するか、新しい教材を入力してください。</div>
 
+        <div class="manage-bulk-actions pdf-bulk-actions" id="pdfBulkDeletePanel">
+          <button type="button" class="btn" id="pdfSelectAllDeleteBtn">全て選択</button>
+          <button type="button" class="btn" id="pdfClearDeleteSelectionBtn">選択解除</button>
+          <button type="button" class="btn ng" id="pdfDeleteCheckedBtn" disabled>選択した教材を削除</button>
+        </div>
         <div class="table-wrap pdf-editor-table-wrap" style="margin-top:12px;">
           <table>
             <thead>
               <tr>
+                <th style="width:64px;">削除</th>
+                <th style="width:110px;">更新</th>
                 <th>教材</th>
                 <th>教科</th>
                 <th>カテゴリ</th>
-                <th>画像</th>
+                <th style="width:72px;">画像</th>
               </tr>
             </thead>
             <tbody id="pdfEditTableBody"></tbody>

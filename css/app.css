@@ -338,6 +338,42 @@
       font-size:12px;
       line-height:1.5;
     }
+    .pdf-editor-table-wrap table{min-width:720px}
+    .pdf-editor-table-wrap tbody td{vertical-align:middle}
+    .pdf-edit-btn{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      width:100%;
+      min-width:88px;
+      height:40px;
+      min-height:38px;
+      max-height:40px;
+      padding:8px;
+      border:1px solid #bfdbfe;
+      border-radius:8px;
+      background:#eff6ff;
+      color:#1d4ed8;
+      font-size:13px;
+      font-weight:800;
+      line-height:1.2;
+      cursor:pointer;
+    }
+    .pdf-edit-btn.is-selected{
+      border-color:#1d4ed8;
+      background:#2563eb;
+      color:#fff;
+    }
+    .pdf-editing-row{
+      background:#eff6ff;
+      box-shadow:inset 3px 0 0 #2563eb;
+    }
+    .pdf-delete-check{
+      width:22px;
+      height:22px;
+      min-height:auto;
+    }
+    .pdf-delete-check:disabled{opacity:.35}
     .pdf-mask-toolbar{
       display:grid;
       grid-template-columns:repeat(6,1fr);
@@ -513,6 +549,8 @@
       .pdf-editor-fields,
       .pdf-editor-actions{grid-template-columns:1fr}
       .image-memory-mode-switch{width:100%}
+      .manage-bulk-actions.pdf-bulk-actions{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .manage-bulk-actions.pdf-bulk-actions .ng{grid-column:1 / -1}
     }
 
     .pdf-mask-sticky-panel{

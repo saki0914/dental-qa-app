@@ -33,6 +33,8 @@ export function createImageMemory(dependencies) {
 
   let pdfMaterials = [];
   let selectedPdfId = null;
+  let editingPdfId = null;
+  let pdfDeleteSelectedIds = [];
   let pdfSearchQuery = "";
   let pdfSubjectFilter = "all";
   let pdfCategoryFilter = "";
@@ -53,6 +55,10 @@ export function createImageMemory(dependencies) {
 
 function currentPdfMaterial() {
   return pdfMaterials.find(pdf => pdf.id === selectedPdfId) || null;
+}
+
+function currentEditingPdfMaterial() {
+  return pdfMaterials.find(pdf => pdf.id === editingPdfId) || null;
 }
 
 function currentPdfMask() {
@@ -190,10 +196,14 @@ function setPdfViewMode(mode, { save = true } = {}) {
   pdfViewMode = mode === "edit" ? "edit" : "study";
   renderPdfViewMode();
   if (pdfViewMode === "edit") {
-    fillPdfEditorForm(currentPdfMaterial());
+    fillPdfEditorForm(currentEditingPdfMaterial());
     renderPdfEditPreview();
   } else {
-    renderPdfViewer();
+    const selectionChanged = renderPdfTable();
+    if (!selectionChanged) {
+      renderPdfMaskTable();
+      renderPdfViewer();
+    }
   }
   if (save) requestAutoSave();
 }
@@ -204,16 +214,40 @@ function selectPdfMaterial(pdfId) {
   selectedMaskIds = [];
   pdfAddMaskMode = false;
   if (el.pdfViewerArea) el.pdfViewerArea.classList.remove("is-add-mask-mode");
-  fillPdfEditorForm(currentPdfMaterial());
   fillPdfMaskForm(null);
   renderPdfTable();
   renderPdfMaskTable();
-  if (pdfViewMode === "edit") {
-    renderPdfEditPreview();
-  } else {
-    renderPdfViewer();
-  }
+  renderPdfViewer();
   requestAutoSave();
+}
+
+function selectPdfMaterialForEdit(pdfId) {
+  const pdf = pdfMaterials.find(item => item.id === pdfId);
+  if (!pdf) {
+    alert("選択した画像教材が見つかりません。");
+    return;
+  }
+
+  editingPdfId = pdf.id;
+  pdfDeleteSelectedIds = pdfDeleteSelectedIds.filter(id => id !== editingPdfId);
+  fillPdfEditorForm(pdf);
+  if (el.pdfFileInput) el.pdfFileInput.value = "";
+  renderPdfTable();
+  renderPdfEditPreview();
+  setPdfEditStatus(`更新対象: ${pdf.title || "無題教材"}`);
+}
+
+function updatePdfBulkDeleteButtonState() {
+  const validIds = new Set(pdfMaterials.map(pdf => pdf.id));
+  pdfDeleteSelectedIds = [...new Set(pdfDeleteSelectedIds)]
+    .filter(id => validIds.has(id))
+    .filter(id => id !== editingPdfId);
+
+  if (!el.pdfDeleteCheckedBtn) return;
+  el.pdfDeleteCheckedBtn.disabled = pdfDeleteSelectedIds.length === 0;
+  el.pdfDeleteCheckedBtn.textContent = pdfDeleteSelectedIds.length
+    ? `選択した教材を削除（${pdfDeleteSelectedIds.length}件）`
+    : "選択した教材を削除";
 }
 
 
@@ -242,6 +276,20 @@ function renderPdfTable() {
     subject: pdfSubjectFilter,
     category: pdfCategoryFilter
   });
+  let learningSelectionChanged = false;
+
+  if (pdfViewMode === "study") {
+    const visibleIds = new Set(filteredMaterials.map(pdf => pdf.id));
+    if (!selectedPdfId || !visibleIds.has(selectedPdfId)) {
+      const nextPdfId = filteredMaterials[0]?.id || null;
+      learningSelectionChanged = selectedPdfId !== nextPdfId;
+      selectedPdfId = nextPdfId;
+      selectedMaskId = null;
+      selectedMaskIds = [];
+      pdfAddMaskMode = false;
+      fillPdfMaskForm(null);
+    }
+  }
 
   if (el.pdfTableBody) {
     el.pdfTableBody.innerHTML = filteredMaterials.length
@@ -269,8 +317,29 @@ function renderPdfTable() {
       ? pdfMaterials.map(rawPdf => {
           const pdf = normalizeImageMaterial(rawPdf);
           const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
+          const isEditing = editingPdfId === pdf.id;
+          const checked = pdfDeleteSelectedIds.includes(pdf.id);
           return `
-            <tr class="${selectedPdfId === pdf.id ? "selected" : ""}" data-pdf-id="${escapeHtml(pdf.id)}">
+            <tr class="${isEditing ? "pdf-editing-row" : ""}" data-edit-pdf-row="${escapeHtml(pdf.id)}">
+              <td>
+                <input
+                  type="checkbox"
+                  class="pdf-delete-check"
+                  data-delete-pdf="${escapeHtml(pdf.id)}"
+                  ${checked ? "checked" : ""}
+                  ${isEditing ? "disabled" : ""}
+                  aria-label="削除対象にする"
+                >
+              </td>
+              <td>
+                <button
+                  type="button"
+                  class="pdf-edit-btn ${isEditing ? "is-selected" : ""}"
+                  data-edit-pdf="${escapeHtml(pdf.id)}"
+                >
+                  ${isEditing ? "更新対象" : "編集"}
+                </button>
+              </td>
               <td>${escapeHtml(pdf.title || "無題教材")}</td>
               <td>${escapeHtml(pdf.subject)}</td>
               <td>${escapeHtml(pdf.categories.join(" / ") || "未登録")}</td>
@@ -278,14 +347,49 @@ function renderPdfTable() {
             </tr>
           `;
         }).join("")
-      : '<tr><td colspan="4">画像教材がありません。</td></tr>';
+      : '<tr><td colspan="6">画像教材がありません。</td></tr>';
   }
 
-  [el.pdfTableBody, el.pdfEditTableBody].filter(Boolean).forEach(body => {
-    [...body.querySelectorAll("tr[data-pdf-id]")].forEach(row => {
-      row.addEventListener("click", () => selectPdfMaterial(row.dataset.pdfId));
+  [...(el.pdfTableBody?.querySelectorAll("tr[data-pdf-id]") || [])].forEach(row => {
+    row.addEventListener("click", () => selectPdfMaterial(row.dataset.pdfId));
+  });
+
+  [...(el.pdfEditTableBody?.querySelectorAll("[data-edit-pdf]") || [])].forEach(button => {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      selectPdfMaterialForEdit(button.dataset.editPdf);
     });
   });
+
+  [...(el.pdfEditTableBody?.querySelectorAll("[data-edit-pdf-row]") || [])].forEach(row => {
+    row.addEventListener("click", event => {
+      if (event.target.closest("[data-delete-pdf], [data-edit-pdf]")) return;
+      selectPdfMaterialForEdit(row.dataset.editPdfRow);
+    });
+  });
+
+  [...(el.pdfEditTableBody?.querySelectorAll("[data-delete-pdf]") || [])].forEach(input => {
+    input.addEventListener("click", event => event.stopPropagation());
+    input.addEventListener("change", () => {
+      const id = input.dataset.deletePdf;
+      if (id === editingPdfId) {
+        input.checked = false;
+        return;
+      }
+      pdfDeleteSelectedIds = input.checked
+        ? [...new Set([...pdfDeleteSelectedIds, id])]
+        : pdfDeleteSelectedIds.filter(item => item !== id);
+      updatePdfBulkDeleteButtonState();
+    });
+  });
+
+  updatePdfBulkDeleteButtonState();
+
+  if (learningSelectionChanged) {
+    renderPdfMaskTable();
+    renderPdfViewer();
+  }
+  return learningSelectionChanged;
 }
 
 function renderPdfMaskTable() {
@@ -523,6 +627,15 @@ function readPdfEditorMetadata() {
   return { title, subject, categories, tags: categories };
 }
 
+function clearPdfEditorForm() {
+  editingPdfId = null;
+  fillPdfEditorForm(null);
+  if (el.pdfFileInput) el.pdfFileInput.value = "";
+  renderPdfTable();
+  renderPdfEditPreview();
+  setPdfEditStatus("新しい教材を入力してください。");
+}
+
 async function prepareAndUploadPdfPages(pdfId, selectedFiles) {
   const pdfFiles = selectedFiles.filter(isPdfFile);
   const imageFiles = selectedFiles.filter(isImageFile);
@@ -600,6 +713,8 @@ async function addPdfMaterial() {
     added = true;
 
     selectedPdfId = pdfId;
+    editingPdfId = pdfId;
+    pdfDeleteSelectedIds = pdfDeleteSelectedIds.filter(id => id !== pdfId);
     selectedMaskId = null;
     el.pdfFileInput.value = "";
     renderPdfTable();
@@ -614,6 +729,7 @@ async function addPdfMaterial() {
       await Promise.all(uploadResult.pages.map(page => deletePdfFileByPath(page.imagePath)));
     }
     selectedPdfId = pdfMaterials[0]?.id || null;
+    if (editingPdfId === pdfId) editingPdfId = null;
     renderPdfTable();
     renderPdfMaskTable();
     renderPdfEditPreview();
@@ -625,9 +741,9 @@ async function addPdfMaterial() {
 
 async function updatePdfMaterial() {
   if (!getCurrentUser()) return;
-  const pdf = currentPdfMaterial();
+  const pdf = currentEditingPdfMaterial();
   if (!pdf) {
-    alert("更新したい画像教材を選択してください。");
+    alert("更新したい画像教材を一覧の「編集」から選んでください。");
     return;
   }
   const metadata = readPdfEditorMetadata();
@@ -703,30 +819,39 @@ async function updatePdfMaterial() {
   }
 }
 
-async function deletePdfMaterial() {
+async function deleteCheckedPdfMaterials() {
   if (!getCurrentUser()) return;
 
-  const pdf = currentPdfMaterial();
-  if (!pdf) {
-    alert("削除したい画像教材を選択してください。");
+  const ids = [...new Set(pdfDeleteSelectedIds)].filter(id => id !== editingPdfId);
+  if (!ids.length) {
+    alert("削除する画像教材をチェックしてください。");
     return;
   }
 
-  const title = pdf.title || "無題教材";
-
+  const targets = pdfMaterials.filter(pdf => ids.includes(pdf.id));
+  const preview = targets
+    .slice(0, 10)
+    .map((pdf, index) => `${index + 1}. ${pdf.subject || "教科未設定"} / ${pdf.title || "無題教材"}`)
+    .join("\n");
+  const extra = targets.length > 10 ? `\n...ほか ${targets.length - 10}件` : "";
   const ok = confirm(
-    "この画像教材を削除しますか？\n\n" +
-    "Firestoreの教材データとStorage上の画像ファイルを削除します。\n\n" +
-    "教材：" + title
+    `${targets.length}件の画像教材を削除します。\n` +
+    "Firestoreの教材データとStorage上の画像ファイルが削除されます。\n\n" +
+    `削除対象:\n${preview}${extra}`
   );
   if (!ok) return;
 
-  const previousIndex = pdfMaterials.findIndex(item => item.id === pdf.id);
-  const previousRevealState = pdfRevealStates[pdf.id];
-  pdfMaterials = pdfMaterials.filter(item => item.id !== pdf.id);
-  delete pdfRevealStates[pdf.id];
+  const previousMaterials = pdfMaterials;
+  const previousRevealStates = pdfRevealStates;
+  const previousSelectedPdfId = selectedPdfId;
+  const idSet = new Set(ids);
+  pdfMaterials = pdfMaterials.filter(pdf => !idSet.has(pdf.id));
+  pdfRevealStates = Object.fromEntries(
+    Object.entries(pdfRevealStates).filter(([pdfId]) => !idSet.has(pdfId))
+  );
+  pdfDeleteSelectedIds = [];
 
-  if (selectedPdfId === pdf.id) {
+  if (selectedPdfId && idSet.has(selectedPdfId)) {
     selectedPdfId = pdfMaterials[0]?.id || null;
   }
 
@@ -735,9 +860,9 @@ async function deletePdfMaterial() {
 
   renderPdfTable();
   renderPdfMaskTable();
+  renderPdfViewer();
   renderPdfEditPreview();
-  fillPdfEditorForm(currentPdfMaterial());
-  setPdfEditStatus("画像教材を削除しています...");
+  setPdfEditStatus(`${targets.length}件の画像教材を削除しています...`);
 
   try {
     const saved = await requestSave({
@@ -745,15 +870,16 @@ async function deletePdfMaterial() {
       showAlerts: true
     });
     if (!saved) throw new Error("削除後の教材データをクラウド保存できませんでした。");
-    await deletePdfStorageFiles(pdf);
-    setPdfEditStatus("画像教材を削除しました。");
+    await Promise.all(targets.map(deletePdfStorageFiles));
+    setPdfEditStatus(`${targets.length}件の画像教材を削除しました。`);
   } catch (error) {
-    pdfMaterials.splice(previousIndex, 0, pdf);
-    if (previousRevealState) pdfRevealStates[pdf.id] = previousRevealState;
-    selectedPdfId = pdf.id;
-    fillPdfEditorForm(pdf);
+    pdfMaterials = previousMaterials;
+    pdfRevealStates = previousRevealStates;
+    selectedPdfId = previousSelectedPdfId;
+    pdfDeleteSelectedIds = ids;
     renderPdfTable();
     renderPdfMaskTable();
+    renderPdfViewer();
     renderPdfEditPreview();
     console.error(error);
     setPdfEditStatus("教材削除に失敗しました。\n" + (error.message || error));
@@ -1489,7 +1615,7 @@ async function setPdfImageSource(
 
 function renderPdfEditPreview() {
   if (!el.pdfEditPreview) return;
-  const pdf = currentPdfMaterial();
+  const pdf = currentEditingPdfMaterial();
   const renderToken = ++pdfRenderToken;
 
   if (!pdf) {
@@ -1667,6 +1793,8 @@ function renderPdfViewer(preserveScroll = false) {
         }))
       : [];
     selectedPdfId = persistedState.selectedPdfId || null;
+    editingPdfId = null;
+    pdfDeleteSelectedIds = [];
     selectedMaskId = persistedState.selectedMaskId || null;
     selectedMaskIds = [];
     pdfRevealStates = persistedState.pdfRevealStates || {};
@@ -1687,14 +1815,25 @@ function renderPdfViewer(preserveScroll = false) {
       selectedPdfId = null;
       selectedMaskId = null;
     }
-    fillPdfEditorForm(currentPdfMaterial());
+    fillPdfEditorForm(null);
     renderPdfViewMode();
   }
 
   function bindEvents() {
     el.addPdfBtn?.addEventListener("click", () => addPdfMaterial().catch(console.error));
     el.updatePdfBtn?.addEventListener("click", () => updatePdfMaterial().catch(console.error));
-    el.deletePdfBtn?.addEventListener("click", () => deletePdfMaterial().catch(console.error));
+    el.clearPdfEditorBtn?.addEventListener("click", clearPdfEditorForm);
+    el.pdfSelectAllDeleteBtn?.addEventListener("click", () => {
+      pdfDeleteSelectedIds = pdfMaterials
+        .filter(pdf => pdf.id !== editingPdfId)
+        .map(pdf => pdf.id);
+      renderPdfTable();
+    });
+    el.pdfClearDeleteSelectionBtn?.addEventListener("click", () => {
+      pdfDeleteSelectedIds = [];
+      renderPdfTable();
+    });
+    el.pdfDeleteCheckedBtn?.addEventListener("click", () => deleteCheckedPdfMaterials().catch(console.error));
     el.pdfStudyModeBtn?.addEventListener("click", () => setPdfViewMode("study"));
     el.pdfEditModeBtn?.addEventListener("click", () => setPdfViewMode("edit"));
     el.pdfSearchInput?.addEventListener("input", event => {
