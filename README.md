@@ -18,7 +18,7 @@
 ## 使い方
 
 ### 1. Firebase の設定を入れる
-`js/firebase-config.js` の `PRODUCTION_FIREBASE_CONFIG` を、自分の Firebase プロジェクトの値に置き換えてください。
+`js/config/firebase.js` の `PRODUCTION_FIREBASE_CONFIG` を、自分の Firebase プロジェクトの値に置き換えてください。
 
 ### 2. Authentication を有効化する
 Firebase で **Email/Password** を ON にしてください。
@@ -36,6 +36,14 @@ firebase deploy --project production --only firestore:rules,storage
 ```
 
 Cloud Storage for Firebaseを利用するには、FirebaseプロジェクトのBlazeプランと有効な請求先アカウントも必要です。課金アカウントが無効な場合、保存済み画像を含むStorageアクセスが402または403で失敗します。
+
+### JavaScriptの構成
+
+- `js/app.js`: 学習画面、認証、アプリ全体の状態調停
+- `js/config/`: Firebaseの接続設定
+- `js/core/`: テキスト正規化やエラー分類などのブラウザ非依存ロジック
+- `js/features/`: 問題管理と画像暗記の画面・状態・操作
+- `js/services/`: Firestoreの読込・書込
 
 ### 5. 公開する
 GitHub Pages などに `index.html` を置けば使えます。

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 
 const jsonFiles = [
   "package.json",
@@ -20,8 +21,17 @@ if (/<script type="module">/.test(html)) {
   throw new Error("inline module script remains in index.html");
 }
 
-for (const file of readdirSync("js").filter(file => file.endsWith(".js")).sort()) {
-  execFileSync(process.execPath, ["--check", `js/${file}`], { stdio: "inherit" });
+function collectJavaScriptFiles(directory) {
+  return readdirSync(directory, { withFileTypes: true })
+    .flatMap(entry => {
+      const path = join(directory, entry.name);
+      return entry.isDirectory() ? collectJavaScriptFiles(path) : [path];
+    })
+    .filter(file => file.endsWith(".js"));
+}
+
+for (const file of collectJavaScriptFiles("js").sort()) {
+  execFileSync(process.execPath, ["--check", file], { stdio: "inherit" });
 }
 
 console.log("check OK");

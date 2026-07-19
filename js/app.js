@@ -5,18 +5,9 @@ import {
   onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-auth.js";
 import {
-  doc,
-  getDoc,
-  setDoc,
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
-import {
-  ref as storageRef,
-  uploadBytes,
-  getDownloadURL,
-  deleteObject
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-storage.js";
-import { initializeFirebaseServices } from "./firebase-config.js";
+import { initializeFirebaseServices } from "./config/firebase.js";
 import {
   escapeDisplayText,
   escapeHtml,
@@ -24,14 +15,18 @@ import {
   normalizeAnswerList,
   normalizeConditionGroup,
   normalizeConditionGroups,
-  normalizePdfTags,
   normalizeQuestionAnswers,
   normalizeSubcategories,
-  normalizeToken,
-  textToAnswerList,
-  textToAnswers,
-  textToTagList
-} from "./text-utils.js";
+  normalizeToken
+} from "./core/text-utils.js";
+import { createImageMemory } from "./features/image-memory.js";
+import { createQuestionManager } from "./features/question-manager.js";
+import {
+  readLegacyDocument,
+  readSaveGuardDocuments,
+  readSplitDocuments,
+  writeSplitDocuments
+} from "./services/cloud-store.js";
 
 
 window.addEventListener("error", event => {
@@ -63,40 +58,10 @@ let selectedPrimarySubcategory = "";
 let subcategoryConditionGroups = [];
 let selectedConditionGroupIndex = 0;
 let orderMode = "sequential";
-let selectedQuestionId = null;
-let manageSubjectFilter = "all";
-let managePrimarySubcategory = "";
-let manageSelectedSubcategories = [];
-let pdfSelectedTagFilter = "";
-let isRenderingManageFilter = false;
-let manageDeleteSelectedIds = [];
 let progress = {};
 let questionStatuses = {};
 let studyMode = "normal";
 let isApplyingCloudState = false;
-let currentEditingImageUrl = "";
-let currentEditingImageName = "";
-let currentEditingImagePath = "";
-let pendingImageFile = null;
-let pendingRemoveImage = false;
-let bulkImportPreparedItems = [];
-let pdfMaterials = [];
-let selectedPdfId = null;
-let pdfSearchQuery = "";
-let selectedPdfTags = [];
-let selectedMaskId = null;
-let selectedMaskIds = [];
-let pdfRevealStates = {};
-let pdfAddMaskMode = false;
-let pdfDraft = null;
-let pdfRenderToken = 0;
-let pdfZoom = 1;
-let pdfPinchStartDistance = null;
-let pdfPinchStartZoom = 1;
-let pdfZoomEventsAttached = false;
-let pdfGestureStartZoom = 1;
-let pdfPinchStartCenter = null;
-let pdfPinchStartViewerScroll = null;
 
 const el = {
   cloudStatus: document.getElementById("cloudStatus"),
@@ -115,6 +80,7 @@ const el = {
   studyMeta: document.getElementById("studyMeta"),
   subjectFilter: document.getElementById("subjectFilter"),
   studySubcategoryList: document.getElementById("studySubcategoryList"),
+  forceResetStudyFiltersBtn: document.getElementById("forceResetStudyFiltersBtn"),
   editSubcategories: document.getElementById("editSubcategories"),
   orderMode: document.getElementById("orderMode"),
   chooseIphone: document.getElementById("chooseIphone"),
@@ -182,6 +148,39 @@ const el = {
   nextBtnIpad: document.getElementById("nextBtnIpad")
 };
 
+const questionManager = createQuestionManager({
+  el,
+  getCurrentUser: () => currentUser,
+  getStorage: () => storage,
+  getQuestions: () => allQuestions,
+  setQuestions: questions => { allQuestions = questions; },
+  ensureProgressRow,
+  cleanupStaleStudyFilters,
+  recalcProgressFromQuestionStates,
+  updateSubjectOptions,
+  buildFilteredQuestions,
+  renderProgressTable,
+  renderStudy,
+  requestAutoSave: options => autoSaveToCloud(options)
+});
+
+const imageMemory = createImageMemory({
+  el,
+  getCurrentUser: () => currentUser,
+  getStorage: () => storage,
+  requestAutoSave: options => autoSaveToCloud(options),
+  requestSave: options => saveToCloud(options)
+});
+
+function renderManageTable() { questionManager.render(); }
+function renderManageFilterUi() { questionManager.renderFilter(); }
+function resetBulkImportState() { questionManager.resetBulkImport(); }
+function renderPdfTable() { imageMemory.render(); }
+function renderPdfFilterDropdownUi() { imageMemory.ensureFilterUi(); }
+function renderPdfMaskTable() { imageMemory.renderMasks(); }
+function renderPdfViewer(preserveScroll = false) { imageMemory.renderViewer(preserveScroll); }
+function ensurePdfTagUi() { imageMemory.ensureTagUi(); }
+
 
 function getCurrentQuestionAnswers(q) {
   return normalizeQuestionAnswers(q?.answers || []);
@@ -196,174 +195,6 @@ function ensureCurrentQuestionAnswers(q) {
   return normalized;
 }
 
-
-
-function subcategoriesToText(subcategories) {
-  return normalizeSubcategories(subcategories).join(",");
-}
-
-function setBulkImportStatus(message) {
-  if (el.bulkImportStatus) el.bulkImportStatus.textContent = message;
-}
-
-function normalizeImportRoot(raw) {
-  if (Array.isArray(raw)) return raw;
-  if (raw && typeof raw === "object" && Array.isArray(raw.allQuestions)) return raw.allQuestions;
-  throw new Error("JSONの最上位は配列、または { allQuestions: [...] } にしてください。");
-}
-
-function buildQuestionIdentity(item) {
-  const subject = String(item.subject || "").trim();
-  const question = String(item.question || "").trim();
-  const answers = normalizeAnswerList(normalizeQuestionAnswers(item.answers));
-  return [subject, question, answers.join("|")].join("::");
-}
-
-function validateBulkImportItems(rawItems) {
-  const issues = [];
-  const warnings = [];
-  const prepared = [];
-  const seenImport = new Set();
-  const existingIds = new Set(allQuestions.map(buildQuestionIdentity));
-
-  rawItems.forEach((raw, index) => {
-    const rowNo = index + 1;
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      issues.push(`行${rowNo}: オブジェクト形式ではありません。`);
-      return;
-    }
-
-    const subject = String(raw.subject || "").trim();
-    const question = String(raw.question || "").trim();
-    const answers = Array.isArray(raw.answers)
-      ? raw.answers.map(v => String(v || "").trim()).filter(Boolean)
-      : textToAnswerList(String(raw.answers || ""));
-    const explanation = String(raw.explanation || "").trim();
-    const subcategories = normalizeSubcategories(
-      Array.isArray(raw.subCategories) ? raw.subCategories :
-      Array.isArray(raw.subcategories) ? raw.subcategories :
-      textToAnswers(String(raw.subCategories || raw.subcategories || ""))
-    );
-
-    if (!subject) issues.push(`行${rowNo}: subject が空です。`);
-    if (!question) issues.push(`行${rowNo}: question が空です。`);
-    if (!answers.length) issues.push(`行${rowNo}: answers が空です。`);
-    if (answers.some(a => !String(a).trim())) issues.push(`行${rowNo}: answers に空要素があります。`);
-    if (subcategories.some(s => s.length > 80)) issues.push(`行${rowNo}: subCategories は1件80文字以内にしてください。`);
-    if (subject.length > 80) issues.push(`行${rowNo}: subject は80文字以内にしてください。`);
-    if (question.length > 500) issues.push(`行${rowNo}: question は500文字以内にしてください。`);
-    if (explanation.length > 2000) issues.push(`行${rowNo}: explanation は2000文字以内にしてください。`);
-    if (raw.orderedAnswers !== undefined && typeof raw.orderedAnswers !== "boolean") {
-      issues.push(`行${rowNo}: orderedAnswers は true または false で指定してください。`);
-    }
-
-    const preparedItem = {
-      id: crypto.randomUUID(),
-      subject,
-      subcategories,
-      question,
-      answers,
-      explanation,
-      imageUrl: typeof raw.imageUrl === "string" ? raw.imageUrl.trim() : "",
-      imagePath: typeof raw.imagePath === "string" ? raw.imagePath.trim() : "",
-      imageName: typeof raw.imageName === "string" ? raw.imageName.trim() : "",
-      orderedAnswers: raw.orderedAnswers === true
-    };
-
-    const identity = buildQuestionIdentity(preparedItem);
-    if (seenImport.has(identity)) {
-      warnings.push(`行${rowNo}: 同じ subject・question・answers の重複がJSON内にあります。この行はスキップされます。`);
-      return;
-    }
-    seenImport.add(identity);
-
-    if (existingIds.has(identity)) {
-      warnings.push(`行${rowNo}: 既存データと重複しています。この行はスキップされます。`);
-      return;
-    }
-
-    prepared.push(preparedItem);
-  });
-
-  return { issues, warnings, prepared };
-}
-
-async function runBulkImportValidation() {
-  if (!currentUser) {
-    alert("先にログインしてください。");
-    return false;
-  }
-
-  const file = el.bulkImportFile?.files?.[0];
-  if (!file) {
-    alert("JSONファイルを選んでください。");
-    return false;
-  }
-
-  try {
-    const text = await file.text();
-    const parsed = JSON.parse(text);
-    const rawItems = normalizeImportRoot(parsed);
-    const result = validateBulkImportItems(rawItems);
-
-    bulkImportPreparedItems = result.prepared;
-
-    const lines = [
-      `選択ファイル: ${file.name}`,
-      `JSON件数: ${rawItems.length}件`,
-      `追加候補: ${result.prepared.length}件`,
-      `エラー: ${result.issues.length}件`,
-      `警告: ${result.warnings.length}件`
-    ];
-
-    if (result.issues.length) {
-      const message = "一括登録を中止しました。\n\n" + result.issues.slice(0, 30).join("\n") +
-        (result.issues.length > 30 ? "\n…以下省略…" : "");
-      alert(message);
-    } else if (result.warnings.length) {
-      alert("検証は通りましたが、注意点があります。\n\n" + result.warnings.slice(0, 30).join("\n") +
-        (result.warnings.length > 30 ? "\n…以下省略…" : ""));
-    } else {
-      alert("検証OKです。問題は見つかりませんでした。");
-    }
-
-    setBulkImportStatus(lines.join("\n"));
-    return result.issues.length === 0;
-  } catch (error) {
-    bulkImportPreparedItems = [];
-    setBulkImportStatus("検証失敗: " + error.message);
-    alert("JSONの読み込みまたは検証に失敗しました。\n\n" + error.message);
-    return false;
-  }
-}
-
-async function executeBulkImport() {
-  if (!currentUser) {
-    alert("先にログインしてください。");
-    return;
-  }
-
-  const ok = await runBulkImportValidation();
-  if (!ok) return;
-
-  if (!bulkImportPreparedItems.length) {
-    alert("追加できるデータがありません。");
-    return;
-  }
-
-  allQuestions = [...allQuestions, ...bulkImportPreparedItems];
-  bulkImportPreparedItems.forEach(q => ensureProgressRow(q.subject));
-  selectedQuestionId = null;
-  afterQuestionMutation();
-  setBulkImportStatus((el.bulkImportStatus?.textContent || "") + `\n一括追加完了: ${bulkImportPreparedItems.length}件`);
-  alert(`一括追加が完了しました。\n${bulkImportPreparedItems.length}件を追加しました。`);
-}
-
-function resetBulkImportState() {
-  bulkImportPreparedItems = [];
-  if (el.bulkImportFile) el.bulkImportFile.value = "";
-  setBulkImportStatus("JSONファイルを選択して「検証する」を押してください。");
-}
 
 
 function getPrimarySubcategories() {
@@ -418,12 +249,8 @@ function ensureSubcategoryDropdownUi() {
     selectedSubcategories = selectedPrimarySubcategory ? [selectedPrimarySubcategory] : [];
     renderStudySubcategoryChips();
     buildFilteredQuestions();
-    manageSubjectFilter = state.manageSubjectFilter || "all";
-  managePrimarySubcategory = state.managePrimarySubcategory || "";
-  manageSelectedSubcategories = Array.isArray(state.manageSelectedSubcategories) ? state.manageSelectedSubcategories : [];
-  pdfSelectedTagFilter = state.pdfSelectedTagFilter || "";
-  cleanupStaleStudyFilters();
-  renderStudy();
+    cleanupStaleStudyFilters();
+    renderStudy();
     autoSaveToCloud();
   });
 }
@@ -740,30 +567,6 @@ function renderQuestionImage(q) {
     el.questionImage.removeAttribute("src");
     el.questionImage.alt = "";
     el.questionImageWrap.style.display = "none";
-  }
-}
-
-function renderEditorImagePreview() {
-  if (currentEditingImageUrl) {
-    el.imagePreview.src = currentEditingImageUrl;
-    el.imagePreview.alt = currentEditingImageName || "問題画像プレビュー";
-    el.imagePreviewWrap.style.display = "block";
-    el.editImageName.value = currentEditingImageName || "画像あり";
-    if (el.imageStatusText) {
-      el.imageStatusText.textContent = pendingImageFile
-        ? "未保存の画像プレビューです。追加または更新で保存されます。"
-        : "保存済み画像があります。";
-    }
-  } else {
-    el.imagePreview.removeAttribute("src");
-    el.imagePreview.alt = "";
-    el.imagePreviewWrap.style.display = "none";
-    el.editImageName.value = "";
-    if (el.imageStatusText) {
-      el.imageStatusText.textContent = pendingRemoveImage
-        ? "画像は削除予定です。更新で反映されます。"
-        : "画像未設定です。";
-    }
   }
 }
 
@@ -1184,7 +987,6 @@ function renderStudyCurrentOnly() {
   el.studyMeta.textContent = `${deviceMode === "iphone" ? "iPhone版" : "iPad版"} / 苦手復習`;
   el.question.textContent = formatDisplayText(q.question);
   renderQuestionImage(q);
-  renderQuestionImage(q);
   el.answerBox.innerHTML = `<b>正解</b><br>${ensureCurrentQuestionAnswers(q).map(escapeDisplayText).join("\n")}`;
   el.explainBox.innerHTML = `<b>解説</b><br>${escapeDisplayText(q.explanation || "解説なし")}`;
   el.answerBox.style.display = "none";
@@ -1459,2016 +1261,6 @@ function renderProgressTable() {
 }
 
 
-function getManageSubjects() {
-  return [...new Set(allQuestions.map(q => q.subject).filter(Boolean))].sort();
-}
-
-function getManagePrimarySubcategories() {
-  const source = manageSubjectFilter === "all" ? allQuestions : allQuestions.filter(q => q.subject === manageSubjectFilter);
-  return [...new Set(source.map(q => Array.isArray(q.subcategories) ? q.subcategories[0] : "").filter(Boolean))].sort();
-}
-
-function getManageRelatedSubcategories(primary) {
-  if (!primary) return [];
-  const source = manageSubjectFilter === "all" ? allQuestions : allQuestions.filter(q => q.subject === manageSubjectFilter);
-  return [...new Set(source.filter(q => Array.isArray(q.subcategories) && q.subcategories[0] === primary).flatMap(q => q.subcategories || []).filter(Boolean))].sort();
-}
-
-function ensureManageFilterUi() {
-  const existing = document.getElementById("manageFilterPanel");
-  if (existing) return;
-
-  const table = el.questionTableBody?.closest(".table-wrap") || el.questionTableBody?.closest("table");
-  if (!table) return;
-
-  const panel = document.createElement("div");
-  panel.id = "manageFilterPanel";
-  panel.className = "manage-filter-panel";
-  panel.innerHTML = `
-    <select id="manageSubjectSelect"></select>
-    <select id="managePrimarySubcategorySelect"></select>
-    <div class="manage-check-list" id="manageSubcategoryChecklist"></div>
-  `;
-  table.insertAdjacentElement("beforebegin", panel);
-
-  document.getElementById("manageSubjectSelect").addEventListener("change", () => {
-    manageSubjectFilter = document.getElementById("manageSubjectSelect").value || "all";
-    managePrimarySubcategory = "";
-    manageSelectedSubcategories = [];
-    renderManageFilterUi();
-    renderManageTable();
-  if (typeof renderManageFilterUi === "function") renderManageFilterUi();
-  });
-
-  document.getElementById("managePrimarySubcategorySelect").addEventListener("change", () => {
-    managePrimarySubcategory = document.getElementById("managePrimarySubcategorySelect").value || "";
-    manageSelectedSubcategories = managePrimarySubcategory ? [managePrimarySubcategory] : [];
-    renderManageFilterUi();
-    renderManageTable();
-  });
-}
-
-function renderManageFilterUi() {
-  ensureManageFilterUi();
-
-  const subjectSelect = document.getElementById("manageSubjectSelect");
-  const primarySelect = document.getElementById("managePrimarySubcategorySelect");
-  const checklist = document.getElementById("manageSubcategoryChecklist");
-  if (!subjectSelect || !primarySelect || !checklist) return;
-
-  const subjects = getManageSubjects();
-
-  if (manageSubjectFilter !== "all" && !subjects.includes(manageSubjectFilter)) {
-    manageSubjectFilter = "all";
-    managePrimarySubcategory = "";
-    manageSelectedSubcategories = [];
-  }
-
-  subjectSelect.innerHTML = `<option value="all">全教科</option>` +
-    subjects.map(subject => `
-      <option value="${escapeHtml(subject)}" ${subject === manageSubjectFilter ? "selected" : ""}>
-        ${escapeHtml(subject)}
-      </option>
-    `).join("");
-
-  subjectSelect.value = manageSubjectFilter;
-
-  const primaryItems = getManagePrimarySubcategories();
-
-  if (managePrimarySubcategory && !primaryItems.includes(managePrimarySubcategory)) {
-    managePrimarySubcategory = "";
-    manageSelectedSubcategories = [];
-  }
-
-  primarySelect.innerHTML = `<option value="">章・大分類を選択してください</option>` +
-    primaryItems.map(item => `
-      <option value="${escapeHtml(item)}" ${item === managePrimarySubcategory ? "selected" : ""}>
-        ${escapeHtml(item)}
-      </option>
-    `).join("");
-
-  primarySelect.value = managePrimarySubcategory || "";
-
-  if (!managePrimarySubcategory) {
-    manageSelectedSubcategories = [];
-    checklist.innerHTML = '<div class="helper">章・大分類を選ぶと、関連サブカテゴリだけを表示します。未選択なら全件表示します。</div>';
-    return;
-  }
-
-  const related = getManageRelatedSubcategories(managePrimarySubcategory);
-
-  if (!manageSelectedSubcategories.includes(managePrimarySubcategory)) {
-    manageSelectedSubcategories.unshift(managePrimarySubcategory);
-  }
-
-  checklist.innerHTML = related.map(tag => {
-    const checked = manageSelectedSubcategories.includes(tag);
-    return `
-      <label class="manage-check-row ${checked ? "is-active" : ""}">
-        <input type="checkbox" value="${escapeHtml(tag)}" ${checked ? "checked" : ""}>
-        <span>${escapeHtml(tag)}</span>
-      </label>
-    `;
-  }).join("");
-
-  [...checklist.querySelectorAll("input[type='checkbox']")].forEach(input => {
-    input.addEventListener("change", () => {
-      const value = input.value;
-      if (input.checked) {
-        if (!manageSelectedSubcategories.includes(value)) {
-          manageSelectedSubcategories.push(value);
-        }
-      } else {
-        manageSelectedSubcategories = manageSelectedSubcategories.filter(tag => tag !== value);
-      }
-
-      if (managePrimarySubcategory && !manageSelectedSubcategories.includes(managePrimarySubcategory)) {
-        manageSelectedSubcategories.unshift(managePrimarySubcategory);
-      }
-
-      renderManageFilterUi();
-      renderManageTable();
-    });
-  });
-}
-
-function getFilteredManageQuestions() {
-  return allQuestions.filter(q => {
-    if (manageSubjectFilter !== "all" && q.subject !== manageSubjectFilter) {
-      return false;
-    }
-
-    const tags = Array.isArray(q.subcategories) ? q.subcategories : [];
-
-    // 章・大分類が未選択なら、教科条件だけで表示する。
-    // If no primary category is selected, show all questions within the subject filter.
-    if (!managePrimarySubcategory) {
-      return true;
-    }
-
-    if (!tags.includes(managePrimarySubcategory)) {
-      return false;
-    }
-
-    // チェック済みサブカテゴリがなければ、章・大分類だけで表示する。
-    // If no child subcategory is checked, show all questions in the selected primary category.
-    const activeTags = manageSelectedSubcategories.filter(Boolean);
-
-    if (!activeTags.length) {
-      return true;
-    }
-
-    return activeTags.every(tag => tags.includes(tag));
-  });
-}
-
-
-
-function fillEditorForm(q) {
-  if (!q) return;
-
-  el.editSubject.value = q.subject || "";
-  el.editSubcategories.value = subcategoriesToText(q.subcategories || []);
-  el.editQuestion.value = q.question || "";
-  el.editAnswers.value = Array.isArray(q.answers) ? q.answers.join("\n") : String(q.answers || "");
-  el.editExplanation.value = q.explanation || "";
-
-  if (el.editOrderedAnswers) {
-    el.editOrderedAnswers.checked = !!q.orderedAnswers;
-  }
-
-  currentEditingImageUrl = q.imageUrl || "";
-  currentEditingImagePath = q.imagePath || "";
-  currentEditingImageName = q.imageName || "";
-  pendingImageFile = null;
-  pendingRemoveImage = false;
-  renderEditorImagePreview();
-}
-
-
-function ensureManageBulkDeleteUi() {
-  if (document.getElementById("manageBulkDeletePanel")) return;
-
-  const table = el.questionTableBody?.closest(".table-wrap") || el.questionTableBody?.closest("table");
-  if (!table) return;
-
-  const panel = document.createElement("div");
-  panel.id = "manageBulkDeletePanel";
-  panel.className = "manage-bulk-actions";
-  panel.innerHTML = `
-    <button type="button" class="btn" id="manageSelectAllDeleteBtn">全て選択</button>
-    <button type="button" class="btn" id="manageClearDeleteSelectionBtn">選択解除</button>
-    <button type="button" class="btn ng" id="manageDeleteCheckedBtn" disabled>選択した問題を削除</button>
-  `;
-
-  table.insertAdjacentElement("beforebegin", panel);
-
-  document.getElementById("manageSelectAllDeleteBtn").addEventListener("click", () => {
-    const visibleIds = getVisibleManageQuestions()
-      .filter(q => q.id !== selectedQuestionId)
-      .map(q => q.id);
-
-    manageDeleteSelectedIds = [...new Set(visibleIds)];
-    renderManageTable();
-  });
-
-  document.getElementById("manageClearDeleteSelectionBtn").addEventListener("click", () => {
-    manageDeleteSelectedIds = [];
-    renderManageTable();
-  });
-
-  document.getElementById("manageDeleteCheckedBtn").addEventListener("click", deleteCheckedManageQuestions);
-}
-
-function updateManageBulkDeleteButtonState() {
-  const deleteBtn = document.getElementById("manageDeleteCheckedBtn");
-  if (!deleteBtn) return;
-
-  const validIds = new Set(allQuestions.map(q => q.id));
-  manageDeleteSelectedIds = manageDeleteSelectedIds
-    .filter(id => validIds.has(id))
-    .filter(id => id !== selectedQuestionId);
-
-  const disabled = manageDeleteSelectedIds.length === 0;
-  deleteBtn.disabled = disabled;
-  deleteBtn.textContent = manageDeleteSelectedIds.length
-    ? `選択した問題を削除（${manageDeleteSelectedIds.length}件）`
-    : "選択した問題を削除";
-}
-
-function getVisibleManageQuestions() {
-  const keyword = (el.searchInput?.value || "").trim().toLowerCase();
-  const filteredByDropdown = typeof getFilteredManageQuestions === "function"
-    ? getFilteredManageQuestions()
-    : allQuestions;
-
-  return filteredByDropdown.filter(q => {
-    if (!keyword) return true;
-
-    const haystack = [
-      q.subject || "",
-      ...(Array.isArray(q.subcategories) ? q.subcategories : []),
-      q.question || "",
-      Array.isArray(q.answers) ? q.answers.join(" ") : String(q.answers || ""),
-      q.explanation || ""
-    ].join(" ").toLowerCase();
-
-    return haystack.includes(keyword);
-  });
-}
-
-function deleteCheckedManageQuestions() {
-  const ids = [...new Set(manageDeleteSelectedIds)].filter(id => id !== selectedQuestionId);
-
-  if (!ids.length) {
-    alert("削除する問題をチェックしてください。");
-    return;
-  }
-
-  if (ids.length >= allQuestions.length) {
-    alert("安全のため、全問題が0件になる削除はできません。");
-    return;
-  }
-
-  const targets = allQuestions.filter(q => ids.includes(q.id));
-  const preview = targets
-    .slice(0, 10)
-    .map((q, index) => `${index + 1}. ${q.subject || "教科未設定"} / ${q.question || "無題"}`)
-    .join("\n");
-
-  const extra = targets.length > 10
-    ? `\n...ほか ${targets.length - 10}件`
-    : "";
-
-  const ok = confirm(
-    `${targets.length}件の問題を削除します。\nこの操作は元に戻せません。\n\n削除対象:\n${preview}${extra}`
-  );
-  if (!ok) return;
-
-  const idSet = new Set(ids);
-  allQuestions = allQuestions.filter(q => !idSet.has(q.id));
-  manageDeleteSelectedIds = [];
-
-  cleanupStaleStudyFilters();
-  recalcProgressFromQuestionStates();
-  renderManageFilterUi();
-  renderManageTable();
-  renderProgressTable();
-  buildFilteredQuestions();
-  renderStudy();
-  autoSaveToCloud();
-}
-
-
-
-function selectQuestionForEdit(questionId) {
-  const q = allQuestions.find(item => item.id === questionId);
-  if (!q) {
-    alert("選択した問題が見つかりません。");
-    return;
-  }
-
-  selectedQuestionId = q.id;
-
-  // 更新対象は削除対象から外す。
-  // Remove the editing target from deletion targets.
-  if (Array.isArray(manageDeleteSelectedIds)) {
-    manageDeleteSelectedIds = manageDeleteSelectedIds.filter(id => id !== selectedQuestionId);
-  }
-
-  fillEditorForm(q);
-  renderManageTable();
-
-  if (typeof updateManageBulkDeleteButtonState === "function") {
-    updateManageBulkDeleteButtonState();
-  }
-
-  const editorAnchor =
-    document.getElementById("questionForm") ||
-    document.getElementById("questionEditor") ||
-    el.questionTextInput ||
-    el.questionInput;
-
-  if (editorAnchor && typeof editorAnchor.scrollIntoView === "function") {
-    editorAnchor.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
-}
-
-
-function renderManageTable() {
-  if (!el.questionTableBody) return;
-
-  if (typeof renderManageFilterUi === "function" && !isRenderingManageFilter) {
-    isRenderingManageFilter = true;
-    try {
-      renderManageFilterUi();
-    } finally {
-      isRenderingManageFilter = false;
-    }
-  }
-
-  ensureManageBulkDeleteUi();
-
-  const source = getVisibleManageQuestions();
-
-  const validVisibleIds = new Set(source.map(q => q.id));
-  manageDeleteSelectedIds = manageDeleteSelectedIds
-    .filter(id => validVisibleIds.has(id))
-    .filter(id => id !== selectedQuestionId);
-
-  if (!source.length) {
-    el.questionTableBody.innerHTML = '<tr><td colspan="6">条件に合う問題がありません。</td></tr>';
-    updateManageBulkDeleteButtonState();
-    return;
-  }
-
-  el.questionTableBody.innerHTML = source.map(q => {
-    const isEditing = q.id === selectedQuestionId;
-    const checked = manageDeleteSelectedIds.includes(q.id);
-    const subcategories = Array.isArray(q.subcategories) ? q.subcategories.join(" / ") : "";
-    const answers = Array.isArray(q.answers) ? q.answers.join(" / ") : String(q.answers || "");
-
-    return `
-      <tr class="${isEditing ? "manage-editing-row" : ""}" data-manage-row="${escapeHtml(q.id)}">
-        <td>
-          <input
-            type="checkbox"
-            class="manage-delete-check"
-            data-delete-question="${escapeHtml(q.id)}"
-            ${checked ? "checked" : ""}
-            ${isEditing ? "disabled" : ""}
-            aria-label="削除対象にする"
-          >
-        </td>
-        <td>
-          <button
-            type="button"
-            class="manage-edit-btn ${isEditing ? "is-selected" : ""}"
-            data-edit-question="${escapeHtml(q.id)}"
-          >
-            ${isEditing ? "更新対象" : "編集"}
-          </button>
-        </td>
-        <td>${escapeHtml(q.subject || "")}</td>
-        <td>${escapeHtml(subcategories)}</td>
-        <td>${escapeHtml(q.question || "")}</td>
-        <td>${escapeHtml(answers)}</td>
-      </tr>
-    `;
-  }).join("");
-
-  [...el.questionTableBody.querySelectorAll("[data-edit-question]")].forEach(btn => {
-    btn.addEventListener("click", event => {
-      event.stopPropagation();
-      selectQuestionForEdit(btn.dataset.editQuestion);
-    });
-  });
-
-  [...el.questionTableBody.querySelectorAll("[data-manage-row]")].forEach(row => {
-    row.addEventListener("click", event => {
-      if (event.target.closest("[data-delete-question]")) return;
-      if (event.target.closest("[data-edit-question]")) return;
-      selectQuestionForEdit(row.dataset.manageRow);
-    });
-  });
-
-  [...el.questionTableBody.querySelectorAll("[data-delete-question]")].forEach(input => {
-    input.addEventListener("click", event => {
-      event.stopPropagation();
-    });
-
-    input.addEventListener("change", () => {
-      const id = input.dataset.deleteQuestion;
-      if (id === selectedQuestionId) {
-        input.checked = false;
-        return;
-      }
-
-      if (input.checked) {
-        if (!manageDeleteSelectedIds.includes(id)) {
-          manageDeleteSelectedIds.push(id);
-        }
-      } else {
-        manageDeleteSelectedIds = manageDeleteSelectedIds.filter(item => item !== id);
-      }
-
-      updateManageBulkDeleteButtonState();
-    });
-  });
-
-  updateManageBulkDeleteButtonState();
-}
-
-
-async function uploadQuestionImage(questionId, file) {
-  if (!storage || !currentUser || !file) return { imageUrl: "", imagePath: "", imageName: "" };
-  const safeName = (file.name || "image").replace(/[^a-zA-Z0-9._-]/g, "_");
-  const path = `users/${currentUser.uid}/questions/${questionId}/${Date.now()}_${safeName}`;
-  const refObj = storageRef(storage, path);
-  await uploadBytes(refObj, file, "画像ファイル");
-  const url = await getDownloadURL(refObj);
-  return { imageUrl: url, imagePath: path, imageName: file.name || safeName };
-}
-
-async function deleteQuestionImageByPath(path) {
-  if (!storage || !path) return;
-  try {
-    await deleteObject(storageRef(storage, path));
-  } catch (error) {
-    console.warn("画像削除をスキップ:", error);
-  }
-}
-
-async function addQuestion() {
-  if (!currentUser) return;
-  const payload = readEditorForm();
-  if (!payload) return;
-
-  const questionId = crypto.randomUUID();
-  let imageMeta = {
-    imageUrl: currentEditingImageUrl || "",
-    imagePath: currentEditingImagePath || "",
-    imageName: currentEditingImageName || ""
-  };
-
-  if (pendingImageFile) {
-    imageMeta = await uploadQuestionImage(questionId, pendingImageFile);
-  }
-
-  const question = {
-    id: questionId,
-    ...payload,
-    ...imageMeta
-  };
-  allQuestions.push(question);
-  ensureProgressRow(question.subject);
-  selectedQuestionId = question.id;
-  pendingImageFile = null;
-  pendingRemoveImage = false;
-  afterQuestionMutation();
-}
-
-async function updateQuestion() {
-  if (!currentUser) return;
-  if (!selectedQuestionId) {
-    alert("更新したい問題を一覧から選んでください。");
-    return;
-  }
-  const payload = readEditorForm();
-  if (!payload) return;
-
-  const index = allQuestions.findIndex(q => q.id === selectedQuestionId);
-  if (index === -1) return;
-
-  const before = allQuestions[index];
-  let imageMeta = {
-    imageUrl: before.imageUrl || "",
-    imagePath: before.imagePath || "",
-    imageName: before.imageName || ""
-  };
-
-  if (pendingRemoveImage && before.imagePath) {
-    await deleteQuestionImageByPath(before.imagePath);
-    imageMeta = { imageUrl: "", imagePath: "", imageName: "" };
-  }
-
-  if (pendingImageFile) {
-    if (before.imagePath) {
-      await deleteQuestionImageByPath(before.imagePath);
-    }
-    imageMeta = await uploadQuestionImage(selectedQuestionId, pendingImageFile);
-  }
-
-  allQuestions[index] = { ...before, ...payload, subcategories: normalizeSubcategories(payload.subcategories), ...imageMeta };
-  if (before.subject !== payload.subject) ensureProgressRow(payload.subject);
-
-  currentEditingImageUrl = imageMeta.imageUrl || "";
-  currentEditingImagePath = imageMeta.imagePath || "";
-  currentEditingImageName = imageMeta.imageName || "";
-  pendingImageFile = null;
-  pendingRemoveImage = false;
-  renderEditorImagePreview();
-  afterQuestionMutation();
-}
-
-function deleteQuestion() {
-  alert("問題の削除は、一覧のチェックボックスで選択してから「選択した問題を削除」を押してください。");
-}
-
-function readEditorForm() {
-  const subject = el.editSubject.value.trim();
-  const subcategories = textToTagList(el.editSubcategories.value);
-  const question = el.editQuestion.value.trim();
-  const answers = normalizeQuestionAnswers(el.editAnswers.value);
-  const explanation = el.editExplanation.value.trim();
-  const orderedAnswers = el.editOrderedAnswers ? el.editOrderedAnswers.checked : false;
-
-  if (!subject || !question || !answers.length) {
-    alert("教科・問題・答えは必須です。");
-    return null;
-  }
-  return { subject, subcategories, question, answers, explanation, orderedAnswers };
-}
-
-function clearEditorForm() {
-  el.editSubject.value = "";
-  el.editSubcategories.value = "";
-  el.editQuestion.value = "";
-  el.editAnswers.value = "";
-  el.editExplanation.value = "";
-  if (el.editOrderedAnswers) el.editOrderedAnswers.checked = false;
-  currentEditingImageUrl = "";
-  currentEditingImageName = "";
-  currentEditingImagePath = "";
-  pendingImageFile = null;
-  pendingRemoveImage = false;
-  el.editImageFile.value = "";
-  renderEditorImagePreview();
-  selectedQuestionId = null;
-  renderManageTable();
-}
-
-function afterQuestionMutation() {
-  cleanupStaleStudyFilters();
-  updateSubjectOptions();
-  renderManageTable();
-  renderProgressTable();
-  renderStudy();
-  autoSaveToCloud();
-}
-
-
-function currentPdfMaterial() {
-  return pdfMaterials.find(pdf => pdf.id === selectedPdfId) || null;
-}
-
-function currentPdfMask() {
-  const pdf = currentPdfMaterial();
-  if (!pdf) return null;
-  return (pdf.masks || []).find(mask => mask.id === selectedMaskId) || null;
-}
-
-function setPdfStatus(message) {
-  if (el.pdfStatus) el.pdfStatus.textContent = message;
-}
-
-function getPdfRevealMap(pdfId) {
-  if (!pdfRevealStates[pdfId]) pdfRevealStates[pdfId] = {};
-  return pdfRevealStates[pdfId];
-}
-
-function formatPercent(value) {
-  const number = Number(value || 0);
-  return Number.isInteger(number) ? String(number) : number.toFixed(1);
-}
-
-function readPdfMaskForm() {
-  const page = Number(el.maskPageInput.value);
-  const x = Number(el.maskXInput.value);
-  const y = Number(el.maskYInput.value);
-  const width = Number(el.maskWInput.value);
-  const height = Number(el.maskHInput.value);
-
-  if (!Number.isFinite(page) || page < 1) {
-    alert("ページ番号を1以上で入力してください。");
-    return null;
-  }
-  if (![x, y, width, height].every(Number.isFinite)) {
-    alert("x・y・幅・高さを入力してください。");
-    return null;
-  }
-  if (x < 0 || y < 0 || width <= 0 || height <= 0 || x + width > 100 || y + height > 100) {
-    alert("隠し範囲はPDFページ内に収まるようにしてください。");
-    return null;
-  }
-  return { page: Math.round(page), x, y, width, height };
-}
-
-function fillPdfMaskForm(mask) {
-  if (!mask) {
-    el.maskPageInput.value = "";
-    el.maskXInput.value = "";
-    el.maskYInput.value = "";
-    el.maskWInput.value = "";
-    el.maskHInput.value = "";
-    return;
-  }
-  el.maskPageInput.value = mask.page;
-  el.maskXInput.value = formatPercent(mask.x);
-  el.maskYInput.value = formatPercent(mask.y);
-  el.maskWInput.value = formatPercent(mask.width);
-  el.maskHInput.value = formatPercent(mask.height);
-}
-
-
-function pdfTagsToText(tags) {
-  return normalizePdfTags(tags).join(",");
-}
-
-function ensurePdfTagUi() {
-  if (document.getElementById("pdfSearchInput")) return;
-
-  const toolbar = document.querySelector("#tab-pdf .pdf-toolbar");
-  if (!toolbar) return;
-
-  const box = document.createElement("div");
-  box.id = "pdfTagSearchBox";
-  box.innerHTML = `
-    <div class="grid2" style="margin-bottom:10px;">
-      <input id="pdfSearchInput" placeholder="教材名・タグ名で検索">
-      <input id="pdfTagInput" placeholder="タグ名（複数は読点・カンマ区切り）">
-    </div>
-    <div class="subcat-box" style="margin-bottom:12px;">
-      <div class="subcat-title">タグを選択できます（未選択なら全件）</div>
-      <div class="subcat-list" id="pdfTagChipList"></div>
-    </div>
-  `;
-
-  toolbar.insertAdjacentElement("afterend", box);
-
-  const searchInput = document.getElementById("pdfSearchInput");
-  searchInput.value = pdfSearchQuery || "";
-  searchInput.addEventListener("input", () => {
-    pdfSearchQuery = searchInput.value || "";
-    renderPdfTable();
-  renderPdfFilterDropdownUi();
-  });
-}
-
-function getPdfTagInput() {
-  ensurePdfTagUi();
-  return document.getElementById("pdfTagInput");
-}
-
-function getPdfSearchInput() {
-  ensurePdfTagUi();
-  return document.getElementById("pdfSearchInput");
-}
-
-function getPdfTagChipList() {
-  ensurePdfTagUi();
-  return document.getElementById("pdfTagChipList");
-}
-
-function getAvailablePdfTags() {
-  return [...new Set(
-    pdfMaterials.flatMap(pdf => Array.isArray(pdf.tags) ? pdf.tags : [])
-  )].sort();
-}
-
-function getFilteredPdfMaterials() {
-  const query = (pdfSearchQuery || "").trim().toLowerCase();
-
-  return pdfMaterials.filter(pdf => {
-    const tags = Array.isArray(pdf.tags) ? pdf.tags : [];
-    const searchText = [
-      pdf.title || "",
-      pdf.pdfName || "",
-      pdf.sourceName || "",
-      tags.join(" ")
-    ].join(" ").toLowerCase();
-
-    const matchesQuery = !query || searchText.includes(query);
-    const matchesTags = !selectedPdfTags.length || selectedPdfTags.every(tag => tags.includes(tag));
-    return matchesQuery && matchesTags;
-  });
-}
-
-function renderPdfTagChips() {
-  const chipList = getPdfTagChipList();
-  if (!chipList) return;
-
-  const tags = getAvailablePdfTags();
-  selectedPdfTags = selectedPdfTags.filter(tag => tags.includes(tag));
-
-  if (!tags.length) {
-    chipList.innerHTML = '<span class="subcat-title">タグなし</span>';
-    return;
-  }
-
-  chipList.innerHTML = tags.map(tag => `
-    <button type="button" class="subcat-chip ${selectedPdfTags.includes(tag) ? "active" : ""}" data-pdf-tag="${escapeHtml(tag)}">
-      ${escapeHtml(tag)}
-    </button>
-  `).join("");
-
-  [...chipList.querySelectorAll("[data-pdf-tag]")].forEach(btn => {
-    btn.addEventListener("click", () => {
-      const tag = btn.dataset.pdfTag;
-      if (selectedPdfTags.includes(tag)) {
-        selectedPdfTags = selectedPdfTags.filter(item => item !== tag);
-      } else {
-        selectedPdfTags = [...selectedPdfTags, tag];
-      }
-      renderPdfTagChips();
-      renderPdfTable();
-    });
-  });
-}
-
-
-
-function getAvailablePdfTagList() {
-  return [...new Set(pdfMaterials.flatMap(item => Array.isArray(item.tags) ? item.tags : []).filter(Boolean))].sort();
-}
-
-function ensurePdfFilterDropdownUi() {
-  if (document.getElementById("pdfTagFilterSelect")) return;
-  const table = el.pdfTableBody?.closest(".table-wrap") || el.pdfTableBody?.closest("table");
-  if (!table) return;
-  const panel = document.createElement("div");
-  panel.id = "pdfFilterPanel";
-  panel.className = "pdf-filter-panel";
-  panel.innerHTML = `<select id="pdfTagFilterSelect"><option value="">全タグ</option></select>`;
-  table.insertAdjacentElement("beforebegin", panel);
-  document.getElementById("pdfTagFilterSelect").addEventListener("change", () => {
-    pdfSelectedTagFilter = document.getElementById("pdfTagFilterSelect").value || "";
-    renderPdfTable();
-  });
-}
-
-function renderPdfFilterDropdownUi() {
-  ensurePdfFilterDropdownUi();
-  const select = document.getElementById("pdfTagFilterSelect");
-  if (!select) return;
-  const tags = getAvailablePdfTagList();
-  if (pdfSelectedTagFilter && !tags.includes(pdfSelectedTagFilter)) pdfSelectedTagFilter = "";
-  select.innerHTML = `<option value="">全タグ</option>` +
-    tags.map(tag => `<option value="${escapeHtml(tag)}" ${tag === pdfSelectedTagFilter ? "selected" : ""}>${escapeHtml(tag)}</option>`).join("");
-}
-
-function pdfMatchesDropdownFilter(pdf) {
-  if (!pdfSelectedTagFilter) return true;
-  const tags = Array.isArray(pdf.tags) ? pdf.tags : [];
-  return tags.includes(pdfSelectedTagFilter);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-function renderPdfTable() {
-  if (!el.pdfTableBody) return;
-
-  ensurePdfTagUi();
-  renderPdfTagChips();
-
-  renderPdfFilterDropdownUi();
-  const filteredMaterials = getFilteredPdfMaterials().filter(pdfMatchesDropdownFilter);
-
-  if (!filteredMaterials.length) {
-    el.pdfTableBody.innerHTML = '<tr><td colspan="4">該当する画像教材がありません。</td></tr>';
-    return;
-  }
-
-  el.pdfTableBody.innerHTML = filteredMaterials.map(pdf => {
-    const revealMap = getPdfRevealMap(pdf.id);
-    const masks = Array.isArray(pdf.masks) ? pdf.masks : [];
-    const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
-    const revealed = masks.filter(mask => revealMap[mask.id]).length;
-    const fileLabel = pages.length
-      ? `${pages.length}枚`
-      : (pdf.pdfName || "旧PDF");
-    const tags = normalizePdfTags(pdf.tags || []);
-    const tagHtml = tags.length
-      ? `<div style="font-size:12px;color:#6b7280;margin-top:4px;">${escapeHtml(tags.join(" / "))}</div>`
-      : "";
-    return `
-      <tr class="${selectedPdfId === pdf.id ? "selected" : ""}" data-pdf-id="${pdf.id}">
-        <td>${escapeHtml(pdf.title || "無題教材")}${tagHtml}</td>
-        <td>${masks.length}</td>
-        <td>${revealed}</td>
-        <td>${escapeHtml(fileLabel)}</td>
-      </tr>
-    `;
-  }).join("");
-
-  [...el.pdfTableBody.querySelectorAll("tr[data-pdf-id]")].forEach(row => {
-    row.addEventListener("click", () => {
-      selectedPdfId = row.dataset.pdfId;
-      selectedMaskId = null;
-      selectedMaskIds = [];
-      pdfAddMaskMode = false;
-      if (el.pdfViewerArea) el.pdfViewerArea.classList.remove("is-add-mask-mode");
-      const pdf = currentPdfMaterial();
-      el.pdfTitleInput.value = pdf?.title || "";
-      const tagInput = getPdfTagInput();
-      if (tagInput) tagInput.value = pdfTagsToText(pdf?.tags || []);
-      fillPdfMaskForm(null);
-      renderPdfTable();
-      renderPdfMaskTable();
-      renderPdfViewer();
-  if (answersMigrated) autoSaveToCloud();
-      autoSaveToCloud();
-    });
-  });
-}
-
-function renderPdfMaskTable() {
-  if (!el.pdfMaskTableBody) return;
-  const pdf = currentPdfMaterial();
-  if (!pdf) {
-    el.pdfMaskTableBody.innerHTML = '<tr><td colspan="5">画像教材を選択してください。</td></tr>';
-    return;
-  }
-  const masks = Array.isArray(pdf.masks) ? pdf.masks : [];
-  if (!masks.length) {
-    el.pdfMaskTableBody.innerHTML = '<tr><td colspan="5">隠し範囲がありません。</td></tr>';
-    return;
-  }
-
-  el.pdfMaskTableBody.innerHTML = masks.map(mask => `
-    <tr class="${selectedMaskId === mask.id || selectedMaskIds.includes(mask.id) ? "selected" : ""}" data-mask-id="${mask.id}">
-      <td>${mask.page}</td>
-      <td>${formatPercent(mask.x)}%</td>
-      <td>${formatPercent(mask.y)}%</td>
-      <td>${formatPercent(mask.width)}%</td>
-      <td>${formatPercent(mask.height)}%</td>
-    </tr>
-  `).join("");
-
-  [...el.pdfMaskTableBody.querySelectorAll("tr[data-mask-id]")].forEach(row => {
-    row.addEventListener("click", () => {
-      const viewerScrollTop = el.pdfViewerArea ? el.pdfViewerArea.scrollTop : 0;
-      const viewerScrollLeft = el.pdfViewerArea ? el.pdfViewerArea.scrollLeft : 0;
-      const windowScrollY = window.scrollY || document.documentElement.scrollTop || 0;
-
-      selectedMaskId = row.dataset.maskId;
-      selectedMaskIds = [];
-      fillPdfMaskForm(currentPdfMask());
-      renderPdfMaskTable();
-      updatePdfMaskElementsOnly();
-
-      requestAnimationFrame(() => {
-        if (el.pdfViewerArea) {
-          el.pdfViewerArea.scrollTop = viewerScrollTop;
-          el.pdfViewerArea.scrollLeft = viewerScrollLeft;
-        }
-        window.scrollTo({ top: windowScrollY, left: 0, behavior: "auto" });
-      });
-
-      autoSaveToCloud();
-    });
-  });
-}
-
-async function uploadPdfFile(pdfId, file, pageNumber = 1) {
-  if (!storage || !currentUser || !file) return { imageUrl: "", imagePath: "", imageName: "" };
-
-  if (typeof file.size === "number" && file.size <= 0) {
-    throw new Error("画像ファイルが0バイトです。保存を停止しました。");
-  }
-
-  const safeName = (file.name || `page_${pageNumber}.jpg`).replace(/[^a-zA-Z0-9._-]/g, "_");
-  const path = `users/${currentUser.uid}/imageMaterials/${pdfId}/page_${pageNumber}_${Date.now()}_${safeName}`;
-  const refObj = storageRef(storage, path);
-
-  await uploadBytes(refObj, file, { contentType: file.type || "image/jpeg" });
-  const url = await getDownloadURL(refObj);
-
-  return {
-    imageUrl: url,
-    url,
-    imagePath: path,
-    imageName: file.name || safeName,
-    size: file.size || null
-  };
-}
-
-async function deletePdfFileByPath(path) {
-  if (!storage || !path) return;
-  try {
-    await deleteObject(storageRef(storage, path));
-  } catch (error) {
-    console.warn("教材削除をスキップ:", error);
-  }
-}
-
-
-let cachedPdfJsLib = null;
-
-async function getPdfJsLibForConvert() {
-  if (cachedPdfJsLib) return cachedPdfJsLib;
-  cachedPdfJsLib = await import("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs");
-  cachedPdfJsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
-  return cachedPdfJsLib;
-}
-
-function canvasToBlob(canvas, type = "image/jpeg", quality = 0.9) {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(blob => {
-      if (blob) {
-        resolve(blob);
-      } else {
-        reject(new Error("PDFページの画像化に失敗しました。"));
-      }
-    }, type, quality);
-  });
-}
-
-async function convertPdfToImageFiles(pdfFile, onProgress) {
-  const pdfjsLib = await getPdfJsLibForConvert();
-  const arrayBuffer = await pdfFile.arrayBuffer();
-
-  const loadingTask = pdfjsLib.getDocument({
-    data: arrayBuffer,
-    useSystemFonts: true,
-    disableFontFace: false,
-    cMapUrl: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/cmaps/",
-    cMapPacked: true,
-    standardFontDataUrl: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/standard_fonts/"
-  });
-
-  const pdfDoc = await loadingTask.promise;
-  const imageFiles = [];
-
-  for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber++) {
-    if (onProgress) onProgress(pageNumber, pdfDoc.numPages, "converting");
-
-    const page = await pdfDoc.getPage(pageNumber);
-    const baseViewport = page.getViewport({ scale: 1 });
-
-    // PowerPoint由来PDFは細かい文字や図形が多いため、やや高解像度で画像化する。
-    // PowerPoint PDFs often have small text/shapes, so render at a higher resolution.
-    const targetWidth = 2200;
-    const scale = Math.min(3.2, Math.max(1.8, targetWidth / baseViewport.width));
-    const viewport = page.getViewport({ scale });
-
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d", { alpha: false });
-    canvas.width = Math.floor(viewport.width);
-    canvas.height = Math.floor(viewport.height);
-
-    // 透明背景や白抜け対策として、先に白で塗る。
-    // Fill white first to avoid transparent/background rendering gaps.
-    context.save();
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.restore();
-
-    const renderOptions = {
-      canvasContext: context,
-      viewport,
-      background: "white"
-    };
-
-    if (pdfjsLib.AnnotationMode) {
-      renderOptions.annotationMode = pdfjsLib.AnnotationMode.ENABLE;
-    }
-
-    await page.render(renderOptions).promise;
-
-    const blob = await canvasToBlob(canvas, "image/jpeg", 0.92);
-    const baseName = (pdfFile.name || "converted.pdf").replace(/\.pdf$/i, "");
-    const imageName = `${baseName}_page_${String(pageNumber).padStart(3, "0")}.jpg`;
-    const imageFile = new File([blob], imageName, { type: "image/jpeg" });
-    imageFiles.push(imageFile);
-
-    canvas.width = 1;
-    canvas.height = 1;
-  }
-
-  return imageFiles;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-function isPdfFile(file) {
-  return !!file && (file.type === "application/pdf" || /\.pdf$/i.test(file.name || ""));
-}
-
-function isImageFile(file) {
-  return !!file && (!!file.type?.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(file.name || ""));
-}
-
-
-async function addPdfMaterial() {
-  if (!currentUser) return;
-
-  ensurePdfTagUi();
-  const title = el.pdfTitleInput.value.trim();
-  const tagInput = getPdfTagInput();
-  const tags = normalizePdfTags(textToTagList(tagInput ? tagInput.value : ""));
-  const selectedFiles = Array.from(el.pdfFileInput.files || []);
-
-  if (!title) {
-    alert("教材タイトルを入力してください。");
-    return;
-  }
-  if (!selectedFiles.length) {
-    alert("PDFまたは画像ファイルを選んでください。");
-    return;
-  }
-
-  const pdfFiles = selectedFiles.filter(file => file.type === "application/pdf" || /\.pdf$/i.test(file.name));
-  const imageFiles = selectedFiles.filter(file => file.type.startsWith("image/") || /\.(jpg|jpeg|png|webp)$/i.test(file.name));
-
-  if (pdfFiles.length && imageFiles.length) {
-    alert("PDFと画像は同時に登録できません。PDFだけ、または画像だけを選んでください。");
-    return;
-  }
-  if (pdfFiles.length > 1) {
-    alert("PDFは1ファイルずつ登録してください。複数ページPDFは自動でページごとに画像化されます。");
-    return;
-  }
-
-  const pdfId = crypto.randomUUID();
-  let filesToUpload = [];
-
-  try {
-    if (pdfFiles.length === 1) {
-      const pdfFile = pdfFiles[0];
-      setPdfStatus("PDFを画像に変換しています...");
-
-      filesToUpload = await convertPdfToImageFiles(pdfFile, (page, total, stage) => {
-        if (stage === "converting") {
-          setPdfStatus(`PDFを画像に変換しています... ${page}/${total}ページ`);
-        }
-      });
-
-      if (!filesToUpload.length) {
-        alert("PDFから画像を作成できませんでした。");
-        setPdfStatus("PDFから画像を作成できませんでした。");
-        return;
-      }
-    } else {
-      filesToUpload = imageFiles;
-    }
-
-    setPdfStatus(`画像をアップロードしています... 0/${filesToUpload.length}`);
-
-    const pages = [];
-    for (let index = 0; index < filesToUpload.length; index++) {
-      const pageNumber = index + 1;
-      const meta = await uploadPdfFile(pdfId, filesToUpload[index], pageNumber);
-      pages.push({ page: pageNumber, ...meta });
-      setPdfStatus(`画像をアップロードしています... ${pageNumber}/${filesToUpload.length}`);
-    }
-
-    pdfMaterials.push({
-      id: pdfId,
-      title,
-      pages,
-      masks: [],
-      tags,
-      sourceType: pdfFiles.length === 1 ? "pdf-converted" : "images",
-      sourceName: pdfFiles.length === 1 ? pdfFiles[0].name : ""
-    });
-
-    selectedPdfId = pdfId;
-    selectedMaskId = null;
-    el.pdfFileInput.value = "";
-    renderPdfTable();
-    renderPdfMaskTable();
-    renderPdfViewer();
-    setPdfStatus("教材を追加しました。PDFは画像として保存済みです。隠したい範囲をドラッグで追加できます。");
-    autoSaveToCloud();
-  } catch (error) {
-    console.error(error);
-    setPdfStatus("教材追加に失敗しました。\n" + (error.message || error));
-    alert("教材追加に失敗しました。\n\n" + (error.message || error));
-  }
-}
-
-function updatePdfMaterialTitle() {
-  if (!currentUser) return;
-  const pdf = currentPdfMaterial();
-  if (!pdf) {
-    alert("更新したい画像教材を選択してください。");
-    return;
-  }
-  const title = el.pdfTitleInput.value.trim();
-  if (!title) {
-    alert("画像教材タイトルを入力してください。");
-    return;
-  }
-
-  ensurePdfTagUi();
-  const tagInput = getPdfTagInput();
-
-  pdf.title = title;
-  pdf.tags = normalizePdfTags(textToTagList(tagInput ? tagInput.value : ""));
-
-  renderPdfTable();
-  renderPdfTagChips();
-  setPdfStatus("画像教材タイトルとタグを更新しました。");
-  autoSaveToCloud();
-}
-
-async function deletePdfMaterial() {
-  if (!currentUser) return;
-
-  const pdf = currentPdfMaterial();
-  if (!pdf) {
-    alert("削除したい画像教材を選択してください。");
-    return;
-  }
-
-  const title = pdf.title || "無題教材";
-
-  const ok = confirm(
-    "この画像教材を削除しますか？\n\n" +
-    "Firestoreの教材データとStorage上の画像ファイルを削除します。\n\n" +
-    "教材：" + title
-  );
-  if (!ok) return;
-
-  try {
-    setPdfStatus("画像教材を削除しています...");
-    await deletePdfStorageFiles(pdf);
-  } catch (error) {
-    console.warn(error);
-  }
-
-  pdfMaterials = pdfMaterials.filter(item => item.id !== pdf.id);
-
-  if (selectedPdfId === pdf.id) {
-    selectedPdfId = pdfMaterials[0]?.id || null;
-  }
-
-  selectedMaskId = null;
-  selectedMaskIds = [];
-
-  renderPdfTable();
-  renderPdfMaskTable();
-  renderPdfViewer();
-  setPdfStatus("画像教材を削除しました。");
-
-  await saveToCloud({
-    allowEmptyPdfMaterials: true,
-    showAlerts: true
-  });
-}
-
-function updatePdfMaskFromForm() {
-  if (!currentUser) return;
-  const pdf = currentPdfMaterial();
-  const mask = currentPdfMask();
-  if (!pdf || !mask) {
-    alert("更新したい隠し範囲を選択してください。");
-    return;
-  }
-  const payload = readPdfMaskForm();
-  if (!payload) return;
-  Object.assign(mask, payload);
-  renderPdfMaskTable();
-  renderPdfViewer(true);
-  setPdfStatus("隠し範囲を更新しました。");
-  autoSaveToCloud();
-}
-
-function deletePdfMask() {
-  const pdf = currentPdfMaterial();
-  if (!pdf) {
-    alert("画像教材を選択してください。");
-    return;
-  }
-
-  const targetIds = selectedMaskIds.length ? [...selectedMaskIds] : (selectedMaskId ? [selectedMaskId] : []);
-  if (!targetIds.length) {
-    alert("削除したい隠し範囲を選択してください。");
-    return;
-  }
-
-  if (!confirm(`${targetIds.length}件の隠し範囲を削除しますか？`)) return;
-
-  const targetSet = new Set(targetIds);
-  pdf.masks = (pdf.masks || []).filter(mask => !targetSet.has(mask.id));
-
-  const revealMap = getPdfRevealMap(pdf.id);
-  targetIds.forEach(id => {
-    delete revealMap[id];
-    removeSinglePdfMaskElement(id);
-  });
-
-  selectedMaskId = null;
-  selectedMaskIds = [];
-  fillPdfMaskForm(null);
-  renderPdfMaskTable();
-  renderPdfTable();
-  updatePdfMaskElementsOnly();
-  setPdfStatus(`隠し範囲を削除しました。${targetIds.length}件`);
-  autoSaveToCloud();
-}
-
-function clearPdfMaskSelection() {
-  selectedMaskId = null;
-  selectedMaskIds = [];
-  fillPdfMaskForm(null);
-  renderPdfMaskTable();
-  updatePdfMaskElementsOnly();
-  setPdfStatus("選択を解除しました。");
-}
-
-
-function selectAllMasks() {
-  const pdf = currentPdfMaterial();
-  if (!pdf) {
-    alert("画像教材を選択してください。");
-    return;
-  }
-
-  const masks = Array.isArray(pdf.masks) ? pdf.masks : [];
-  if (!masks.length) {
-    alert("選択できるマスクがありません。");
-    return;
-  }
-
-  selectedMaskIds = masks.map(mask => mask.id);
-  selectedMaskId = selectedMaskIds[0] || null;
-  if (selectedMaskId) fillPdfMaskForm(currentPdfMask());
-
-  renderPdfMaskTable();
-  updatePdfMaskElementsOnly();
-  setPdfStatus(`マスクを全選択しました。${selectedMaskIds.length}件`);
-}
-
-function showAllMasks() {
-  const pdf = currentPdfMaterial();
-  if (!pdf) {
-    alert("画像教材を選択してください。");
-    return;
-  }
-
-  const masks = Array.isArray(pdf.masks) ? pdf.masks : [];
-  if (!masks.length) {
-    alert("表示できるマスクがありません。");
-    return;
-  }
-
-  const snapshot = getScrollSnapshot();
-  const revealMap = getPdfRevealMap(pdf.id);
-  masks.forEach(mask => {
-    revealMap[mask.id] = true;
-  });
-
-  renderPdfMaskTable();
-  renderPdfTable();
-  updatePdfMaskElementsOnly();
-  restoreScrollSnapshot(snapshot);
-  setPdfStatus(`マスクを全表示しました。${masks.length}件`);
-  autoSaveToCloud();
-}
-
-
-function resetPdfRevealState() {
-  const pdf = currentPdfMaterial();
-  if (!pdf) {
-    alert("画像教材を選択してください。");
-    return;
-  }
-  if (!confirm("この画像教材の確認済み状態をリセットしますか？")) return;
-  pdfRevealStates[pdf.id] = {};
-  renderPdfTable();
-  renderPdfMaskTable();
-  renderPdfViewer(true);
-  setPdfStatus("表示状態をリセットしました。");
-  autoSaveToCloud();
-}
-
-
-function clampPdfZoom(value) {
-  return Math.min(5, Math.max(0.8, value));
-}
-
-function getTouchDistance(touches) {
-  const dx = touches[0].clientX - touches[1].clientX;
-  const dy = touches[0].clientY - touches[1].clientY;
-  return Math.hypot(dx, dy);
-}
-
-function getTouchCenter(touches) {
-  return {
-    x: (touches[0].clientX + touches[1].clientX) / 2,
-    y: (touches[0].clientY + touches[1].clientY) / 2
-  };
-}
-
-function applyPdfZoom() {
-  if (!el.pdfViewerArea) return;
-  el.pdfViewerArea.querySelectorAll(".pdf-page-wrap").forEach(pageWrap => {
-    pageWrap.style.width = `${pdfZoom * 100}%`;
-    pageWrap.style.maxWidth = `${920 * pdfZoom}px`;
-  });
-}
-
-function attachPdfViewerZoomEvents() {
-  if (!el.pdfViewerArea || pdfZoomEventsAttached) return;
-  pdfZoomEventsAttached = true;
-
-  el.pdfViewerArea.addEventListener("touchstart", (event) => {
-    if (event.touches.length === 2) {
-      event.preventDefault();
-      pdfPinchStartDistance = getTouchDistance(event.touches);
-      pdfPinchStartCenter = getTouchCenter(event.touches);
-      pdfPinchStartZoom = pdfZoom;
-      pdfPinchStartViewerScroll = {
-        top: el.pdfViewerArea.scrollTop,
-        left: el.pdfViewerArea.scrollLeft
-      };
-    }
-  }, { passive: false });
-
-  el.pdfViewerArea.addEventListener("touchmove", (event) => {
-    if (event.touches.length === 2 && pdfPinchStartDistance && pdfPinchStartCenter && pdfPinchStartViewerScroll) {
-      event.preventDefault();
-      event.stopPropagation();
-
-      const currentDistance = getTouchDistance(event.touches);
-      const currentCenter = getTouchCenter(event.touches);
-
-      pdfZoom = clampPdfZoom(pdfPinchStartZoom * (currentDistance / pdfPinchStartDistance));
-      applyPdfZoom();
-
-      // 2本指のまま動かした分だけ画像表示エリアを移動する。
-      // Move the viewer while two fingers are moving.
-      el.pdfViewerArea.scrollLeft = pdfPinchStartViewerScroll.left - (currentCenter.x - pdfPinchStartCenter.x);
-      el.pdfViewerArea.scrollTop = pdfPinchStartViewerScroll.top - (currentCenter.y - pdfPinchStartCenter.y);
-    }
-  }, { passive: false });
-
-  el.pdfViewerArea.addEventListener("touchend", (event) => {
-    if (event.touches.length < 2) {
-      pdfPinchStartDistance = null;
-      pdfPinchStartCenter = null;
-      pdfPinchStartViewerScroll = null;
-      pdfPinchStartZoom = pdfZoom;
-    }
-  }, { passive: false });
-
-  el.pdfViewerArea.addEventListener("touchcancel", () => {
-    pdfPinchStartDistance = null;
-    pdfPinchStartCenter = null;
-    pdfPinchStartViewerScroll = null;
-    pdfPinchStartZoom = pdfZoom;
-  }, { passive: false });
-
-  el.pdfViewerArea.addEventListener("gesturestart", (event) => {
-    event.preventDefault();
-    pdfGestureStartZoom = pdfZoom;
-  }, { passive: false });
-
-  el.pdfViewerArea.addEventListener("gesturechange", (event) => {
-    event.preventDefault();
-    pdfZoom = clampPdfZoom(pdfGestureStartZoom * event.scale);
-    applyPdfZoom();
-  }, { passive: false });
-
-  el.pdfViewerArea.addEventListener("gestureend", (event) => {
-    event.preventDefault();
-    pdfGestureStartZoom = pdfZoom;
-  }, { passive: false });
-
-  el.pdfViewerArea.addEventListener("wheel", (event) => {
-    if (!event.ctrlKey && !event.metaKey) return;
-    event.preventDefault();
-    const direction = event.deltaY > 0 ? -0.08 : 0.08;
-    pdfZoom = clampPdfZoom(pdfZoom + direction);
-    applyPdfZoom();
-  }, { passive: false });
-}
-
-
-function getScrollSnapshot() {
-  return {
-    windowY: window.scrollY || document.documentElement.scrollTop || 0,
-    viewerTop: el.pdfViewerArea ? el.pdfViewerArea.scrollTop : 0,
-    viewerLeft: el.pdfViewerArea ? el.pdfViewerArea.scrollLeft : 0
-  };
-}
-
-function restoreScrollSnapshot(snapshot) {
-  if (!snapshot) return;
-  requestAnimationFrame(() => {
-    if (el.pdfViewerArea) {
-      el.pdfViewerArea.scrollTop = snapshot.viewerTop || 0;
-      el.pdfViewerArea.scrollLeft = snapshot.viewerLeft || 0;
-    }
-    window.scrollTo({ top: snapshot.windowY || 0, left: 0, behavior: "auto" });
-  });
-}
-
-function withScrollPreserved(fn) {
-  const snapshot = getScrollSnapshot();
-  const result = fn();
-  restoreScrollSnapshot(snapshot);
-  return result;
-}
-
-
-function togglePdfAddMaskMode() {
-  if (!currentPdfMaterial()) {
-    alert("先に画像教材を選択してください。");
-    return;
-  }
-  pdfAddMaskMode = !pdfAddMaskMode;
-  el.addMaskModeBtn.textContent = pdfAddMaskMode ? "✅" : "➕";
-  if (el.pdfViewerArea) el.pdfViewerArea.classList.toggle("is-add-mask-mode", pdfAddMaskMode);
-  setPdfStatus(pdfAddMaskMode
-    ? "画像上で隠したい範囲をドラッグしてください。拡大縮小したいときは、ドラッグ追加を終了してから2本指でピンチしてください。"
-    : "ドラッグ追加モードを終了しました。2本指で画像を拡大縮小できます。"
-  );
-}
-
-function getPointerPercent(event, pageWrap) {
-  const rect = pageWrap.getBoundingClientRect();
-  const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
-  const y = Math.min(Math.max(event.clientY - rect.top, 0), rect.height);
-  return {
-    x: (x / rect.width) * 100,
-    y: (y / rect.height) * 100
-  };
-}
-
-
-function finishMaskDrag(pageNumber, startPoint, currentPoint) {
-  const snapshot = getScrollSnapshot();
-  const pdf = currentPdfMaterial();
-  if (!pdf) return;
-
-  const x = Math.max(0, Math.min(startPoint.x, currentPoint.x));
-  const y = Math.max(0, Math.min(startPoint.y, currentPoint.y));
-  const width = Math.min(100 - x, Math.abs(currentPoint.x - startPoint.x));
-  const height = Math.min(100 - y, Math.abs(currentPoint.y - startPoint.y));
-
-  if (width < 0.5 || height < 0.5) {
-    setPdfStatus("隠し範囲が小さすぎます。少し大きめにドラッグしてください。");
-    return;
-  }
-
-  const mask = {
-    id: crypto.randomUUID(),
-    page: pageNumber,
-    x: Number(x.toFixed(2)),
-    y: Number(y.toFixed(2)),
-    width: Number(width.toFixed(2)),
-    height: Number(height.toFixed(2))
-  };
-
-  if (!Array.isArray(pdf.masks)) pdf.masks = [];
-  pdf.masks.push(mask);
-  selectedMaskId = mask.id;
-  fillPdfMaskForm(mask);
-  renderPdfMaskTable();
-  renderPdfTable();
-  addSinglePdfMaskElement(mask);
-  restoreScrollSnapshot(snapshot);
-  setPdfStatus("隠し範囲を追加しました。");
-  autoSaveToCloud();
-}
-
-
-function attachPdfPageDragEvents(pageWrap, pageNumber) {
-  let startPoint = null;
-  let draftEl = null;
-  let isDraggingMask = false;
-
-  function getLocalPoint(event) {
-    const rect = pageWrap.getBoundingClientRect();
-    const clientX = event.touches?.[0]?.clientX ?? event.clientX;
-    const clientY = event.touches?.[0]?.clientY ?? event.clientY;
-    return {
-      x: ((clientX - rect.left) / rect.width) * 100,
-      y: ((clientY - rect.top) / rect.height) * 100
-    };
-  }
-
-  function removeDraft() {
-    if (draftEl) draftEl.remove();
-    draftEl = null;
-  }
-
-  pageWrap.addEventListener("pointerdown", (event) => {
-    if (!pdfAddMaskMode) return;
-    if (event.pointerType === "touch") return; // touchは下のtouchイベントで処理する
-    if (event.target.closest(".pdf-mask")) return;
-
-    event.preventDefault();
-    isDraggingMask = true;
-    startPoint = getLocalPoint(event);
-    removeDraft();
-
-    draftEl = document.createElement("div");
-    draftEl.className = "pdf-draft-mask";
-    pageWrap.appendChild(draftEl);
-    pageWrap.setPointerCapture?.(event.pointerId);
-  });
-
-  pageWrap.addEventListener("pointermove", (event) => {
-    if (!pdfAddMaskMode || !isDraggingMask || !startPoint || !draftEl) return;
-    if (event.pointerType === "touch") return;
-
-    event.preventDefault();
-    const current = getLocalPoint(event);
-    const x = Math.max(0, Math.min(startPoint.x, current.x));
-    const y = Math.max(0, Math.min(startPoint.y, current.y));
-    const width = Math.min(100 - x, Math.abs(current.x - startPoint.x));
-    const height = Math.min(100 - y, Math.abs(current.y - startPoint.y));
-
-    draftEl.style.left = `${x}%`;
-    draftEl.style.top = `${y}%`;
-    draftEl.style.width = `${width}%`;
-    draftEl.style.height = `${height}%`;
-  });
-
-  pageWrap.addEventListener("pointerup", (event) => {
-    if (!pdfAddMaskMode || !isDraggingMask || !startPoint) return;
-    if (event.pointerType === "touch") return;
-
-    event.preventDefault();
-    const current = getLocalPoint(event);
-    finishMaskDrag(pageNumber, startPoint, current);
-    startPoint = null;
-    isDraggingMask = false;
-    removeDraft();
-  });
-
-  pageWrap.addEventListener("touchstart", (event) => {
-    if (!pdfAddMaskMode) return;
-    if (event.touches.length >= 2) {
-      // 2本指はピンチ用。隠し範囲作成は中断する。
-      // Two fingers are for pinch zoom. Cancel mask drawing.
-      startPoint = null;
-      isDraggingMask = false;
-      removeDraft();
-      return;
-    }
-    if (event.target.closest(".pdf-mask")) return;
-
-    event.preventDefault();
-    isDraggingMask = true;
-    startPoint = getLocalPoint(event);
-    removeDraft();
-
-    draftEl = document.createElement("div");
-    draftEl.className = "pdf-draft-mask";
-    pageWrap.appendChild(draftEl);
-  }, { passive:false });
-
-  pageWrap.addEventListener("touchmove", (event) => {
-    if (!pdfAddMaskMode) return;
-    if (event.touches.length >= 2) {
-      startPoint = null;
-      isDraggingMask = false;
-      removeDraft();
-      return;
-    }
-    if (!isDraggingMask || !startPoint || !draftEl) return;
-
-    event.preventDefault();
-    const current = getLocalPoint(event);
-    const x = Math.max(0, Math.min(startPoint.x, current.x));
-    const y = Math.max(0, Math.min(startPoint.y, current.y));
-    const width = Math.min(100 - x, Math.abs(current.x - startPoint.x));
-    const height = Math.min(100 - y, Math.abs(current.y - startPoint.y));
-
-    draftEl.style.left = `${x}%`;
-    draftEl.style.top = `${y}%`;
-    draftEl.style.width = `${width}%`;
-    draftEl.style.height = `${height}%`;
-  }, { passive:false });
-
-  pageWrap.addEventListener("touchend", (event) => {
-    if (!pdfAddMaskMode || !isDraggingMask || !startPoint) return;
-    if (event.changedTouches.length !== 1) return;
-
-    event.preventDefault();
-    const touch = event.changedTouches[0];
-    const rect = pageWrap.getBoundingClientRect();
-    const current = {
-      x: ((touch.clientX - rect.left) / rect.width) * 100,
-      y: ((touch.clientY - rect.top) / rect.height) * 100
-    };
-
-    finishMaskDrag(pageNumber, startPoint, current);
-    startPoint = null;
-    isDraggingMask = false;
-    removeDraft();
-  }, { passive:false });
-
-  pageWrap.addEventListener("touchcancel", () => {
-    startPoint = null;
-    isDraggingMask = false;
-    removeDraft();
-  }, { passive:true });
-}
-
-function drawPdfDraftMask(draft) {
-  const x = Math.min(draft.start.x, draft.current.x);
-  const y = Math.min(draft.start.y, draft.current.y);
-  const width = Math.abs(draft.current.x - draft.start.x);
-  const height = Math.abs(draft.current.y - draft.start.y);
-  draft.draftEl.style.left = `${x}%`;
-  draft.draftEl.style.top = `${y}%`;
-  draft.draftEl.style.width = `${width}%`;
-  draft.draftEl.style.height = `${height}%`;
-}
-
-
-
-function clearPdfMaskElementsOnly() {
-  if (!el.pdfViewerArea) return;
-  el.pdfViewerArea.querySelectorAll(".pdf-mask").forEach(node => node.remove());
-}
-
-function refreshPdfMasksOnly() {
-  const pdf = currentPdfMaterial();
-  if (!pdf || !el.pdfViewerArea) return;
-
-  clearPdfMaskElementsOnly();
-
-  el.pdfViewerArea.querySelectorAll(".pdf-page-wrap[data-page]").forEach(pageWrap => {
-    addPdfMaskOverlays(pageWrap, pdf, Number(pageWrap.dataset.page));
-  });
-
-  updatePdfMaskElementsOnly();
-}
-
-function createPdfMaskElement(pageWrap, pdf, mask) {
-  const revealMap = getPdfRevealMap(pdf.id);
-
-  const maskEl = document.createElement("button");
-  maskEl.type = "button";
-  maskEl.className = "pdf-mask";
-  if (revealMap[mask.id]) maskEl.classList.add("revealed");
-  if (selectedMaskId === mask.id) maskEl.classList.add("selected");
-  maskEl.style.left = `${mask.x}%`;
-  maskEl.style.top = `${mask.y}%`;
-  maskEl.style.width = `${mask.width}%`;
-  maskEl.style.height = `${mask.height}%`;
-  maskEl.innerHTML = "";
-  maskEl.textContent = "";
-  maskEl.title = "";
-  maskEl.dataset.maskId = mask.id;
-  maskEl.setAttribute("aria-label", "隠し範囲");
-
-  maskEl.addEventListener("click", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-
-    const snapshot = getScrollSnapshot();
-
-    selectedMaskId = mask.id;
-    revealMap[mask.id] = !revealMap[mask.id];
-    fillPdfMaskForm(mask);
-
-    renderPdfMaskTable();
-    renderPdfTable();
-    updatePdfMaskElementsOnly();
-
-    restoreScrollSnapshot(snapshot);
-    setPdfStatus("表示を切り替えました。");
-    autoSaveToCloud();
-  });
-
-  return maskEl;
-}
-
-function addSinglePdfMaskElement(mask) {
-  const pdf = currentPdfMaterial();
-  if (!pdf || !el.pdfViewerArea || !mask) return;
-  const pageWrap = el.pdfViewerArea.querySelector(`.pdf-page-wrap[data-page="${mask.page}"]`);
-  if (!pageWrap) {
-    refreshPdfMasksOnly();
-    return;
-  }
-  pageWrap.appendChild(createPdfMaskElement(pageWrap, pdf, mask));
-  updatePdfMaskElementsOnly();
-}
-
-function removeSinglePdfMaskElement(maskId) {
-  if (!el.pdfViewerArea || !maskId) return;
-  const target = el.pdfViewerArea.querySelector(`.pdf-mask[data-mask-id="${maskId}"]`);
-  if (target) target.remove();
-  updatePdfMaskElementsOnly();
-}
-
-
-function updatePdfMaskElementsOnly() {
-  const pdf = currentPdfMaterial();
-  if (!pdf || !el.pdfViewerArea) return;
-  const revealMap = getPdfRevealMap(pdf.id);
-
-  el.pdfViewerArea.querySelectorAll(".pdf-mask").forEach(maskEl => {
-    const id = maskEl.dataset.maskId;
-    maskEl.classList.toggle("revealed", !!revealMap[id]);
-    maskEl.classList.toggle("selected", selectedMaskId === id || selectedMaskIds.includes(id));
-  });
-}
-
-
-function addPdfMaskOverlays(pageWrap, pdf, pageNumber) {
-  (pdf.masks || []).filter(mask => Number(mask.page) === pageNumber).forEach(mask => {
-    pageWrap.appendChild(createPdfMaskElement(pageWrap, pdf, mask));
-  });
-}
-
-
-
-
-
-
-
-
-
-
-function getSavedPdfPageImageUrl(page) {
-  if (!page) return "";
-  return page.imageUrl || page.url || page.downloadUrl || page.src || "";
-}
-
-function getPdfPageImagePath(page) {
-  if (!page) return "";
-  return page.imagePath || page.path || page.storagePath || "";
-}
-
-function classifyStorageError(error) {
-  const code = String(error?.code || "");
-  const details = [
-    code,
-    error?.message,
-    error?.customData?.serverResponse
-  ].filter(Boolean).join(" ");
-
-  if (/quota-exceeded|UserProjectAccountProblem|Spark pricing|billing account|Cloud Storage for Firebase no longer supports/i.test(details)) {
-    return "billing";
-  }
-  if (code === "storage/unauthorized") return "unauthorized";
-  if (code === "storage/object-not-found") return "not-found";
-  if (code === "storage/retry-limit-exceeded") return "retry-limit";
-  return code ? "storage-error" : "image-error";
-}
-
-function getPdfImageLoadFailureMessage(category, pageNumber) {
-  const prefix = `${Number(pageNumber || 1)}ページの画像を表示できません。`;
-
-  if (category === "billing") {
-    return prefix + " Firebase Storageの課金状態を確認してください。Blazeプランまたは請求先アカウントが無効な可能性があります。";
-  }
-  if (category === "unauthorized") {
-    return prefix + " Firebase Storageルールによりアクセスが拒否されました。ログイン状態とStorageルールを確認してください。";
-  }
-  if (category === "not-found") {
-    return prefix + " Storage上に画像ファイルが見つかりません。ファイルが削除されていないか確認してください。";
-  }
-  if (category === "retry-limit") {
-    return prefix + " Storageとの通信がタイムアウトしました。通信環境を確認して再読み込みしてください。";
-  }
-  if (category === "storage-error") {
-    return prefix + " Firebase StorageからURLを取得できません。Storageの設定とブラウザのコンソールを確認してください。";
-  }
-  return prefix + " 画像URLへのアクセスに失敗しました。Storageの課金状態、ファイルの存在、権限を確認してください。";
-}
-
-async function resolvePdfPageImageUrl(pdf, page) {
-  if (!page) return "";
-
-  const imagePath = getPdfPageImagePath(page);
-  if (storage && imagePath) {
-    const refObj = storageRef(storage, imagePath);
-    const freshUrl = await getDownloadURL(refObj);
-
-    page.imagePath = imagePath;
-    page.imageUrl = freshUrl;
-    page.url = freshUrl;
-
-    const material = pdfMaterials.find(item => item.id === pdf.id);
-    if (material && Array.isArray(material.pages)) {
-      const targetPage = material.pages.find(item => String(item.page) === String(page.page));
-      if (targetPage) {
-        targetPage.imagePath = imagePath;
-        targetPage.imageUrl = freshUrl;
-        targetPage.url = freshUrl;
-      }
-    }
-
-    return freshUrl;
-  }
-
-  return getSavedPdfPageImageUrl(page);
-}
-
-async function setPdfImageSource(img, pdf, page) {
-  try {
-    const src = await resolvePdfPageImageUrl(pdf, page);
-
-    if (!src) {
-      throw new Error("画像URLが空です。");
-    }
-
-    img.dataset.storageErrorCategory = "";
-    img.src = src;
-    autoSaveToCloud();
-  } catch (error) {
-    console.error(error);
-    const category = classifyStorageError(error);
-    img.dataset.storageErrorCategory = category;
-
-    const fallback = getSavedPdfPageImageUrl(page);
-    if (fallback) {
-      img.src = fallback;
-      return;
-    }
-
-    img.alt = "画像URLを取得できません";
-    setPdfStatus(getPdfImageLoadFailureMessage(category, page.page));
-  }
-}
-
-async function deletePdfStorageFiles(pdf) {
-  if (!storage || !pdf || !Array.isArray(pdf.pages)) return;
-
-  const paths = [...new Set(
-    pdf.pages
-      .map(page => page.imagePath || page.path || page.storagePath)
-      .filter(Boolean)
-  )];
-
-  await Promise.all(paths.map(async path => {
-    try {
-      await deleteObject(storageRef(storage, path));
-    } catch (error) {
-      console.warn("Storage画像削除をスキップしました:", path, error);
-    }
-  }));
-}
-
-
-function renderPdfViewer(preserveScroll = false) {
-  const snapshot = preserveScroll ? getScrollSnapshot() : null;
-  const pdf = currentPdfMaterial();
-  if (!el.pdfViewerArea) return;
-
-  attachPdfViewerZoomEvents();
-  el.pdfViewerArea.classList.toggle("is-add-mask-mode", pdfAddMaskMode);
-
-  if (!pdf) {
-    el.pdfViewerArea.innerHTML = "<div>画像教材を選択してください。</div>";
-    setPdfStatus("画像教材を選択してください。");
-    restoreScrollSnapshot(snapshot);
-    return;
-  }
-
-  const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
-  el.pdfViewerArea.innerHTML = "";
-
-  if (pages.length) {
-    pages.forEach(page => {
-      const pageNumber = Number(page.page || 1);
-      const pageWrap = document.createElement("div");
-      pageWrap.className = "pdf-page-wrap";
-      pageWrap.dataset.page = String(pageNumber);
-
-      const label = document.createElement("div");
-      label.className = "pdf-page-label";
-      label.textContent = `${pageNumber}ページ`;
-      pageWrap.appendChild(label);
-
-      const img = document.createElement("img");
-      img.alt = page.imageName || `${pageNumber}ページ`;
-      img.loading = "eager";
-      img.draggable = false;
-
-      const onLoadImage = () => {
-        if (img.naturalWidth && img.naturalHeight) {
-          pageWrap.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
-        }
-
-        addPdfMaskOverlays(pageWrap, pdf, pageNumber);
-        attachPdfPageDragEvents(pageWrap, pageNumber);
-        applyPdfZoom();
-        restoreScrollSnapshot(snapshot);
-      };
-
-      img.addEventListener("load", onLoadImage, { once: true });
-
-      img.addEventListener("error", () => {
-        const category = img.dataset.storageErrorCategory || "image-error";
-        setPdfStatus(getPdfImageLoadFailureMessage(category, pageNumber));
-      });
-
-      pageWrap.appendChild(img);
-      el.pdfViewerArea.appendChild(pageWrap);
-
-      // 保存済みURLではなく、表示時にimagePathから最新URLを取得して表示する。
-      // Use a fresh URL from imagePath when rendering, instead of relying only on the saved URL.
-      setPdfImageSource(img, pdf, page);
-    });
-
-    applyPdfZoom();
-    setPdfStatus("画像教材を表示しています。Storageから最新URLを取得します。");
-    restoreScrollSnapshot(snapshot);
-    return;
-  }
-
-  if (pdf.pdfUrl) {
-    el.pdfViewerArea.innerHTML = `
-      <iframe
-        src="${pdf.pdfUrl}"
-        title="${escapeHtml(pdf.title || "旧PDF")}"
-        style="width:100%;height:70vh;border:none;border-radius:12px;background:#fff;">
-      </iframe>
-    `;
-    setPdfStatus("旧PDF教材を表示しました。画像版で使う場合はPDFを登録し直してください。");
-    restoreScrollSnapshot(snapshot);
-    return;
-  }
-
-  el.pdfViewerArea.innerHTML = "<div>画像URLがありません。</div>";
-  setPdfStatus("画像URLがありません。画像教材を登録し直してください。");
-  restoreScrollSnapshot(snapshot);
-}
-
-
 function resetProgress() {
   if (!currentUser) return;
   if (!confirm("進捗をリセットしますか？")) return;
@@ -3514,109 +1306,53 @@ function showTab(tabName) {
 }
 
 
-function serializeState() {
-  return {
-    allQuestions,
-    filteredQuestionIds: filteredQuestions.map(q => q.id),
-    currentIndex,
-    wrongQuestionIds,
-    deviceMode,
-    subjectFilter,
-    selectedSubcategories,
-    orderMode,
-    progress,
-    questionStatuses,
-    studyMode,
-    pdfMaterials,
-    selectedPdfId,
-    selectedMaskId,
-    pdfRevealStates,
-    pdfSearchQuery,
-    selectedPdfTags
-  };
-}
-
-
-function migrateExistingQuestionAnswers() {
-  let changed = false;
-
-  allQuestions = allQuestions.map(q => {
-    const migratedAnswers = normalizeQuestionAnswers(q.answers);
-    const currentAnswers = Array.isArray(q.answers) ? q.answers : [];
-    const isChanged = JSON.stringify(currentAnswers) !== JSON.stringify(migratedAnswers);
-
-    if (isChanged) changed = true;
-
-    return {
-      ...q,
-      answers: migratedAnswers
-    };
-  });
-
-  return changed;
-}
-
-
 function applyState(state) {
   isApplyingCloudState = true;
-  allQuestions = Array.isArray(state.allQuestions) && state.allQuestions.length
-    ? state.allQuestions.map(q => ({
-        ...q,
-        subcategories: normalizeSubcategories(q.subcategories || []),
-        imageUrl: q.imageUrl || "",
-        imagePath: q.imagePath || "",
-        imageName: q.imageName || "",
-        orderedAnswers: q.orderedAnswers === true
-      }))
-    : [];
+  try {
+    allQuestions = Array.isArray(state.allQuestions) && state.allQuestions.length
+      ? state.allQuestions.map(q => ({
+          ...q,
+          subcategories: normalizeSubcategories(q.subcategories || []),
+          imageUrl: q.imageUrl || "",
+          imagePath: q.imagePath || "",
+          imageName: q.imageName || "",
+          orderedAnswers: q.orderedAnswers === true
+        }))
+      : [];
 
-  wrongQuestionIds = Array.isArray(state.wrongQuestionIds) ? state.wrongQuestionIds : [];
-  currentIndex = Number.isInteger(state.currentIndex) ? state.currentIndex : 0;
-  deviceMode = state.deviceMode || "iphone";
-  subjectFilter = state.subjectFilter || "all";
-  selectedSubcategories = Array.isArray(state.selectedSubcategories) ? state.selectedSubcategories : [];
-  selectedPrimarySubcategory = state.selectedPrimarySubcategory || selectedSubcategories[0] || "";
-  subcategoryConditionGroups = normalizeConditionGroups(state.subcategoryConditionGroups);
-  selectedConditionGroupIndex = Number.isInteger(state.selectedConditionGroupIndex) ? state.selectedConditionGroupIndex : 0;
-  orderMode = state.orderMode || "sequential";
-  progress = state.progress || {};
-  questionStatuses = state.questionStatuses || {};
-  migrateQuestionStatusesToFlags();
-  recalcProgressFromQuestionStates();
-  studyMode = state.studyMode || "normal";
-  pdfMaterials = Array.isArray(state.pdfMaterials)
-    ? state.pdfMaterials.map(pdf => ({
-        ...pdf,
-        masks: Array.isArray(pdf.masks) ? pdf.masks : [],
-        tags: normalizePdfTags(pdf.tags || [])
-      }))
-    : [];
-  selectedPdfId = state.selectedPdfId || null;
-  selectedMaskId = state.selectedMaskId || null;
-  pdfRevealStates = state.pdfRevealStates || {};
-  pdfSearchQuery = state.pdfSearchQuery || "";
-  selectedPdfTags = Array.isArray(state.selectedPdfTags) ? state.selectedPdfTags : [];
-  ensurePdfTagUi();
-  const pdfSearchInput = getPdfSearchInput();
-  if (pdfSearchInput) pdfSearchInput.value = pdfSearchQuery;
-  if (selectedPdfId && !pdfMaterials.some(pdf => pdf.id === selectedPdfId)) {
-    selectedPdfId = null;
-    selectedMaskId = null;
+    wrongQuestionIds = Array.isArray(state.wrongQuestionIds) ? state.wrongQuestionIds : [];
+    currentIndex = Number.isInteger(state.currentIndex) ? state.currentIndex : 0;
+    deviceMode = state.deviceMode || "iphone";
+    subjectFilter = state.subjectFilter || "all";
+    selectedSubcategories = Array.isArray(state.selectedSubcategories) ? state.selectedSubcategories : [];
+    selectedPrimarySubcategory = state.selectedPrimarySubcategory || selectedSubcategories[0] || "";
+    subcategoryConditionGroups = normalizeConditionGroups(state.subcategoryConditionGroups);
+    selectedConditionGroupIndex = Number.isInteger(state.selectedConditionGroupIndex) ? state.selectedConditionGroupIndex : 0;
+    orderMode = state.orderMode || "sequential";
+    progress = state.progress || {};
+    questionStatuses = state.questionStatuses || {};
+    migrateQuestionStatusesToFlags();
+    recalcProgressFromQuestionStates();
+    studyMode = state.studyMode || "normal";
+
+    questionManager.apply(state);
+    imageMemory.apply(state);
+
+    allQuestions.forEach(q => ensureProgressRow(q.subject));
+    updateSubjectOptions();
+    el.subjectFilter.value = subjectFilter;
+    el.orderMode.value = orderMode;
+    selectedSubcategories = selectedSubcategories.filter(name => getAvailableSubcategories().includes(name));
+    buildFilteredQuestions();
+    renderManageTable();
+    renderProgressTable();
+    renderStudy();
+    renderPdfTable();
+    renderPdfMaskTable();
+    renderPdfViewer();
+  } finally {
+    isApplyingCloudState = false;
   }
-
-  allQuestions.forEach(q => ensureProgressRow(q.subject));
-  updateSubjectOptions();
-  el.subjectFilter.value = subjectFilter;
-  el.orderMode.value = orderMode;
-  selectedSubcategories = selectedSubcategories.filter(name => getAvailableSubcategories().includes(name));
-  buildFilteredQuestions();
-  renderManageTable();
-  renderProgressTable();
-  renderStudy();
-  renderPdfTable();
-  renderPdfMaskTable();
-  renderPdfViewer();
-  isApplyingCloudState = false;
 }
 
 function setInteractiveDisabled(ids, disabled) {
@@ -3646,7 +1382,7 @@ function updateLoginLockedUI() {
   el.pdfLockBanner.classList.toggle("hidden", loggedIn);
 
   setInteractiveDisabled([
-    "chooseIphone","chooseIpad","subjectFilter","orderMode","applyStudyBtn","shuffleBtn",
+    "chooseIphone","chooseIpad","subjectFilter","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn",
     "userAnswer","judgeBtn","showAnswerBtnIpad","nextBtnIpad","showAnswerBtn","nextBtn",
     "knownBtn","unknownBtn","reviewWrongBtn","reviewUnansweredBtn","resetWrongQuestionsBtn"
   ], !loggedIn);
@@ -3775,29 +1511,22 @@ async function signOutUser() {
 }
 
 
-function getSplitDocRefs() {
-  return {
-    main: doc(db, "users", currentUser.uid, "app", "main"),
-    questions: doc(db, "users", currentUser.uid, "app", "questions"),
-    pdfMaterials: doc(db, "users", currentUser.uid, "app", "pdfMaterials"),
-    progress: doc(db, "users", currentUser.uid, "app", "progress"),
-    settings: doc(db, "users", currentUser.uid, "app", "settings")
-  };
-}
-
 function buildSplitStates() {
+  const imageState = imageMemory.serialize();
+  const questionSettings = questionManager.serialize();
+
   return {
     questions: {
       allQuestions,
       updatedAt: serverTimestamp()
     },
     pdfMaterials: {
-      pdfMaterials,
-      pdfRevealStates,
-      selectedPdfId,
-      selectedMaskId,
-      pdfSearchQuery,
-      selectedPdfTags,
+      pdfMaterials: imageState.pdfMaterials,
+      pdfRevealStates: imageState.pdfRevealStates,
+      selectedPdfId: imageState.selectedPdfId,
+      selectedMaskId: imageState.selectedMaskId,
+      pdfSearchQuery: imageState.pdfSearchQuery,
+      selectedPdfTags: imageState.selectedPdfTags,
       updatedAt: serverTimestamp()
     },
     progress: {
@@ -3817,10 +1546,10 @@ function buildSplitStates() {
       selectedConditionGroupIndex,
       orderMode,
       studyMode,
-      manageSubjectFilter,
-      managePrimarySubcategory,
-      manageSelectedSubcategories,
-      pdfSelectedTagFilter,
+      manageSubjectFilter: questionSettings.manageSubjectFilter,
+      managePrimarySubcategory: questionSettings.managePrimarySubcategory,
+      manageSelectedSubcategories: questionSettings.manageSelectedSubcategories,
+      pdfSelectedTagFilter: imageState.pdfSelectedTagFilter,
       schemaVersion: "split-v1",
       updatedAt: serverTimestamp()
     },
@@ -3846,13 +1575,10 @@ async function saveToCloud(options = {}) {
 
   el.cloudStatus.textContent = "クラウドへ保存中です...";
 
-  const refs = getSplitDocRefs();
+  const userId = currentUser.uid;
   const splitState = buildSplitStates();
 
-  const [questionsSnap, pdfSnap] = await Promise.all([
-    getDoc(refs.questions),
-    getDoc(refs.pdfMaterials)
-  ]);
+  const [questionsSnap, pdfSnap] = await readSaveGuardDocuments(db, userId);
 
   const currentQuestions = questionsSnap.exists() && Array.isArray(questionsSnap.data()?.allQuestions)
     ? questionsSnap.data().allQuestions
@@ -3904,12 +1630,7 @@ async function saveToCloud(options = {}) {
     return false;
   }
 
-  await Promise.all([
-    setDoc(refs.questions, splitState.questions),
-    setDoc(refs.pdfMaterials, splitState.pdfMaterials),
-    setDoc(refs.progress, splitState.progress),
-    setDoc(refs.settings, splitState.settings)
-  ]);
+  await writeSplitDocuments(db, userId, splitState);
 
   el.cloudStatus.textContent = "クラウドに分離保存しました。";
   return true;
@@ -3922,14 +1643,8 @@ async function loadFromCloud(options = {}) {
     return false;
   }
 
-  const refs = getSplitDocRefs();
-
-  const [questionsSnap, pdfSnap, progressSnap, settingsSnap] = await Promise.all([
-    getDoc(refs.questions),
-    getDoc(refs.pdfMaterials),
-    getDoc(refs.progress),
-    getDoc(refs.settings)
-  ]);
+  const userId = currentUser.uid;
+  const [questionsSnap, pdfSnap, progressSnap, settingsSnap] = await readSplitDocuments(db, userId);
 
   const hasSplitData =
     questionsSnap.exists() ||
@@ -3955,7 +1670,7 @@ async function loadFromCloud(options = {}) {
 
   // 旧形式 app/main からの互換読み込み。
   // Compatible loading from the old app/main format.
-  const legacySnap = await getDoc(refs.main);
+  const legacySnap = await readLegacyDocument(db, userId);
   if (!legacySnap.exists()) {
     if (!silentNoData) alert("クラウド保存データがまだありません。");
     return false;
@@ -3980,8 +1695,6 @@ async function loadFromCloud(options = {}) {
 }
 
 let autoSaveTimer = null;
-let answersMigrated = false;
-let allowEmptyPdfMaterialsSaveOnce = false;
 function autoSaveToCloud(options = {}) {
   if (!db || !currentUser || isApplyingCloudState) return;
 
@@ -4039,7 +1752,6 @@ function renderStudyCurrentOnlyAfterShuffle() {
   if (!q) return;
   el.question.textContent = formatDisplayText(q.question);
   renderQuestionImage(q);
-  renderQuestionImage(q);
   el.answerBox.innerHTML = `<b>正解</b><br>${ensureCurrentQuestionAnswers(q).map(escapeDisplayText).join("\n")}`;
   el.explainBox.innerHTML = `<b>解説</b><br>${escapeDisplayText(q.explanation || "解説なし")}`;
   el.answerBox.style.display = "none";
@@ -4063,66 +1775,13 @@ document.getElementById("reviewUnansweredBtn").addEventListener("click", reviewU
 const resetWrongBtn = document.getElementById("resetWrongQuestionsBtn");
 if (resetWrongBtn) resetWrongBtn.addEventListener("click", resetWrongQuestions);
 
-document.getElementById("addBtn").addEventListener("click", () => addQuestion().catch(console.error));
-document.getElementById("updateBtn").addEventListener("click", () => updateQuestion().catch(console.error));
-(document.getElementById("deleteBtn") || { addEventListener: () => {} }).addEventListener("click", () => deleteQuestion().catch(console.error));
-document.getElementById("clearFormBtn").addEventListener("click", clearEditorForm);
 document.getElementById("saveCloudBtn").addEventListener("click", () => saveToCloud().catch(console.error));
 document.getElementById("saveCloudBtn2").addEventListener("click", () => saveToCloud().catch(console.error));
 document.getElementById("loadCloudBtn").addEventListener("click", () => loadFromCloud().catch(console.error));
 document.getElementById("resetProgressBtn").addEventListener("click", resetProgress);
 
-document.getElementById("searchInput").addEventListener("input", renderManageTable);
-
-document.getElementById("bulkImportValidateBtn").addEventListener("click", () => runBulkImportValidation().catch(console.error));
-document.getElementById("bulkImportExecuteBtn").addEventListener("click", () => executeBulkImport().catch(console.error));
-document.getElementById("bulkImportResetBtn").addEventListener("click", resetBulkImportState);
-
-document.getElementById("editImageFile").addEventListener("change", async (e) => {
-  const file = e.target.files && e.target.files[0];
-  if (!file) return;
-  if (!file.type.startsWith("image/")) {
-    alert("画像ファイルを選んでください。");
-    e.target.value = "";
-    return;
-  }
-
-  pendingImageFile = file;
-  pendingRemoveImage = false;
-  currentEditingImageName = file.name || "image";
-  currentEditingImagePath = "";
-
-  const reader = new FileReader();
-  reader.onload = () => {
-    currentEditingImageUrl = typeof reader.result === "string" ? reader.result : "";
-    renderEditorImagePreview();
-  };
-  reader.readAsDataURL(file);
-});
-
-document.getElementById("removeImageBtn").addEventListener("click", () => {
-  if (!currentUser) return;
-  currentEditingImageUrl = "";
-  currentEditingImageName = "";
-  currentEditingImagePath = "";
-  pendingImageFile = null;
-  pendingRemoveImage = true;
-  el.editImageFile.value = "";
-  renderEditorImagePreview();
-});
-
-
-document.getElementById("addPdfBtn").addEventListener("click", () => addPdfMaterial().catch(console.error));
-document.getElementById("updatePdfBtn").addEventListener("click", updatePdfMaterialTitle);
-document.getElementById("deletePdfBtn").addEventListener("click", () => deletePdfMaterial().catch(console.error));
-document.getElementById("addMaskModeBtn").addEventListener("click", togglePdfAddMaskMode);
-document.getElementById("updateMaskBtn").addEventListener("click", updatePdfMaskFromForm);
-document.getElementById("deleteMaskBtn").addEventListener("click", deletePdfMask);
-document.getElementById("clearMaskSelectionBtn").addEventListener("click", clearPdfMaskSelection);
-document.getElementById("selectAllMasksBtn").addEventListener("click", selectAllMasks);
-document.getElementById("showAllMasksBtn").addEventListener("click", showAllMasks);
-document.getElementById("resetPdfRevealBtn").addEventListener("click", resetPdfRevealState);
-
+questionManager.bindEvents();
+imageMemory.bindEvents();
 
 document.getElementById("signUpBtn").addEventListener("click", signUpUser);
 document.getElementById("signInBtn").addEventListener("click", signInUser);

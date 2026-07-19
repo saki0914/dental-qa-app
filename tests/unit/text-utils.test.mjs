@@ -14,7 +14,7 @@ import {
   textToAnswerList,
   textToAnswers,
   textToTagList
-} from "../../js/text-utils.js";
+} from "../../js/core/text-utils.js";
 
 test("入力テキストを問題・タグの配列へ正規化する", () => {
   assert.deepEqual(textToTagList("保存, 補綴，歯周\n小児"), ["保存", "補綴", "歯周", "小児"]);
