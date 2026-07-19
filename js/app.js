@@ -1157,8 +1157,8 @@ function updateLoginLockedUI() {
 
   setInteractiveDisabled([
     "editSubject","searchInput","editQuestion","editAnswers","editExplanation","editOrderedAnswers","editImageFile","removeImageBtn","editImageName",
-    "addBtn","updateBtn","deleteBtn","clearFormBtn","saveCloudBtn","loadCloudBtn","bulkImportFile","bulkImportImageFiles","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn",
-    "saveCloudBtn2","resetProgressBtn",
+    "addBtn","updateBtn","deleteBtn","clearFormBtn","bulkImportFile","bulkImportImageFiles","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn",
+    "resetProgressBtn",
     "pdfStudyModeBtn","pdfEditModeBtn","pdfSearchInput","pdfSubjectFilterSelect","pdfCategoryFilterSelect","pdfFullscreenBtn",
     "pdfTitleInput","pdfSubjectInput","pdfCategoryInput","pdfFileInput","addPdfBtn","updatePdfBtn","clearPdfEditorBtn",
     "pdfSelectAllDeleteBtn","pdfClearDeleteSelectionBtn","pdfDeleteCheckedBtn",
@@ -1508,9 +1508,6 @@ document.getElementById("reviewUnansweredBtn").addEventListener("click", reviewU
 const resetWrongBtn = document.getElementById("resetWrongQuestionsBtn");
 if (resetWrongBtn) resetWrongBtn.addEventListener("click", resetWrongQuestions);
 
-document.getElementById("saveCloudBtn").addEventListener("click", () => saveToCloud().catch(console.error));
-document.getElementById("saveCloudBtn2").addEventListener("click", () => saveToCloud().catch(console.error));
-document.getElementById("loadCloudBtn").addEventListener("click", () => loadFromCloud().catch(console.error));
 document.getElementById("resetProgressBtn").addEventListener("click", resetProgress);
 
 questionManager.bindEvents();
