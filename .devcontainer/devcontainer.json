@@ -7,12 +7,27 @@
   "remoteUser": "node",
   "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
   "forwardPorts": [
-    3000
+    3000,
+    8080,
+    9099,
+    9199
   ],
   "portsAttributes": {
     "3000": {
       "label": "Dental QA local server",
       "onAutoForward": "notify"
+    },
+    "8080": {
+      "label": "Firestore Emulator",
+      "onAutoForward": "silent"
+    },
+    "9099": {
+      "label": "Auth Emulator",
+      "onAutoForward": "silent"
+    },
+    "9199": {
+      "label": "Storage Emulator",
+      "onAutoForward": "silent"
     }
   },
   "mounts": [

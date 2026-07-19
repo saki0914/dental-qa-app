@@ -18,7 +18,7 @@
 ## 使い方
 
 ### 1. Firebase の設定を入れる
-`index.html` の上の方にある `firebaseConfig` を、自分の Firebase プロジェクトの値に置き換えてください。
+`js/firebase-config.js` の `PRODUCTION_FIREBASE_CONFIG` を、自分の Firebase プロジェクトの値に置き換えてください。
 
 ### 2. Authentication を有効化する
 Firebase で **Email/Password** を ON にしてください。
@@ -32,7 +32,7 @@ Cloud Firestore を作成してください。
 Firebase CLIで反映する場合は、プロジェクトルートで次を実行します。
 
 ```bash
-firebase deploy --only firestore:rules,storage
+firebase deploy --project production --only firestore:rules,storage
 ```
 
 Cloud Storage for Firebaseを利用するには、FirebaseプロジェクトのBlazeプランと有効な請求先アカウントも必要です。課金アカウントが無効な場合、保存済み画像を含むStorageアクセスが402または403で失敗します。
@@ -73,6 +73,8 @@ GitHub Pages などに `index.html` を置けば使えます。
 - VS Code
 - VS Code Dev Containers 拡張機能
 
+Dev Containerを使わずFirebase Emulator Suiteを実行する場合は、Node.js 22とJava 21以降も必要です。
+
 ### 開き方
 
 1. Rancher Desktop を起動します。
@@ -97,6 +99,27 @@ npm run dev
 ```
 
 VS Code が転送する `http://localhost:3000` をMac側ブラウザで開きます。Firebase Authentication の制約を避けるため、`file://` ではなくHTTP経由で確認してください。
+
+### テスト
+
+通常の構文・単体・未ログインE2Eは次で実行します。
+
+```bash
+npm run check
+npm run test:unit
+npm run test:e2e
+```
+
+Firestore/Storageルールとログイン後E2EはFirebase Emulator Suiteを自動起動して実行します。
+
+```bash
+npm run test:rules
+npm run test:e2e:authenticated
+```
+
+Emulatorは実在しない `demo-dental-qa` プロジェクトIDに固定されています。アプリ側の接続切替も `localhost` または `127.0.0.1` で `?firebaseEmulator=1` を指定した場合だけ有効です。手動確認では、別ターミナルで `npm run emulators:start` を起動してから `http://localhost:3000/?firebaseEmulator=1` を開きます。
+
+Firebase CLIのデフォルトプロジェクトも誤操作防止のため `demo-dental-qa` です。本番へルールを反映するときだけ、上記のように `--project production` を明示してください。
 
 ### Codex CLI
 

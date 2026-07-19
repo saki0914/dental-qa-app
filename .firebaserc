@@ -1,5 +1,6 @@
 {
   "projects": {
-    "default": "dental-qa-hub-e7cce"
+    "default": "demo-dental-qa",
+    "production": "dental-qa-hub-e7cce"
   }
 }

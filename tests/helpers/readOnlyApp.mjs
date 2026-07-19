@@ -5,6 +5,43 @@ const SECRET_PATTERNS = [
   /([?&](?:key|token|auth|access_token|id_token|password|email)=)[^&#]+/gi
 ];
 
+const PRODUCTION_FIREBASE_HOSTS = new Set([
+  "identitytoolkit.googleapis.com",
+  "securetoken.googleapis.com",
+  "firebaseinstallations.googleapis.com",
+  "firestore.googleapis.com",
+  "firebasestorage.googleapis.com",
+  "storage.googleapis.com"
+]);
+const productionFirebaseAttemptsByPage = new WeakMap();
+const guardedPages = new WeakSet();
+
+function getProductionFirebaseAttempts(page) {
+  if (!productionFirebaseAttemptsByPage.has(page)) {
+    productionFirebaseAttemptsByPage.set(page, []);
+  }
+  return productionFirebaseAttemptsByPage.get(page);
+}
+
+export async function guardProductionFirebase(page) {
+  const attempts = getProductionFirebaseAttempts(page);
+  if (guardedPages.has(page)) return attempts;
+
+  await page.route("**/*", async route => {
+    const url = new URL(route.request().url());
+    const isProductionProject = url.href.includes("dental-qa-hub-e7cce");
+    if (PRODUCTION_FIREBASE_HOSTS.has(url.hostname) || isProductionProject) {
+      attempts.push(`${route.request().method()} ${url.origin}${url.pathname}`);
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+
+  guardedPages.add(page);
+  return attempts;
+}
+
 export function sanitizeText(value) {
   let text = String(value ?? "");
   for (const pattern of SECRET_PATTERNS) {
@@ -50,7 +87,7 @@ function isUnsafeFirebaseWrite(url, method) {
   const path = parsed.pathname;
 
   if (/firestore\.googleapis\.com$/.test(host)) {
-    return /:commit$|:batchWrite$|:write$|\/documents\//.test(path);
+    return /:commit$|:batchWrite$|:write$|\/documents\/|\/Write\/channel/i.test(path);
   }
 
   if (/firebasestorage\.googleapis\.com$|storage\.googleapis\.com$/.test(host)) {
@@ -72,7 +109,8 @@ export function createDiagnostics(page) {
     badResponses: [],
     unsafeFirebaseWrites: [],
     mutatingRequests: [],
-    externalHosts: new Set()
+    externalHosts: new Set(),
+    productionFirebaseAttempts: getProductionFirebaseAttempts(page)
   };
 
   page.on("pageerror", error => {
@@ -139,6 +177,7 @@ export function createDiagnostics(page) {
 }
 
 export async function openApp(page) {
+  await guardProductionFirebase(page);
   const response = await page.goto("/", { waitUntil: "domcontentloaded" });
   expect(response, "top page should return a response").not.toBeNull();
   expect(response.ok(), "top page HTTP status " + response.status()).toBeTruthy();
@@ -158,6 +197,7 @@ export async function expectNoResourceErrors(diagnostics) {
 
 export async function expectNoUnsafeFirebaseWrites(diagnostics) {
   expect(diagnostics.unsafeFirebaseWrites, "Firebase write-like requests").toEqual([]);
+  expect(diagnostics.productionFirebaseAttempts, "production Firebase requests").toEqual([]);
 }
 
 export async function expectReadOnlyClean(diagnostics) {
