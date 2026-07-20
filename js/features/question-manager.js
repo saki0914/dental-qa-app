@@ -14,9 +14,9 @@ import {
   textToTagList
 } from "../core/text-utils.js";
 import {
-  QUESTION_DOCUMENT_MAX_BYTES,
   estimateQuestionDocumentBytes,
-  resolveImportImageFile
+  resolveImportImageFile,
+  splitQuestionsIntoChunks
 } from "../core/question-import.js";
 
 export function createQuestionManager(dependencies) {
@@ -168,18 +168,19 @@ function validateBulkImportItems(rawItems) {
     prepared.push(preparedItem);
   });
 
-  const estimatedBytes = estimateQuestionDocumentBytes([
+  const questionsAfterImport = [
     ...shared.allQuestions,
     ...prepared.map(stripPendingImportFields)
-  ]);
-  if (estimatedBytes > QUESTION_DOCUMENT_MAX_BYTES) {
-    issues.push(
-      `保存データの見積もりが${Math.ceil(estimatedBytes / 1000)}KBです。` +
-      `安全上限${Math.ceil(QUESTION_DOCUMENT_MAX_BYTES / 1000)}KBを超えるため分割してください。`
-    );
+  ];
+  const estimatedBytes = estimateQuestionDocumentBytes(questionsAfterImport);
+  let chunkCount = 0;
+  try {
+    chunkCount = splitQuestionsIntoChunks(questionsAfterImport).length;
+  } catch (error) {
+    issues.push(error.message);
   }
 
-  return { issues, warnings, prepared, estimatedBytes, selectedImageCount: imageFiles.length };
+  return { issues, warnings, prepared, estimatedBytes, chunkCount, selectedImageCount: imageFiles.length };
 }
 
 async function runBulkImportValidation() {
@@ -207,7 +208,8 @@ async function runBulkImportValidation() {
       `JSON件数: ${rawItems.length}件`,
       `追加候補: ${result.prepared.length}件`,
       `選択画像: ${result.selectedImageCount}件`,
-      `保存サイズ見積もり: ${Math.ceil(result.estimatedBytes / 1000)}KB`,
+      `登録後の全問題サイズ見積もり: ${Math.ceil(result.estimatedBytes / 1000)}KB`,
+      `クラウド分割保存: ${result.chunkCount}文書`,
       `エラー: ${result.issues.length}件`,
       `警告: ${result.warnings.length}件`
     ];
