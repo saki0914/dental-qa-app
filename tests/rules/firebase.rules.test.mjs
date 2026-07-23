@@ -24,6 +24,9 @@ import {
   updateMetadata,
   uploadBytes
 } from "firebase/storage";
+import {
+  deleteQuestionImageFiles
+} from "../../js/core/question-image-delete.js";
 
 const PROJECT_ID = "demo-dental-qa";
 let testEnv;
@@ -95,4 +98,66 @@ test("Storageは本人のusers/{uid}配下だけを許可する", async () => {
   await assertFails(uploadBytes(ref(guestStorage, ownPath), bytes));
   await assertFails(uploadBytes(ref(aliceStorage, "public/page-1.png"), bytes));
   await assertSucceeds(deleteObject(ref(aliceStorage, ownPath)));
+});
+
+test("問題画像一括削除は本人のquestions配下をStorageから削除する", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71]);
+  const aliceStorage = testEnv.authenticatedContext("alice").storage();
+  const imagePath = "users/alice/questions/q1/image.png";
+  await assertSucceeds(uploadBytes(ref(aliceStorage, imagePath), bytes, { contentType: "image/png" }));
+
+  const [result] = await deleteQuestionImageFiles([
+    { id: "q1", imagePath }
+  ], {
+    userId: "alice",
+    deleteByPath: path => deleteObject(ref(aliceStorage, path))
+  });
+
+  assert.equal(result.status, "deleted");
+  await assert.rejects(
+    getBytes(ref(aliceStorage, imagePath)),
+    error => error?.code === "storage/object-not-found"
+  );
+});
+
+test("問題画像一括削除はStorage拒否を対象ごとの失敗として返す", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71]);
+  const aliceStorage = testEnv.authenticatedContext("alice").storage();
+  const bobStorage = testEnv.authenticatedContext("bob").storage();
+  const imagePath = "users/alice/questions/q1/image.png";
+  await assertSucceeds(uploadBytes(ref(aliceStorage, imagePath), bytes, { contentType: "image/png" }));
+
+  const [result] = await deleteQuestionImageFiles([
+    { id: "q1", imagePath }
+  ], {
+    userId: "alice",
+    deleteByPath: path => deleteObject(ref(bobStorage, path))
+  });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "delete-failed");
+  await assertSucceeds(getBytes(ref(aliceStorage, imagePath)));
+});
+
+test("問題画像一括削除は不正パスをStorageへ送らず保持する", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71]);
+  const aliceStorage = testEnv.authenticatedContext("alice").storage();
+  const imagePath = "users/alice/imageMaterials/material-1/page-1.png";
+  let deleteCalls = 0;
+  await assertSucceeds(uploadBytes(ref(aliceStorage, imagePath), bytes, { contentType: "image/png" }));
+
+  const [result] = await deleteQuestionImageFiles([
+    { id: "q1", imagePath }
+  ], {
+    userId: "alice",
+    deleteByPath: async path => {
+      deleteCalls += 1;
+      await deleteObject(ref(aliceStorage, path));
+    }
+  });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "invalid-path");
+  assert.equal(deleteCalls, 0);
+  await assertSucceeds(getBytes(ref(aliceStorage, imagePath)));
 });

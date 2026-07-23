@@ -18,6 +18,10 @@ import {
   resolveImportImageFile,
   splitQuestionsIntoChunks
 } from "../core/question-import.js";
+import {
+  deleteQuestionImageFiles,
+  restoreFailedQuestionDeletes
+} from "../core/question-image-delete.js";
 
 export function createQuestionManager(dependencies) {
   const {
@@ -49,6 +53,7 @@ export function createQuestionManager(dependencies) {
   let manageSelectedSubcategories = [];
   let isRenderingManageFilter = false;
   let manageDeleteSelectedIds = [];
+  let isDeletingManageQuestions = false;
   let currentEditingImageUrl = "";
   let currentEditingImageName = "";
   let currentEditingImagePath = "";
@@ -552,9 +557,11 @@ function updateManageBulkDeleteButtonState() {
     .filter(id => validIds.has(id))
     .filter(id => id !== selectedQuestionId);
 
-  const disabled = manageDeleteSelectedIds.length === 0;
+  const disabled = isDeletingManageQuestions || manageDeleteSelectedIds.length === 0;
   deleteBtn.disabled = disabled;
-  deleteBtn.textContent = manageDeleteSelectedIds.length
+  deleteBtn.textContent = isDeletingManageQuestions
+    ? "問題を削除しています..."
+    : manageDeleteSelectedIds.length
     ? `選択した問題を削除（${manageDeleteSelectedIds.length}件）`
     : "選択した問題を削除";
 }
@@ -580,7 +587,34 @@ function getVisibleManageQuestions() {
   });
 }
 
-function deleteCheckedManageQuestions() {
+function renderAfterManageQuestionDelete() {
+  cleanupStaleStudyFilters();
+  recalcProgressFromQuestionStates();
+  updateSubjectOptions();
+  renderManageFilterUi();
+  renderManageTable();
+  renderProgressTable();
+  buildFilteredQuestions();
+  renderStudy();
+}
+
+function formatFailedQuestionDeletes(failures) {
+  const lines = failures.slice(0, 10).map((result, index) => {
+    const question = result.question || {};
+    const reason = result.reason === "invalid-path"
+      ? "画像の保存先が不正です"
+      : result.reason === "storage-unavailable"
+        ? "Storageへ接続できません"
+        : "Storage画像を削除できません";
+    return `${index + 1}. ${question.subject || "教科未設定"} / ${question.question || "無題"}（${reason}）`;
+  });
+  if (failures.length > 10) lines.push(`...ほか ${failures.length - 10}件`);
+  return lines.join("\n");
+}
+
+async function deleteCheckedManageQuestions() {
+  if (!getCurrentUser() || isDeletingManageQuestions) return;
+
   const ids = [...new Set(manageDeleteSelectedIds)].filter(id => id !== selectedQuestionId);
 
   if (!ids.length) {
@@ -604,22 +638,88 @@ function deleteCheckedManageQuestions() {
     : "";
 
   const ok = confirm(
-    `${targets.length}件の問題を削除します。\nこの操作は元に戻せません。\n\n削除対象:\n${preview}${extra}`
+    `${targets.length}件の問題を削除します。\n` +
+    "Firestoreの問題データとStorage上の画像ファイルが削除されます。\n\n" +
+    `削除対象:\n${preview}${extra}`
   );
   if (!ok) return;
 
+  const user = getCurrentUser();
+  const previousQuestions = shared.allQuestions;
   const idSet = new Set(ids);
   shared.allQuestions = shared.allQuestions.filter(q => !idSet.has(q.id));
   manageDeleteSelectedIds = [];
+  isDeletingManageQuestions = true;
+  renderAfterManageQuestionDelete();
 
-  cleanupStaleStudyFilters();
-  recalcProgressFromQuestionStates();
-  renderManageFilterUi();
-  renderManageTable();
-  renderProgressTable();
-  buildFilteredQuestions();
-  renderStudy();
-  requestAutoSave();
+  try {
+    const saved = await requestSave({ showAlerts: false });
+    if (!saved) throw new Error("削除後の問題データをクラウド保存できませんでした。");
+  } catch (error) {
+    shared.allQuestions = previousQuestions;
+    manageDeleteSelectedIds = ids;
+    renderAfterManageQuestionDelete();
+    console.error(error);
+    alert("問題の削除に失敗したため、変更を取り消しました。\n\n" + (error.message || error));
+    isDeletingManageQuestions = false;
+    updateManageBulkDeleteButtonState();
+    return;
+  }
+
+  const storage = getStorage();
+  const results = await deleteQuestionImageFiles(targets, {
+    userId: user.uid,
+    deleteByPath: storage
+      ? path => deleteObject(storageRef(storage, path))
+      : null
+  });
+  const failures = results.filter(result => result.status === "failed");
+
+  if (!failures.length) {
+    isDeletingManageQuestions = false;
+    updateManageBulkDeleteButtonState();
+    return;
+  }
+
+  const failedIds = new Set(failures.map(result => result.question.id));
+  shared.allQuestions = restoreFailedQuestionDeletes(
+    shared.allQuestions,
+    previousQuestions,
+    failedIds
+  );
+  manageDeleteSelectedIds = [...failedIds];
+  renderAfterManageQuestionDelete();
+
+  let compensationSaved = false;
+  let compensationError = null;
+  try {
+    compensationSaved = await requestSave({ showAlerts: false });
+  } catch (error) {
+    compensationError = error;
+    console.error(error);
+  }
+
+  const deletedCount = targets.length - failures.length;
+  const details = formatFailedQuestionDeletes(failures);
+  if (compensationSaved) {
+    alert(
+      `${deletedCount}件の問題を削除しました。\n` +
+      `${failures.length}件は画像を削除できなかったため、問題データを復元しました。\n\n` +
+      `復元した問題:\n${details}`
+    );
+  } else {
+    requestAutoSave({ showAlerts: true });
+    alert(
+      `${deletedCount}件の問題を削除しましたが、${failures.length}件はStorage画像を削除できませんでした。\n` +
+      "該当する問題は画面上へ戻しましたが、Firestoreへの復元保存にも失敗しました。\n" +
+      "自動保存を再試行します。クラウド保存の完了表示を確認してください。\n\n" +
+      `復元対象:\n${details}\n\n` +
+      (compensationError?.message || "クラウド保存が完了しませんでした。")
+    );
+  }
+
+  isDeletingManageQuestions = false;
+  updateManageBulkDeleteButtonState();
 }
 
 
