@@ -1,0 +1,26 @@
+{
+  "viewport": {
+    "width": 768,
+    "height": 1024
+  },
+  "checks": [
+    "350問読込",
+    "画像問題21問・画像17件の実表示",
+    "4肢択2逆順・NFKC/大小文字正規化",
+    "4肢択2重複入力拒否",
+    "4肢択1",
+    "orderedAnswers=true順序維持",
+    "単一回答・新explanation",
+    "状況設定問題",
+    "画像表示・同一画像の別観点再利用",
+    "統合後問題 Q0041",
+    "answers修正問題 Q0040",
+    "次へ・戻る"
+  ],
+  "questionCount": 350,
+  "imageQuestionCount": 21,
+  "imageFileCount": 17,
+  "pageErrors": [],
+  "blockedProductionRequests": [],
+  "result": "pass"
+}

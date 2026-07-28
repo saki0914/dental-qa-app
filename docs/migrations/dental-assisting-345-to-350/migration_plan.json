@@ -1,0 +1,78 @@
+{
+  "schemaVersion": "1.0",
+  "migrationId": "20260727-113219-language-quality-final-to-20260727-234539-full-semantic-quality-revision",
+  "subject": "歯科診療補助",
+  "formalizationReport": "/Users/sakin/Library/Mobile Documents/com~apple~CloudDocs/歯科診療補助/教科書/subject/runs/20260728-012040-national-exam-semantic-quality-final/formalization_report.json",
+  "sourceRun": "/Users/sakin/Library/Mobile Documents/com~apple~CloudDocs/歯科診療補助/教科書/subject/runs/20260727-113219-language-quality-final",
+  "targetRun": "/Users/sakin/Library/Mobile Documents/com~apple~CloudDocs/歯科診療補助/教科書/subject/runs/20260728-012040-national-exam-semantic-quality-final",
+  "mappingAuthority": "app_migration_manifest_345_to_350.json",
+  "sourceQuestions": 345,
+  "targetQuestions": 350,
+  "targetChapterCounts": {
+    "1章_歯科診療補助の概要": 17,
+    "2章_医療安全と感染予防": 212,
+    "3章_歯科診療における基礎知識": 50,
+    "4章_歯科診療補助における基礎知識": 71
+  },
+  "targetImageQuestions": 21,
+  "targetImages": 17,
+  "operations": {
+    "updatedOrMerged": 333,
+    "new": 17,
+    "replaced": 4,
+    "mergeGroups": 9,
+    "removedSourceRecords": 16,
+    "imagesToStage": 17
+  },
+  "runtimeIdentity": {
+    "preserveExistingIds": 320,
+    "resetLearningStateIds": 13,
+    "newOrReplacementDeterministicIds": 21,
+    "removedRuntimeIds": 16,
+    "newIdRule": "da-<sha256(migrationId:newQuestionId) first 28 hex>",
+    "fuzzyQuestionMatching": false
+  },
+  "learningStateValues": {
+    "unanswered": null,
+    "known": 1,
+    "weak": 2
+  },
+  "mergeStatePolicy": {
+    "allSourcesKnown": 1,
+    "anySourceWeak": 2,
+    "otherwiseIfUnansweredIncluded": null,
+    "orphanSourceStatesRetained": false
+  },
+  "executionOrder": [
+    "verify source 345 questions and all runtime ids",
+    "verify target formal run, hashes, 350 questions and 17 images",
+    "acquire per-user migration lock",
+    "write private local backup",
+    "stage 17 images at migration-specific deterministic paths",
+    "materialize updated, new, merged and replaced questions",
+    "transform learning states and settings",
+    "verify the complete in-memory 350-question state",
+    "atomically write chunked questions, progress, settings and migration record",
+    "verify final counts, content hash, image references and orphan states",
+    "release migration lock"
+  ],
+  "defaultMode": "dry-run",
+  "productionGuards": {
+    "applyFlag": "--apply",
+    "environment": "--environment production",
+    "requiredMigrationId": "20260727-113219-language-quality-final-to-20260727-234539-full-semantic-quality-revision",
+    "requiredConfirmation": "MIGRATE-DENTAL-ASSISTING-345-TO-350",
+    "productionExecutedInThisTask": false
+  },
+  "rollback": {
+    "backupRoot": "migration-backups/",
+    "visibleInFinder": true,
+    "gitIgnored": true,
+    "restoresQuestions": true,
+    "restoresLearningStates": true,
+    "restoresSettings": true,
+    "removesMigrationImages": true,
+    "expectedQuestionCount": 345
+  },
+  "result": "frozen"
+}

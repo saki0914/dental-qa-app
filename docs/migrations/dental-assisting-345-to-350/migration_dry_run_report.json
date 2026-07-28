@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "1.0",
+  "migrationId": "20260727-113219-language-quality-final-to-20260727-234539-full-semantic-quality-revision",
+  "mode": "dry-run",
+  "writesPerformed": 0,
+  "source": {
+    "questionCount": 345,
+    "hash": "c78e7c5a1b57bdf0c4b68094cf757778b577cd7b6f6e29910d765234df80553f",
+    "learningStates": {
+      "total": 345,
+      "known": 115,
+      "weak": 115,
+      "unanswered": 115
+    }
+  },
+  "target": {
+    "questionCount": 350,
+    "hash": "dbfa54e9e421a6b94a6c22ae3f17a632a932d86387cd8f482dacc5ddd722f050",
+    "chapterCounts": {
+      "1章_歯科診療補助の概要": 17,
+      "2章_医療安全と感染予防": 212,
+      "3章_歯科診療における基礎知識": 50,
+      "4章_歯科診療補助における基礎知識": 71
+    },
+    "imageQuestions": 21,
+    "images": 17
+  },
+  "operations": {
+    "sourceQuestions": 345,
+    "finalQuestions": 350,
+    "updatedOrMerged": 333,
+    "new": 17,
+    "replaced": 4,
+    "mergeGroups": 9,
+    "removedSourceRecords": 16,
+    "imagesToStage": 17
+  },
+  "learningStatePolicy": {
+    "allSourcesKnown": 1,
+    "anySourceWeak": 2,
+    "otherwiseIfUnansweredIncluded": null,
+    "orphanSourceStatesRetained": false
+  },
+  "preservedRuntimeIdCount": 320,
+  "resetRuntimeIdCount": 13,
+  "removedRuntimeIdCount": 16,
+  "productionWrites": 0,
+  "result": "pass",
+  "currentState": "source-verified"
+}

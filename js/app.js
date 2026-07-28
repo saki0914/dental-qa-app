@@ -11,11 +11,15 @@ import {
   escapeDisplayText,
   escapeHtml,
   formatDisplayText,
-  normalizeAnswerList,
   normalizeQuestionAnswers,
-  normalizeSubcategories,
-  normalizeToken
+  normalizeSubcategories
 } from "./core/text-utils.js";
+import {
+  compareAnswerLists,
+  diffAnswerLists,
+  isOrderSensitiveQuestion,
+  normalizeAnswerForComparison
+} from "./core/answer-comparison.js";
 import {
   calculateStudyCounters,
   filterQuestionsForStudy,
@@ -768,18 +772,6 @@ function resetWrongQuestionsQuestions() {
 }
 
 
-function isOrderSensitiveQuestion(q) {
-  const questionText = String(q?.question || "");
-
-  // JSON側で orderedAnswers: true を指定した場合は順番固定にする。
-  // If orderedAnswers: true is set in JSON, answers are checked in order.
-  if (q && q.orderedAnswers === true) return true;
-
-  // 穴埋めや a〜d 指定がある問題は、各欄の順番を固定して判定する。
-  // Fill-in-the-blank questions with a-d labels are checked in order.
-  return /(穴埋め|空欄|空所|[a-dａ-ｄＡ-Ｄ]\s*[〜~～]|[a-dａ-ｄＡ-Ｄ]\s*[）\).．:：])/i.test(questionText);
-}
-
 function getAnswerLabel(index, orderSensitive) {
   if (orderSensitive) {
     const labels = ["a", "b", "c", "d", "e", "f", "g", "h"];
@@ -853,7 +845,6 @@ function judgeIpadAnswer() {
   const inputValues = collectIpadAnswerValues();
   const rawInput = inputValues.join("\n");
   const expectedOriginal = ensureCurrentQuestionAnswers(q);
-  const expected = normalizeAnswerList(expectedOriginal);
   const orderSensitive = isOrderSensitiveQuestion(q);
 
   if (!inputValues.some(value => value.trim())) {
@@ -866,8 +857,8 @@ function judgeIpadAnswer() {
   let statusMessage = "";
 
   if (orderSensitive) {
-    const normalizedExpected = expectedOriginal.map(answer => normalizeToken(answer));
-    const normalizedActual = inputValues.map(answer => normalizeToken(answer));
+    const normalizedExpected = expectedOriginal.map(normalizeAnswerForComparison);
+    const normalizedActual = inputValues.map(normalizeAnswerForComparison);
     const missingLabels = [];
     const wrongLabels = [];
 
@@ -879,7 +870,12 @@ function judgeIpadAnswer() {
 
     const extraAnswers = normalizedActual.slice(normalizedExpected.length).filter(Boolean);
 
-    if (!missingLabels.length && !wrongLabels.length && !extraAnswers.length) {
+    if (
+      compareAnswerLists(expectedOriginal, inputValues, { ordered: true }) &&
+      !missingLabels.length &&
+      !wrongLabels.length &&
+      !extraAnswers.length
+    ) {
       isCorrect = true;
       statusType = "ok";
       statusMessage = "正解です。";
@@ -892,11 +888,9 @@ function judgeIpadAnswer() {
       statusMessage = pieces.join("\n");
     }
   } else {
-    const actual = normalizeAnswerList(inputValues);
-    const missing = expected.filter(x => !actual.includes(x));
-    const extra = actual.filter(x => !expected.includes(x));
+    const { missing, extra } = diffAnswerLists(expectedOriginal, inputValues);
 
-    if (missing.length === 0 && extra.length === 0) {
+    if (compareAnswerLists(expectedOriginal, inputValues)) {
       isCorrect = true;
       statusType = "ok";
       statusMessage = "正解です。";

@@ -12,6 +12,8 @@ blob-report/
 
 *.log
 logs/
+.migration-backups/
+migration-backups/
 
 .DS_Store
 

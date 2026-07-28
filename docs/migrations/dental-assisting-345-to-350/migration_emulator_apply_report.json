@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "1.0",
+  "mode": "apply",
+  "migrationId": "20260727-113219-language-quality-final-to-20260727-234539-full-semantic-quality-revision",
+  "backupId": "20260727165609-c10c805d6c",
+  "alreadyCompleted": false,
+  "writesPerformed": 1,
+  "operations": {
+    "sourceQuestions": 345,
+    "finalQuestions": 350,
+    "updatedOrMerged": 333,
+    "new": 17,
+    "replaced": 4,
+    "mergeGroups": 9,
+    "removedSourceRecords": 16,
+    "imagesToStage": 17
+  },
+  "sourceLearningStates": {
+    "total": 345,
+    "known": 115,
+    "weak": 115,
+    "unanswered": 115
+  },
+  "targetLearningStates": {
+    "total": 350,
+    "known": 104,
+    "weak": 110,
+    "unanswered": 136
+  },
+  "verification": {
+    "valid": true,
+    "errors": [],
+    "targetQuestionCount": 350,
+    "chapterCounts": {
+      "1章_歯科診療補助の概要": 17,
+      "2章_医療安全と感染予防": 212,
+      "3章_歯科診療における基礎知識": 50,
+      "4章_歯科診療補助における基礎知識": 71
+    },
+    "imageQuestionCount": 21,
+    "imageAssetCount": 17,
+    "orphanStatusCount": 0,
+    "migratedContentSha256": "d573bd2ec5299a84370183e0c652e75123a226b164059ac74b20795051fcf2e1"
+  },
+  "result": "pass",
+  "finalQuestionCount": 350,
+  "imageQuestionCount": 21,
+  "imageFileCount": 17,
+  "allTargetExplanationsApplied": true,
+  "oldProblemResidueCount": 0,
+  "productionWrites": 0
+}
