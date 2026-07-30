@@ -3,10 +3,9 @@ import {
   signOut,
   onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-auth.js";
-import {
-  serverTimestamp
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
 import { initializeFirebaseServices } from "./config/firebase.js";
+import { restoreLegacyQuestionStatuses } from "./core/cloud-sync-state.js";
+import { createSaveCoordinator } from "./core/save-coordinator.js";
 import {
   escapeDisplayText,
   escapeHtml,
@@ -33,9 +32,8 @@ import {
 import { createImageMemory } from "./features/image-memory.js";
 import { createQuestionManager } from "./features/question-manager.js";
 import {
-  readLegacyDocument,
-  readSaveGuardDocuments,
-  readSplitDocuments,
+  readCloudState,
+  UnsafeEmptyOverwriteError,
   writeSplitDocuments
 } from "./services/cloud-store.js";
 
@@ -73,6 +71,9 @@ let progress = {};
 let questionStatuses = {};
 let studyMode = "normal";
 let isApplyingCloudState = false;
+let authEpoch = 0;
+let syncPhase = "signed-out";
+let activeSyncSession = null;
 
 const el = {
   cloudStatus: document.getElementById("cloudStatus"),
@@ -187,9 +188,70 @@ const el = {
   nextBtnIpad: document.getElementById("nextBtnIpad")
 };
 
+function isSyncSessionCurrent(session) {
+  return !!session &&
+    session === activeSyncSession &&
+    currentUser?.uid === session.userId &&
+    authEpoch === session.epoch;
+}
+
+function isInteractionReady() {
+  return !!currentUser && !!activeSyncSession?.loaded &&
+    isSyncSessionCurrent(activeSyncSession);
+}
+
+function getSaveFailureMessage(error) {
+  if (error instanceof UnsafeEmptyOverwriteError) {
+    return (
+      "安全のため、空状態によるクラウドデータの上書きを停止しました。\n" +
+      `対象: ${error.areas.join(", ")}\n` +
+      "ページを再読み込みして状態を確認してください。"
+    );
+  }
+  return "クラウド保存に失敗しました。\n" + (error?.message || error || "原因不明のエラー");
+}
+
+async function persistSnapshotToCloud({ session, snapshot, options }) {
+  if (!db || !session?.loaded) return false;
+
+  try {
+    await writeSplitDocuments(db, session.userId, snapshot, options);
+    return true;
+  } catch (error) {
+    const message = getSaveFailureMessage(error);
+    if (isSyncSessionCurrent(session)) {
+      el.cloudStatus.textContent = message;
+      if (options.showAlerts) alert(message);
+    }
+    throw error;
+  }
+}
+
+const saveCoordinator = createSaveCoordinator({
+  persist: persistSnapshotToCloud,
+  debounceMs: 600,
+  onTransition: event => {
+    if (!isSyncSessionCurrent(event.session)) return;
+
+    if (event.type === "waiting") {
+      syncPhase = "ready";
+      el.cloudStatus.textContent = "クラウド保存を待機しています...";
+    } else if (event.type === "saving") {
+      syncPhase = "saving";
+      el.cloudStatus.textContent = "クラウドへ保存中です...";
+    } else if (event.type === "saved") {
+      syncPhase = "ready";
+      el.cloudStatus.textContent = "クラウドに分離保存しました。";
+    } else if (event.type === "error") {
+      syncPhase = "error";
+      el.cloudStatus.textContent = getSaveFailureMessage(event.error);
+    }
+  }
+});
+
 const questionManager = createQuestionManager({
   el,
-  getCurrentUser: () => currentUser,
+  getCurrentUser: () => isInteractionReady() ? currentUser : null,
   getStorage: () => storage,
   getQuestions: () => allQuestions,
   setQuestions: questions => { allQuestions = questions; },
@@ -206,7 +268,7 @@ const questionManager = createQuestionManager({
 
 const imageMemory = createImageMemory({
   el,
-  getCurrentUser: () => currentUser,
+  getCurrentUser: () => isInteractionReady() ? currentUser : null,
   getStorage: () => storage,
   getQuestionSubjects: () => getStudySubjects(allQuestions),
   requestAutoSave: options => autoSaveToCloud(options),
@@ -452,7 +514,7 @@ function resetWrongQuestions() {
   buildFilteredQuestions();
   renderProgressTable();
   renderStudy();
-  autoSaveToCloud();
+  autoSaveToCloud({ allowEmptyProgress: true });
 }
 
 
@@ -758,20 +820,6 @@ function renderStudyCurrentOnly() {
   clearJudgeStatus();
 }
 
-function resetWrongQuestionsQuestions() {
-  allQuestions.forEach(q => {
-    if (getQuestionState(q.id) === 2) {
-      setQuestionState(q.id, null);
-    }
-  });
-  recalcProgressFromQuestionStates();
-  buildFilteredQuestions();
-  renderProgressTable();
-  renderStudy();
-  autoSaveToCloud();
-}
-
-
 function getAnswerLabel(index, orderSensitive) {
   if (orderSensitive) {
     const labels = ["a", "b", "c", "d", "e", "f", "g", "h"];
@@ -1014,7 +1062,7 @@ function renderProgressTable() {
 
 
 function resetProgress() {
-  if (!currentUser) return;
+  if (!isInteractionReady()) return;
   if (!confirm("進捗をリセットしますか？")) return;
   progress = {};
   questionStatuses = {};
@@ -1023,7 +1071,7 @@ function resetProgress() {
   allQuestions.forEach(q => ensureProgressRow(q.subject));
   renderProgressTable();
   renderStudy();
-  autoSaveToCloud();
+  autoSaveToCloud({ allowEmptyProgress: true });
 }
 
 function applyStudyCondition() {
@@ -1041,11 +1089,11 @@ function shuffle(arr) {
 }
 
 function showTab(tabName) {
-  if (!currentUser && tabName !== "auth") {
+  if (!isInteractionReady() && tabName !== "auth") {
     tabName = "auth";
   }
   document.querySelectorAll(".tab").forEach(tab => {
-    const canShow = currentUser || tab.dataset.tab === "auth";
+    const canShow = isInteractionReady() || tab.dataset.tab === "auth";
     tab.classList.toggle("active", canShow && tab.dataset.tab === tabName);
   });
   document.querySelectorAll('[id^="tab-"]').forEach(panel => panel.classList.add("hidden"));
@@ -1084,7 +1132,7 @@ function applyState(state) {
       studyConditionGroups.length > 0;
     orderMode = state.orderMode || "sequential";
     progress = state.progress || {};
-    questionStatuses = state.questionStatuses || {};
+    questionStatuses = restoreLegacyQuestionStatuses(state);
     migrateQuestionStatusesToFlags();
     recalcProgressFromQuestionStates();
     studyMode = state.studyMode || "normal";
@@ -1123,31 +1171,32 @@ function setInteractiveDisabled(ids, disabled) {
 
 function updateLoginLockedUI() {
   const loggedIn = !!currentUser;
+  const canInteract = isInteractionReady();
 
   document.querySelectorAll('.tab').forEach(tab => {
     const isAuth = tab.dataset.tab === "auth";
-    tab.classList.toggle("hidden", !loggedIn && !isAuth);
+    tab.classList.toggle("hidden", !canInteract && !isAuth);
   });
 
-  document.getElementById("tab-study").classList.toggle("hidden", !loggedIn);
-  document.getElementById("tab-manage").classList.toggle("hidden", !loggedIn);
-  document.getElementById("tab-progress").classList.toggle("hidden", !loggedIn);
-  document.getElementById("tab-pdf").classList.toggle("hidden", !loggedIn);
+  document.getElementById("tab-study").classList.toggle("hidden", !canInteract);
+  document.getElementById("tab-manage").classList.toggle("hidden", !canInteract);
+  document.getElementById("tab-progress").classList.toggle("hidden", !canInteract);
+  document.getElementById("tab-pdf").classList.toggle("hidden", !canInteract);
   document.getElementById("tab-auth").classList.toggle("hidden", false);
 
-  el.studyLockBanner.classList.toggle("hidden", loggedIn);
-  el.manageLockBanner.classList.toggle("hidden", loggedIn);
-  el.progressLockBanner.classList.toggle("hidden", loggedIn);
-  el.pdfLockBanner.classList.toggle("hidden", loggedIn);
+  el.studyLockBanner.classList.toggle("hidden", canInteract);
+  el.manageLockBanner.classList.toggle("hidden", canInteract);
+  el.progressLockBanner.classList.toggle("hidden", canInteract);
+  el.pdfLockBanner.classList.toggle("hidden", canInteract);
 
   setInteractiveDisabled([
     "chooseIphone","chooseIpad","subjectFilter","primarySubcategorySelect","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn","addConditionGroupBtn","clearCurrentConditionBtn",
     "userAnswer","judgeBtn","showAnswerBtnIpad","nextBtnIpad","showAnswerBtn","nextBtn",
     "knownBtn","unknownBtn","reviewWrongBtn","reviewUnansweredBtn","resetWrongQuestionsBtn"
-  ], !loggedIn);
+  ], !canInteract);
 
   document.querySelectorAll("#relatedSubcategoryChecklist input")
-    .forEach(input => { input.disabled = !loggedIn; });
+    .forEach(input => { input.disabled = !canInteract; });
 
   setInteractiveDisabled([
     "editSubject","searchInput","editQuestion","editAnswers","editExplanation","editOrderedAnswers","editImageFile","removeImageBtn","editImageName",
@@ -1158,15 +1207,23 @@ function updateLoginLockedUI() {
     "pdfSelectAllDeleteBtn","pdfClearDeleteSelectionBtn","pdfDeleteCheckedBtn",
     "maskPageInput","maskXInput","maskYInput","maskWInput","maskHInput",
     "addMaskModeBtn","updateMaskBtn","deleteMaskBtn","clearMaskSelectionBtn","selectAllMasksBtn","markWeakMaskBtn","showAllMasksBtn","resetPdfRevealBtn"
-  ], !loggedIn);
+  ], !canInteract);
 
-  if (!loggedIn) {
+  if (!canInteract) {
     document.querySelectorAll(".tab").forEach(tab => {
       tab.classList.toggle("active", tab.dataset.tab === "auth");
     });
   }
+
+  if (loggedIn && !canInteract && syncPhase === "loading") {
+    el.authStatus.textContent = `ログイン中: ${currentUser.email || "メール不明"}（クラウド読込中）`;
+  }
 }
 
+function clearLocalState() {
+  applyState({});
+  resetBulkImportState();
+}
 
 async function initFirebase() {
   try {
@@ -1174,32 +1231,62 @@ async function initFirebase() {
     ({ app, auth, db, storage } = initializeFirebaseServices());
     el.cloudStatus.textContent = "Firebase初期化完了です。ログイン状態を確認しています...";
 
-    onAuthStateChanged(auth, async (user) => {
-      if (user) {
-        currentUser = user;
-        el.authStatus.textContent = `ログイン中: ${user.email || "メール不明"}`;
-        el.cloudStatus.textContent = "Firebase接続済みです。クラウド保存データを確認しています...";
-        updateLoginLockedUI();
+    onAuthStateChanged(auth, async user => {
+      const epoch = ++authEpoch;
+      saveCoordinator.setSession(null);
+      activeSyncSession = null;
+      currentUser = user || null;
+      clearLocalState();
 
-        const loaded = await loadFromCloud({ silentNoData: true, autoMode: true });
-        if (loaded) {
-          el.cloudStatus.textContent = "Firebase接続済みです。クラウド内容を自動反映しました。";
-        } else {
-          el.cloudStatus.textContent = "Firebase接続済みです。クラウド保存データがないため、現在の初期データを表示しています。";
-          renderManageTable();
-          renderProgressTable();
-          renderStudy();
-          renderPdfTable();
-          renderPdfMaskTable();
-          renderPdfViewer();
-        }
-        if (document.getElementById("tab-auth").classList.contains("hidden") === false) {
-          showTab("study");
-        }
-      } else {
-        currentUser = null;
+      if (!user) {
+        syncPhase = "signed-out";
         el.authStatus.textContent = "未ログインです。";
-        el.cloudStatus.textContent = "Firebase接続済みです。ログインすると学習・問題管理・進捗・クラウド連携が使えます。";
+        el.cloudStatus.textContent =
+          "Firebase接続済みです。ログインすると学習・問題管理・進捗・クラウド連携が使えます。";
+        updateLoginLockedUI();
+        showTab("auth");
+        return;
+      }
+
+      const session = {
+        epoch,
+        userId: user.uid,
+        loaded: false
+      };
+      activeSyncSession = session;
+      saveCoordinator.setSession(session);
+      syncPhase = "loading";
+      el.authStatus.textContent = `ログイン中: ${user.email || "メール不明"}（クラウド読込中）`;
+      el.cloudStatus.textContent = "Firebase接続済みです。クラウド保存データを確認しています...";
+      updateLoginLockedUI();
+      showTab("auth");
+
+      try {
+        const result = await loadFromCloud({
+          session,
+          silentNoData: true,
+          autoMode: true
+        });
+        if (!isSyncSessionCurrent(session) || result.stale) return;
+
+        session.loaded = true;
+        syncPhase = "ready";
+        el.authStatus.textContent = `ログイン中: ${user.email || "メール不明"}`;
+        el.cloudStatus.textContent = result.loaded
+          ? result.source === "split-with-legacy-fallback"
+            ? "Firebase接続済みです。分割データの欠損箇所を旧形式データで補完して反映しました。"
+            : "Firebase接続済みです。クラウド内容を自動反映しました。"
+          : "Firebase接続済みです。クラウド保存データがないため、空の初期状態を表示しています。";
+        updateLoginLockedUI();
+        showTab("study");
+      } catch (error) {
+        if (!isSyncSessionCurrent(session)) return;
+        console.error(error);
+        syncPhase = "error";
+        session.loaded = false;
+        el.cloudStatus.textContent =
+          "クラウドデータの初期読込に失敗したため、編集をロックしています。\n" +
+          "ページを再読み込みしてください。\n" + (error.message || error);
         updateLoginLockedUI();
       }
     });
@@ -1234,8 +1321,33 @@ async function signInUser() {
 
 async function signOutUser() {
   if (!auth) return;
+  const session = activeSyncSession;
+
+  if (session && saveCoordinator.isDirty(session)) {
+    el.cloudStatus.textContent = "未保存の変更を保存してからログアウトします...";
+    const timeout = new Promise(resolve => {
+      setTimeout(() => resolve("timeout"), 10_000);
+    });
+    const result = await Promise.race([
+      saveCoordinator.flush(session),
+      timeout
+    ]);
+
+    if (result !== true) {
+      const proceed = confirm(
+        result === "timeout"
+          ? "クラウド保存が10秒以内に完了しませんでした。\n未保存の変更が失われる可能性がありますが、ログアウトしますか？"
+          : "クラウド保存に失敗しました。\n未保存の変更が失われる可能性がありますが、ログアウトしますか？"
+      );
+      if (!proceed) {
+        el.cloudStatus.textContent =
+          "未保存の変更を保持するため、ログアウトを中止しました。";
+        return;
+      }
+    }
+  }
+
   await signOut(auth);
-  el.cloudStatus.textContent = "ログアウトしました。";
 }
 
 
@@ -1245,22 +1357,19 @@ function buildSplitStates() {
 
   return {
     questions: {
-      allQuestions,
-      updatedAt: serverTimestamp()
+      allQuestions
     },
     pdfMaterials: {
       pdfMaterials: imageState.pdfMaterials,
       pdfRevealStates: imageState.pdfRevealStates,
       selectedPdfId: imageState.selectedPdfId,
       selectedMaskId: imageState.selectedMaskId,
-      pdfSearchQuery: imageState.pdfSearchQuery,
-      updatedAt: serverTimestamp()
+      pdfSearchQuery: imageState.pdfSearchQuery
     },
     progress: {
       progress,
       questionStatuses,
-      wrongQuestionIds,
-      updatedAt: serverTimestamp()
+      wrongQuestionIds
     },
     settings: {
       filteredQuestionIds: filteredQuestions.map(q => q.id),
@@ -1279,168 +1388,94 @@ function buildSplitStates() {
       pdfCategoryFilter: imageState.pdfCategoryFilter,
       pdfViewMode: imageState.pdfViewMode,
       studyFilterVersion: "condition-groups-v3",
-      schemaVersion: "split-v2",
-      updatedAt: serverTimestamp()
-    },
-    main: {
-      schemaVersion: "split-v2",
-      updatedAt: serverTimestamp()
+      schemaVersion: "split-v2"
     }
   };
 }
 
 
 async function saveToCloud(options = {}) {
-  const {
-    allowEmptyPdfMaterials = false,
-    allowEmptyQuestions = false,
-    showAlerts = true
-  } = options;
-
-  if (!db || !currentUser) {
-    if (showAlerts) alert("先にログインしてください。");
+  const session = activeSyncSession;
+  const showAlerts = options.showAlerts !== false;
+  if (!db || !isInteractionReady() || !session) {
+    if (showAlerts) alert("クラウド読込の完了後に操作してください。");
     return false;
   }
 
-  el.cloudStatus.textContent = "クラウドへ保存中です...";
-
-  const userId = currentUser.uid;
-  const splitState = buildSplitStates();
-
-  const [questionsSnap, pdfSnap] = await readSaveGuardDocuments(db, userId);
-
-  const currentQuestions = questionsSnap.exists() && Array.isArray(questionsSnap.data()?.allQuestions)
-    ? questionsSnap.data().allQuestions
-    : [];
-  const nextQuestions = Array.isArray(splitState.questions.allQuestions)
-    ? splitState.questions.allQuestions
-    : [];
-
-  if (!allowEmptyQuestions && currentQuestions.length > 0 && nextQuestions.length === 0) {
-    const message =
-      "安全のため保存を停止しました。\n\n" +
-      "Firestore側には問題データが残っていますが、画面側の問題データが0件です。\n" +
-      "このまま保存すると問題データが空で上書きされる可能性があります。\n\n" +
-      "ページを再読み込みしてから確認してください。";
-
-    el.cloudStatus.textContent = message;
-
-    if (showAlerts) {
-      alert(message);
-    }
-
-    return false;
-  }
-
-  const currentPdfMaterials = pdfSnap.exists() && Array.isArray(pdfSnap.data()?.pdfMaterials)
-    ? pdfSnap.data().pdfMaterials
-    : [];
-  const nextPdfMaterials = Array.isArray(splitState.pdfMaterials.pdfMaterials)
-    ? splitState.pdfMaterials.pdfMaterials
-    : [];
-
-  if (!allowEmptyPdfMaterials && currentPdfMaterials.length > 0 && nextPdfMaterials.length === 0) {
-    const message =
-      "安全のため画像暗記データの自動保存を停止しました。\n" +
-      "Firestore側には画像暗記データが残っていますが、画面側の画像暗記データが0件です。\n" +
-      "自動保存では空上書きしません。削除する場合は画像教材の削除ボタンから実行してください。";
-
-    el.cloudStatus.textContent = message;
-
-    if (showAlerts) {
-      alert(
-        "安全のため保存を停止しました。\n\n" +
-        "Firestore側には画像暗記データが残っていますが、画面側の画像暗記データが0件です。\n" +
-        "このまま保存すると画像暗記データが空で上書きされる可能性があります。\n\n" +
-        "ページを再読み込みしてから確認してください。"
-      );
-    }
-
-    return false;
-  }
-
-  await writeSplitDocuments(db, userId, splitState);
-
-  el.cloudStatus.textContent = "クラウドに分離保存しました。";
-  return true;
+  return saveCoordinator.request({
+    session,
+    snapshot: buildSplitStates(),
+    options: {
+      allowEmptyPdfMaterials: options.allowEmptyPdfMaterials === true,
+      allowEmptyQuestions: options.allowEmptyQuestions === true,
+      allowEmptyProgress: options.allowEmptyProgress === true,
+      allowEmptySettings: options.allowEmptySettings === true,
+      showAlerts
+    },
+    immediate: true
+  });
 }
 
 async function loadFromCloud(options = {}) {
-  const { silentNoData = false, autoMode = false } = options;
-  if (!db || !currentUser) {
+  const {
+    session = activeSyncSession,
+    silentNoData = false,
+    autoMode = false
+  } = options;
+  if (!db || !session) {
     if (!silentNoData) alert("先にログインしてください。");
-    return false;
+    return { loaded: false, source: "none", stale: false };
   }
 
-  const userId = currentUser.uid;
-  const [questionsSnap, pdfSnap, progressSnap, settingsSnap] = await readSplitDocuments(db, userId);
-
-  const hasSplitData =
-    questionsSnap.exists() ||
-    pdfSnap.exists() ||
-    progressSnap.exists() ||
-    settingsSnap.exists();
-
-  if (hasSplitData) {
-    const mergedState = {
-      ...(questionsSnap.exists() ? questionsSnap.data() : {}),
-      ...(pdfSnap.exists() ? pdfSnap.data() : {}),
-      ...(progressSnap.exists() ? progressSnap.data() : {}),
-      ...(settingsSnap.exists() ? settingsSnap.data() : {})
+  const result = await readCloudState(db, session.userId);
+  if (!isSyncSessionCurrent(session)) {
+    return {
+      loaded: false,
+      source: result.source,
+      stale: true
     };
-
-    applyState(mergedState);
-
-    if (!autoMode) {
-      el.cloudStatus.textContent = "クラウドから分離保存データを再開しました。";
-    }
-    return true;
   }
 
-  // 旧形式 app/main からの互換読み込み。
-  // Compatible loading from the old app/main format.
-  const legacySnap = await readLegacyDocument(db, userId);
-  if (!legacySnap.exists()) {
+  if (!result.hasData) {
+    applyState({});
     if (!silentNoData) alert("クラウド保存データがまだありません。");
-    return false;
+    return {
+      loaded: false,
+      source: result.source,
+      stale: false
+    };
   }
 
-  const legacyData = legacySnap.data();
-  const hasLegacyContent =
-    Array.isArray(legacyData.allQuestions) ||
-    Array.isArray(legacyData.pdfMaterials);
-
-  if (!hasLegacyContent) {
-    if (!silentNoData) alert("クラウド保存データがまだありません。");
-    return false;
-  }
-
-  applyState(legacyData);
+  applyState(result.state);
 
   if (!autoMode) {
-    el.cloudStatus.textContent = "旧形式のクラウドデータから再開しました。次回保存から分離保存されます。";
+    el.cloudStatus.textContent = result.source === "legacy"
+      ? "旧形式のクラウドデータから再開しました。次回保存から分離保存されます。"
+      : "クラウドから分離保存データを再開しました。";
   }
-  return true;
+  return {
+    loaded: true,
+    source: result.source,
+    stale: false
+  };
 }
 
-let autoSaveTimer = null;
 function autoSaveToCloud(options = {}) {
-  if (!db || !currentUser || isApplyingCloudState) return;
+  const session = activeSyncSession;
+  if (!db || !isInteractionReady() || !session || isApplyingCloudState) return;
 
-  const {
-    allowEmptyPdfMaterials = false,
-    allowEmptyQuestions = false,
-    showAlerts = false
-  } = options;
-
-  el.cloudStatus.textContent = "クラウド保存を待機しています...";
-  clearTimeout(autoSaveTimer);
-  autoSaveTimer = setTimeout(() => {
-    saveToCloud({ allowEmptyPdfMaterials, allowEmptyQuestions, showAlerts }).catch(err => {
-      console.error(err);
-      el.cloudStatus.textContent = "クラウド自動保存を停止しました。詳細は画面メッセージまたはコンソールを確認してください。";
-    });
-  }, 600);
+  void saveCoordinator.request({
+    session,
+    snapshot: buildSplitStates(),
+    options: {
+      allowEmptyPdfMaterials: options.allowEmptyPdfMaterials === true,
+      allowEmptyQuestions: options.allowEmptyQuestions === true,
+      allowEmptyProgress: options.allowEmptyProgress === true,
+      allowEmptySettings: options.allowEmptySettings === true,
+      showAlerts: options.showAlerts === true
+    },
+    immediate: false
+  });
 }
 
 document.querySelectorAll(".tab").forEach(tab => {
@@ -1449,6 +1484,25 @@ document.querySelectorAll(".tab").forEach(tab => {
 
 window.addEventListener("scroll", updateFloatingStudyActions, { passive: true });
 window.addEventListener("resize", updateFloatingStudyActions);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "hidden") return;
+  const session = activeSyncSession;
+  if (session && saveCoordinator.isDirty(session)) {
+    void saveCoordinator.flush(session);
+  }
+});
+window.addEventListener("pagehide", () => {
+  const session = activeSyncSession;
+  if (session && saveCoordinator.isDirty(session)) {
+    void saveCoordinator.flush(session);
+  }
+});
+window.addEventListener("beforeunload", event => {
+  const session = activeSyncSession;
+  if (!session || !saveCoordinator.isDirty(session)) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 
 document.getElementById("chooseIphone").addEventListener("click", () => {
   deviceMode = "iphone";

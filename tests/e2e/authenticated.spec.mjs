@@ -375,15 +375,49 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
     clientX: box.x + box.width * 0.6,
     clientY: box.y + box.height * 0.5
   });
-  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).toHaveCount(1);
+  for (const [startX, startY, endX, endY] of [
+    [0.1, 0.6, 0.35, 0.75],
+    [0.55, 0.6, 0.85, 0.8]
+  ]) {
+    await pageWrap.dispatchEvent("pointerdown", {
+      ...pointer,
+      clientX: box.x + box.width * startX,
+      clientY: box.y + box.height * startY
+    });
+    await pageWrap.dispatchEvent("pointermove", {
+      ...pointer,
+      clientX: box.x + box.width * endX,
+      clientY: box.y + box.height * endY
+    });
+    await pageWrap.dispatchEvent("pointerup", {
+      ...pointer,
+      clientX: box.x + box.width * endX,
+      clientY: box.y + box.height * endY
+    });
+  }
+  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).toHaveCount(3);
   await page.locator("#addMaskModeBtn").click();
+  await page.locator("#pdfFullscreenBtn").click();
+  await expect(page.locator("#pdfViewerShell")).not.toHaveClass(/is-fullscreen/);
+  await page.locator("#maskXInput").fill("58");
+  await page.locator("#maskYInput").fill("62");
+  await page.locator("#maskWInput").fill("24");
+  await page.locator("#maskHInput").fill("16");
+  await page.locator("#updateMaskBtn").click();
+  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]").last()).toContainText("58%");
+  await page.locator("#pdfMaskTableBody tr[data-mask-id]").first().click();
+  page.once("dialog", dialog => dialog.accept());
+  await page.locator("#deleteMaskBtn").click();
+  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).toHaveCount(2);
+  await page.locator("#pdfFullscreenBtn").click();
+  await expect(page.locator("#pdfViewerShell")).toHaveClass(/is-fullscreen/);
   await page.locator("#clearMaskSelectionBtn").click();
-  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).not.toHaveClass(/selected/);
+  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]").first()).not.toHaveClass(/selected/);
   await page.locator("#selectAllMasksBtn").click();
-  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).toHaveClass(/selected/);
+  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]").first()).toHaveClass(/selected/);
   await page.locator("#markWeakMaskBtn").click();
   await expect(page.locator("#pdfMaskTableBody")).toContainText("苦手");
-  await expect(page.locator(".pdf-mask")).toHaveClass(/is-weak/);
+  await expect(page.locator(".pdf-mask").first()).toHaveClass(/is-weak/);
   await captureVisualPair(page, "image-memory-viewer-fullscreen");
   await page.locator("#pdfFullscreenBtn").click();
   await expect(page.locator("#pdfViewerShell")).not.toHaveClass(/is-fullscreen/);
@@ -448,9 +482,11 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
   await expect(page.locator("#pdfSubjectFilterSelect")).toHaveValue("E2E歯科学");
   await expect(page.locator("#pdfCategoryFilterSelect")).toHaveValue("E2E");
   await expect(page.locator("#pdfTableBody")).toContainText("E2E画像教材更新");
-  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).toHaveCount(1);
+  await expect(page.locator("#pdfMaskTableBody tr[data-mask-id]")).toHaveCount(2);
+  await expect(page.locator("#pdfMaskTableBody")).toContainText("58%");
+  await expect(page.locator("#pdfMaskTableBody")).toContainText("24%");
   await expect(page.locator("#pdfMaskTableBody")).toContainText("苦手");
-  await expect(page.locator(".pdf-mask")).toHaveClass(/is-weak/);
+  await expect(page.locator(".pdf-mask").first()).toHaveClass(/is-weak/);
   await expect(page.locator("#pdfViewerArea img")).toBeVisible({ timeout: 20_000 });
 
   await page.locator("#pdfEditModeBtn").click();
