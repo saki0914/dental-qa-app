@@ -126,10 +126,14 @@ async function readState(userId) {
     const snapshot = await getDoc(appRef(db, userId, name));
     chunks.push(snapshot.data());
   }
-  const progressSnapshot = await getDoc(appRef(db, userId, "progress"));
+  const [progressSnapshot, syncSnapshot] = await Promise.all([
+    getDoc(appRef(db, userId, "progress")),
+    getDoc(appRef(db, userId, "sync"))
+  ]);
   return {
     allQuestions: restoreQuestionsFromChunks(manifest, chunks),
-    progress: progressSnapshot.data()
+    progress: progressSnapshot.data(),
+    revision: syncSnapshot.data()?.revision
   };
 }
 
@@ -203,6 +207,7 @@ test("Emulatorで345→350、複数ユーザー状態、冪等性、ロールバ
         .map(question => question.imageName)).size,
       17
     );
+    assert.equal(migrated.revision, 1);
     const rerun = runCli(userId, "--apply");
     assert.equal(rerun.alreadyCompleted, true);
     assert.equal(rerun.writesPerformed, 0);
@@ -218,6 +223,7 @@ test("Emulatorで345→350、複数ユーザー状態、冪等性、ロールバ
       restored.progress.questionStatuses,
       sourceSnapshots[userId].questionStatuses
     );
+    assert.equal(restored.revision, 2);
     const secondRollback = runCli(userId, "--rollback", applied.backupId);
     assert.equal(secondRollback.alreadyRolledBack, true);
     assert.equal(secondRollback.writesPerformed, 0);
@@ -259,4 +265,5 @@ test("Emulatorで画像準備後の失敗から同じmigrationIdで再開でき�
     migrated.allQuestions.filter(question => question.subject === "歯科診療補助").length,
     350
   );
+  assert.equal(migrated.revision, 1);
 });

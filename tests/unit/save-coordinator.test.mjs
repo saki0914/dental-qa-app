@@ -138,22 +138,38 @@ test("セッション切替後は旧セッションの完了を成功扱いせ�
   assert.deepEqual(started, ["user-a", "user-b"]);
 });
 
-test("保存失敗後はdirtyを維持しflushも失敗を返す", async () => {
+test("競合失敗後はdirtyを維持するがflushで自動リトライしない", async () => {
   const session = { userId: "user-a" };
+  const gate = deferred();
+  let persistCount = 0;
   const coordinator = createSaveCoordinator({
     persist: async () => {
-      throw new Error("forced failure");
+      persistCount += 1;
+      await gate.promise;
+      const error = new Error("forced conflict");
+      error.name = "CloudSaveConflictError";
+      error.stopQueuedSaves = true;
+      throw error;
     }
   });
   coordinator.setSession(session);
 
-  const saved = await coordinator.request({
+  const firstSave = coordinator.request({
     session,
     snapshot: { value: "unsaved" },
     immediate: true
   });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const queuedSave = coordinator.request({
+    session,
+    snapshot: { value: "newer but still conflicted" },
+    immediate: true
+  });
+  gate.resolve();
 
-  assert.equal(saved, false);
+  assert.equal(await firstSave, false);
+  assert.equal(await queuedSave, false);
   assert.equal(coordinator.isDirty(session), true);
   assert.equal(await coordinator.flush(session), false);
+  assert.equal(persistCount, 1);
 });

@@ -35,6 +35,10 @@ function getQuestionCount(value) {
     : 0;
 }
 
+export function normalizeCloudRevision(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 export function cloneCloudState(value) {
   if (typeof structuredClone === "function") return structuredClone(value);
   return JSON.parse(JSON.stringify(value));

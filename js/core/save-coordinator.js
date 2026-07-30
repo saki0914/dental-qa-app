@@ -107,6 +107,11 @@ export function createSaveCoordinator({
         generation: item.generation,
         error: failure
       });
+      if (failure?.stopQueuedSaves === true && pending) {
+        settleWaiters(pending, false);
+        pending = null;
+        return false;
+      }
       if (pending) return drain();
       return false;
     }

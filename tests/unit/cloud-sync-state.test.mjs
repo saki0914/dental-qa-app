@@ -3,8 +3,17 @@ import assert from "node:assert/strict";
 import {
   findUnsafeEmptyOverwriteAreas,
   mergeCloudState,
+  normalizeCloudRevision,
   restoreLegacyQuestionStatuses
 } from "../../js/core/cloud-sync-state.js";
+
+test("sync文書の欠損・不正revisionは後方互換の0として扱う", () => {
+  assert.equal(normalizeCloudRevision(undefined), 0);
+  assert.equal(normalizeCloudRevision(-1), 0);
+  assert.equal(normalizeCloudRevision(1.5), 0);
+  assert.equal(normalizeCloudRevision(Number.MAX_SAFE_INTEGER + 1), 0);
+  assert.equal(normalizeCloudRevision(7), 7);
+});
 
 test("部分的な分割文書は欠損領域だけ旧mainから補完する", () => {
   const result = mergeCloudState({

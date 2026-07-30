@@ -10,7 +10,8 @@ import {
 } from "../core/question-import.js";
 import {
   findUnsafeEmptyOverwriteAreas,
-  mergeCloudState
+  mergeCloudState,
+  normalizeCloudRevision
 } from "../core/cloud-sync-state.js";
 
 const QUESTION_CHUNK_WARNING_THRESHOLD = 50;
@@ -20,6 +21,19 @@ export class UnsafeEmptyOverwriteError extends Error {
     super(`空状態による上書きを停止しました: ${areas.join(", ")}`);
     this.name = "UnsafeEmptyOverwriteError";
     this.areas = areas;
+  }
+}
+
+export class CloudSaveConflictError extends Error {
+  constructor(expectedRevision, actualRevision) {
+    super(
+      "他の端末で先にクラウドデータが更新されました。" +
+      "ページを再読み込みして最新の状態を確認してください。"
+    );
+    this.name = "CloudSaveConflictError";
+    this.expectedRevision = expectedRevision;
+    this.actualRevision = actualRevision;
+    this.stopQueuedSaves = true;
   }
 }
 
@@ -67,7 +81,8 @@ export function getSplitDocRefs(db, userId) {
     questions: doc(db, "users", userId, "app", "questions"),
     pdfMaterials: doc(db, "users", userId, "app", "pdfMaterials"),
     progress: doc(db, "users", userId, "app", "progress"),
-    settings: doc(db, "users", userId, "app", "settings")
+    settings: doc(db, "users", userId, "app", "settings"),
+    sync: doc(db, "users", userId, "app", "sync")
   };
 }
 
@@ -79,13 +94,15 @@ export async function readCloudState(db, userId) {
       questionManifestSnapshot,
       pdfSnapshot,
       progressSnapshot,
-      settingsSnapshot
+      settingsSnapshot,
+      syncSnapshot
     ] = await Promise.all([
       transaction.get(refs.main),
       transaction.get(refs.questions),
       transaction.get(refs.pdfMaterials),
       transaction.get(refs.progress),
-      transaction.get(refs.settings)
+      transaction.get(refs.settings),
+      transaction.get(refs.sync)
     ]);
 
     const main = getSnapshotData(mainSnapshot);
@@ -104,7 +121,10 @@ export async function readCloudState(db, userId) {
       settings: getSnapshotData(settingsSnapshot)
     });
 
-    return merged;
+    return {
+      ...merged,
+      revision: normalizeCloudRevision(getSnapshotData(syncSnapshot)?.revision)
+    };
   });
 }
 
@@ -113,7 +133,8 @@ export async function writeSplitDocuments(db, userId, splitState, options = {}) 
     allowEmptyQuestions = false,
     allowEmptyPdfMaterials = false,
     allowEmptyProgress = false,
-    allowEmptySettings = false
+    allowEmptySettings = false,
+    expectedRevision = 0
   } = options;
   const questions = Array.isArray(splitState.questions?.allQuestions)
     ? splitState.questions.allQuestions
@@ -135,13 +156,15 @@ export async function writeSplitDocuments(db, userId, splitState, options = {}) 
       questionManifestSnapshot,
       pdfSnapshot,
       progressSnapshot,
-      settingsSnapshot
+      settingsSnapshot,
+      syncSnapshot
     ] = await Promise.all([
       transaction.get(refs.main),
       transaction.get(refs.questions),
       transaction.get(refs.pdfMaterials),
       transaction.get(refs.progress),
-      transaction.get(refs.settings)
+      transaction.get(refs.settings),
+      transaction.get(refs.sync)
     ]);
 
     const mainDocument = getSnapshotData(mainSnapshot);
@@ -149,6 +172,11 @@ export async function writeSplitDocuments(db, userId, splitState, options = {}) 
     const pdfDocument = getSnapshotData(pdfSnapshot);
     const progressDocument = getSnapshotData(progressSnapshot);
     const settingsDocument = getSnapshotData(settingsSnapshot);
+    const actualRevision = normalizeCloudRevision(getSnapshotData(syncSnapshot)?.revision);
+    const normalizedExpectedRevision = normalizeCloudRevision(expectedRevision);
+    if (actualRevision !== normalizedExpectedRevision) {
+      throw new CloudSaveConflictError(normalizedExpectedRevision, actualRevision);
+    }
     const unsafeAreas = findUnsafeEmptyOverwriteAreas({
       questions: questionDocument || mainDocument,
       pdfMaterials: pdfDocument || mainDocument,
@@ -193,6 +221,11 @@ export async function writeSplitDocuments(db, userId, splitState, options = {}) 
       ...(splitState.settings || {}),
       ...metadata
     });
-    return true;
+    const nextRevision = actualRevision + 1;
+    transaction.set(refs.sync, {
+      revision: nextRevision,
+      ...metadata
+    });
+    return nextRevision;
   });
 }

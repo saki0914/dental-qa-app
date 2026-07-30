@@ -14,8 +14,7 @@ import {
   getDoc,
   runTransaction,
   serverTimestamp,
-  setDoc,
-  writeBatch
+  setDoc
 } from "firebase/firestore";
 import {
   deleteObject,
@@ -30,6 +29,7 @@ import {
   createQuestionChunkStorage,
   restoreQuestionsFromChunks
 } from "../js/core/question-import.js";
+import { normalizeCloudRevision } from "../js/core/cloud-sync-state.js";
 import {
   buildDryRunReport,
   buildMigrationPlan,
@@ -188,12 +188,13 @@ function questionChunkName(index) {
 
 async function readCurrentState(db, userId) {
   const questionsRef = appDocumentRef(db, userId, "questions");
-  const [questionsSnapshot, progressSnapshot, settingsSnapshot, pdfSnapshot] =
+  const [questionsSnapshot, progressSnapshot, settingsSnapshot, pdfSnapshot, syncSnapshot] =
     await Promise.all([
       getDoc(questionsRef),
       getDoc(appDocumentRef(db, userId, "progress")),
       getDoc(appDocumentRef(db, userId, "settings")),
-      getDoc(appDocumentRef(db, userId, "pdfMaterials"))
+      getDoc(appDocumentRef(db, userId, "pdfMaterials")),
+      getDoc(appDocumentRef(db, userId, "sync"))
     ]);
   if (!questionsSnapshot.exists()) throw new Error("questions文書がありません。");
   const questionsDocument = questionsSnapshot.data() || {};
@@ -225,7 +226,10 @@ async function readCurrentState(db, userId) {
     chunkDocuments,
     progressDocument: progressSnapshot.exists() ? progressSnapshot.data() : {},
     settingsDocument: settingsSnapshot.exists() ? settingsSnapshot.data() : {},
-    pdfMaterialsDocument: pdfSnapshot.exists() ? pdfSnapshot.data() : {}
+    pdfMaterialsDocument: pdfSnapshot.exists() ? pdfSnapshot.data() : {},
+    syncRevision: normalizeCloudRevision(
+      syncSnapshot.exists() ? syncSnapshot.data()?.revision : undefined
+    )
   };
 }
 
@@ -456,30 +460,46 @@ async function commitMigratedState(
     QUESTION_CHUNK_STORAGE_MODE && Number.isInteger(currentState.questionsDocument.chunkCount)
     ? currentState.questionsDocument.chunkCount
     : 0;
-  const batch = writeBatch(db);
-  batch.set(appDocumentRef(db, userId, "questions"), storage.manifest);
-  storage.chunks.forEach((chunk, index) => {
-    batch.set(appDocumentRef(db, userId, questionChunkName(index)), chunk);
+  const syncRef = appDocumentRef(db, userId, "sync");
+  await runTransaction(db, async transaction => {
+    const syncSnapshot = await transaction.get(syncRef);
+    const actualRevision = normalizeCloudRevision(
+      syncSnapshot.exists() ? syncSnapshot.data()?.revision : undefined
+    );
+    if (actualRevision !== currentState.syncRevision) {
+      throw new Error(
+        "移行準備中にクラウドデータが更新されたため、移行を中止しました。" +
+        "最新データで再実行してください。"
+      );
+    }
+
+    transaction.set(appDocumentRef(db, userId, "questions"), storage.manifest);
+    storage.chunks.forEach((chunk, index) => {
+      transaction.set(appDocumentRef(db, userId, questionChunkName(index)), chunk);
+    });
+    for (let index = storage.chunks.length; index < previousChunkCount; index += 1) {
+      transaction.delete(appDocumentRef(db, userId, questionChunkName(index)));
+    }
+    transaction.set(appDocumentRef(db, userId, "progress"), {
+      ...migratedState.progressDocument,
+      updatedAt: serverTimestamp()
+    });
+    transaction.set(appDocumentRef(db, userId, "settings"), {
+      ...migratedState.settingsDocument,
+      updatedAt: serverTimestamp()
+    });
+    transaction.set(syncRef, {
+      revision: actualRevision + 1,
+      updatedAt: serverTimestamp()
+    });
+    transaction.set(migrationStateRef, {
+      ...migrationRecord,
+      status: "completed",
+      phase: "completed",
+      completedAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    }, { merge: true });
   });
-  for (let index = storage.chunks.length; index < previousChunkCount; index += 1) {
-    batch.delete(appDocumentRef(db, userId, questionChunkName(index)));
-  }
-  batch.set(appDocumentRef(db, userId, "progress"), {
-    ...migratedState.progressDocument,
-    updatedAt: serverTimestamp()
-  });
-  batch.set(appDocumentRef(db, userId, "settings"), {
-    ...migratedState.settingsDocument,
-    updatedAt: serverTimestamp()
-  });
-  batch.set(migrationStateRef, {
-    ...migrationRecord,
-    status: "completed",
-    phase: "completed",
-    completedAt: serverTimestamp(),
-    updatedAt: serverTimestamp()
-  }, { merge: true });
-  await batch.commit();
 }
 
 async function verifyExistingFinalState(db, userId, bundle, migrationState) {
@@ -690,25 +710,43 @@ async function restoreDocuments(db, userId, currentState, backup, migrationState
     QUESTION_CHUNK_STORAGE_MODE && Number.isInteger(currentState.questionsDocument.chunkCount)
     ? currentState.questionsDocument.chunkCount
     : 0;
-  const batch = writeBatch(db);
-  batch.set(appDocumentRef(db, userId, "questions"), documents.questions);
-  oldChunks.forEach(row => {
-    batch.set(appDocumentRef(db, userId, row.name), row.data);
+  const syncRef = appDocumentRef(db, userId, "sync");
+  await runTransaction(db, async transaction => {
+    const syncSnapshot = await transaction.get(syncRef);
+    const actualRevision = normalizeCloudRevision(
+      syncSnapshot.exists() ? syncSnapshot.data()?.revision : undefined
+    );
+    if (actualRevision !== currentState.syncRevision) {
+      throw new Error(
+        "ロールバック準備中にクラウドデータが更新されたため、復元を中止しました。" +
+        "最新データを確認して再実行してください。"
+      );
+    }
+
+    transaction.set(appDocumentRef(db, userId, "questions"), documents.questions);
+    oldChunks.forEach(row => {
+      transaction.set(appDocumentRef(db, userId, row.name), row.data);
+    });
+    for (let index = 0; index < currentChunkCount; index += 1) {
+      const name = questionChunkName(index);
+      if (!oldChunkNames.has(name)) {
+        transaction.delete(appDocumentRef(db, userId, name));
+      }
+    }
+    transaction.set(appDocumentRef(db, userId, "progress"), documents.progress);
+    transaction.set(appDocumentRef(db, userId, "settings"), documents.settings);
+    transaction.set(appDocumentRef(db, userId, "pdfMaterials"), documents.pdfMaterials);
+    transaction.set(syncRef, {
+      revision: actualRevision + 1,
+      updatedAt: serverTimestamp()
+    });
+    transaction.set(migrationStateRef, {
+      status: "rollback-data-restored",
+      phase: "rollback-data-restored",
+      rollbackDataRestoredAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    }, { merge: true });
   });
-  for (let index = 0; index < currentChunkCount; index += 1) {
-    const name = questionChunkName(index);
-    if (!oldChunkNames.has(name)) batch.delete(appDocumentRef(db, userId, name));
-  }
-  batch.set(appDocumentRef(db, userId, "progress"), documents.progress);
-  batch.set(appDocumentRef(db, userId, "settings"), documents.settings);
-  batch.set(appDocumentRef(db, userId, "pdfMaterials"), documents.pdfMaterials);
-  batch.set(migrationStateRef, {
-    status: "rollback-data-restored",
-    phase: "rollback-data-restored",
-    rollbackDataRestoredAt: serverTimestamp(),
-    updatedAt: serverTimestamp()
-  }, { merge: true });
-  await batch.commit();
 }
 
 async function runRollback(context, options, bundle) {

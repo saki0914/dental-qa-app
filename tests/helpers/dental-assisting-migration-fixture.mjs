@@ -154,10 +154,14 @@ export async function readEmulatorState(testEnvironment, userId) {
     const snapshot = await getDoc(appRef(db, userId, name));
     chunks.push(snapshot.data());
   }
-  const progressSnapshot = await getDoc(appRef(db, userId, "progress"));
+  const [progressSnapshot, syncSnapshot] = await Promise.all([
+    getDoc(appRef(db, userId, "progress")),
+    getDoc(appRef(db, userId, "sync"))
+  ]);
   return {
     allQuestions: restoreQuestionsFromChunks(manifest, chunks),
-    progress: progressSnapshot.data()
+    progress: progressSnapshot.data(),
+    revision: syncSnapshot.data()?.revision
   };
 }
 

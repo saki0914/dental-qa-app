@@ -32,6 +32,7 @@ import {
 import { createImageMemory } from "./features/image-memory.js";
 import { createQuestionManager } from "./features/question-manager.js";
 import {
+  CloudSaveConflictError,
   readCloudState,
   UnsafeEmptyOverwriteError,
   writeSplitDocuments
@@ -197,10 +198,17 @@ function isSyncSessionCurrent(session) {
 
 function isInteractionReady() {
   return !!currentUser && !!activeSyncSession?.loaded &&
+    activeSyncSession.conflicted !== true &&
     isSyncSessionCurrent(activeSyncSession);
 }
 
 function getSaveFailureMessage(error) {
+  if (error instanceof CloudSaveConflictError) {
+    return (
+      "他の端末で先にクラウドデータが更新されたため、この端末からの保存を停止しました。\n" +
+      "ページを再読み込みして最新の状態を確認してください。"
+    );
+  }
   if (error instanceof UnsafeEmptyOverwriteError) {
     return (
       "安全のため、空状態によるクラウドデータの上書きを停止しました。\n" +
@@ -212,14 +220,23 @@ function getSaveFailureMessage(error) {
 }
 
 async function persistSnapshotToCloud({ session, snapshot, options }) {
-  if (!db || !session?.loaded) return false;
+  if (!db || !session?.loaded || session.conflicted) return false;
 
   try {
-    await writeSplitDocuments(db, session.userId, snapshot, options);
+    const nextRevision = await writeSplitDocuments(db, session.userId, snapshot, {
+      ...options,
+      expectedRevision: session.revision
+    });
+    session.revision = nextRevision;
     return true;
   } catch (error) {
     const message = getSaveFailureMessage(error);
     if (isSyncSessionCurrent(session)) {
+      if (error instanceof CloudSaveConflictError) {
+        session.conflicted = true;
+        syncPhase = "conflict";
+        updateLoginLockedUI();
+      }
       el.cloudStatus.textContent = message;
       if (options.showAlerts) alert(message);
     }
@@ -243,8 +260,12 @@ const saveCoordinator = createSaveCoordinator({
       syncPhase = "ready";
       el.cloudStatus.textContent = "クラウドに分離保存しました。";
     } else if (event.type === "error") {
-      syncPhase = "error";
+      syncPhase = event.error instanceof CloudSaveConflictError ? "conflict" : "error";
       el.cloudStatus.textContent = getSaveFailureMessage(event.error);
+      if (event.error instanceof CloudSaveConflictError) {
+        event.session.conflicted = true;
+        updateLoginLockedUI();
+      }
     }
   }
 });
@@ -1172,6 +1193,25 @@ function setInteractiveDisabled(ids, disabled) {
 function updateLoginLockedUI() {
   const loggedIn = !!currentUser;
   const canInteract = isInteractionReady();
+  const hasConflict = loggedIn && activeSyncSession?.conflicted === true;
+  const lockMessages = hasConflict
+    ? {
+        study: "他の端末で更新されました。再読み込みするまで学習操作を停止しています。",
+        manage: "他の端末で更新されました。再読み込みするまで問題管理を停止しています。",
+        progress: "他の端末で更新されました。再読み込みするまで進捗操作を停止しています。",
+        pdf: "他の端末で更新されました。再読み込みするまで画像暗記を停止しています。"
+      }
+    : {
+        study: loggedIn ? "クラウド読込の完了後に学習が使えます。" : "ログインすると学習が使えます。",
+        manage: loggedIn ? "クラウド読込の完了後に問題管理が使えます。" : "ログインすると問題管理が使えます。",
+        progress: loggedIn ? "クラウド読込の完了後に進捗が使えます。" : "ログインすると進捗が使えます。",
+        pdf: loggedIn ? "クラウド読込の完了後に画像暗記が使えます。" : "ログインすると画像暗記が使えます。"
+      };
+
+  el.studyLockBanner.textContent = lockMessages.study;
+  el.manageLockBanner.textContent = lockMessages.manage;
+  el.progressLockBanner.textContent = lockMessages.progress;
+  el.pdfLockBanner.textContent = lockMessages.pdf;
 
   document.querySelectorAll('.tab').forEach(tab => {
     const isAuth = tab.dataset.tab === "auth";
@@ -1217,6 +1257,9 @@ function updateLoginLockedUI() {
 
   if (loggedIn && !canInteract && syncPhase === "loading") {
     el.authStatus.textContent = `ログイン中: ${currentUser.email || "メール不明"}（クラウド読込中）`;
+  } else if (hasConflict) {
+    el.authStatus.textContent =
+      `ログイン中: ${currentUser.email || "メール不明"}（他端末との保存競合により操作停止中）`;
   }
 }
 
@@ -1251,7 +1294,9 @@ async function initFirebase() {
       const session = {
         epoch,
         userId: user.uid,
-        loaded: false
+        loaded: false,
+        conflicted: false,
+        revision: 0
       };
       activeSyncSession = session;
       saveCoordinator.setSession(session);
@@ -1436,6 +1481,7 @@ async function loadFromCloud(options = {}) {
     };
   }
 
+  session.revision = result.revision;
   if (!result.hasData) {
     applyState({});
     if (!silentNoData) alert("クラウド保存データがまだありません。");
@@ -1458,6 +1504,56 @@ async function loadFromCloud(options = {}) {
     source: result.source,
     stale: false
   };
+}
+
+async function refreshFromCloudIfClean() {
+  const session = activeSyncSession;
+  if (
+    !db ||
+    !isSyncSessionCurrent(session) ||
+    !session.loaded ||
+    session.conflicted ||
+    syncPhase !== "ready" ||
+    saveCoordinator.isDirty(session)
+  ) {
+    return false;
+  }
+  if (session.refreshPromise) return session.refreshPromise;
+
+  const refreshPromise = (async () => {
+    try {
+      const result = await readCloudState(db, session.userId);
+      if (
+        !isSyncSessionCurrent(session) ||
+        !session.loaded ||
+        session.conflicted ||
+        saveCoordinator.isDirty(session)
+      ) {
+        return false;
+      }
+      if (result.revision === session.revision) return false;
+
+      applyState(result.hasData ? result.state : {});
+      session.revision = result.revision;
+      el.cloudStatus.textContent =
+        "他の端末で更新されたクラウド内容を自動反映しました。";
+      return true;
+    } catch (error) {
+      if (isSyncSessionCurrent(session) && !saveCoordinator.isDirty(session)) {
+        console.error(error);
+        el.cloudStatus.textContent =
+          "クラウドの更新確認に失敗しました。次回の画面復帰時に再試行します。\n" +
+          (error?.message || error);
+      }
+      return false;
+    } finally {
+      if (session.refreshPromise === refreshPromise) {
+        session.refreshPromise = null;
+      }
+    }
+  })();
+  session.refreshPromise = refreshPromise;
+  return refreshPromise;
 }
 
 function autoSaveToCloud(options = {}) {
@@ -1485,11 +1581,15 @@ document.querySelectorAll(".tab").forEach(tab => {
 window.addEventListener("scroll", updateFloatingStudyActions, { passive: true });
 window.addEventListener("resize", updateFloatingStudyActions);
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "hidden") return;
   const session = activeSyncSession;
-  if (session && saveCoordinator.isDirty(session)) {
+  if (document.visibilityState === "hidden" && session && saveCoordinator.isDirty(session)) {
     void saveCoordinator.flush(session);
+  } else if (document.visibilityState === "visible") {
+    void refreshFromCloudIfClean();
   }
+});
+window.addEventListener("pageshow", () => {
+  void refreshFromCloudIfClean();
 });
 window.addEventListener("pagehide", () => {
   const session = activeSyncSession;

@@ -1,5 +1,8 @@
 import { expect, test } from "@playwright/test";
+import { initializeTestEnvironment } from "@firebase/rules-unit-testing";
+import { doc, getDoc } from "firebase/firestore";
 import { guardProductionFirebase } from "../helpers/readOnlyApp.mjs";
+import { restoreQuestionsFromChunks } from "../../js/core/question-import.js";
 
 async function createEmulatorUser(email, password) {
   const response = await fetch(
@@ -38,6 +41,49 @@ async function waitForCloudSave(page) {
     "クラウドに分離保存しました",
     { timeout: 20_000 }
   );
+}
+
+async function performAndWaitForCloudSave(page, action) {
+  const status = page.locator("#cloudStatus");
+  await action();
+  await expect(status).toContainText(
+    /クラウド保存を待機しています|クラウドへ保存中です/,
+    { timeout: 10_000 }
+  );
+  await expect(status).toContainText(
+    "クラウドに分離保存しました",
+    { timeout: 20_000 }
+  );
+}
+
+async function readStoredQuestions(userId) {
+  const testEnvironment = await initializeTestEnvironment({
+    projectId: "demo-dental-qa",
+    firestore: {
+      host: "127.0.0.1",
+      port: 8080
+    }
+  });
+  try {
+    const db = testEnvironment.authenticatedContext(userId).firestore();
+    const appRef = name => doc(db, "users", userId, "app", name);
+    const [manifestSnapshot, syncSnapshot] = await Promise.all([
+      getDoc(appRef("questions")),
+      getDoc(appRef("sync"))
+    ]);
+    const manifest = manifestSnapshot.data();
+    const chunks = [];
+    for (let index = 0; index < manifest.chunkCount; index += 1) {
+      const suffix = String(index + 1).padStart(4, "0");
+      chunks.push((await getDoc(appRef(`questions-${suffix}`))).data());
+    }
+    return {
+      questions: restoreQuestionsFromChunks(manifest, chunks),
+      revision: syncSnapshot.data()?.revision
+    };
+  } finally {
+    await testEnvironment.cleanup();
+  }
 }
 
 test("@authenticated 高速な「できる／まだ」の最終状態を保存・復元する", async ({ page }) => {
@@ -109,4 +155,147 @@ test("@authenticated 空データの別ユーザーへ前ユーザーの状態�
   await page.locator("#tabBtnManage").click();
   await expect(page.locator("#questionTableBody")).toContainText("ユーザーAだけの問題");
   expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated iPadの削除後に古いiPhoneの保存を拒否して削除を維持する", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const email = `sync-conflict-${Date.now()}-${Math.random().toString(16).slice(2)}@example.test`;
+  const password = "DentalSync!123";
+  const user = await createEmulatorUser(email, password);
+  const ipadContext = await browser.newContext({
+    viewport: { width: 768, height: 1024 },
+    hasTouch: true,
+    isMobile: true,
+    deviceScaleFactor: 2
+  });
+  const iphoneContext = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+    isMobile: true,
+    deviceScaleFactor: 3
+  });
+  const ipad = await ipadContext.newPage();
+  const iphone = await iphoneContext.newPage();
+  const ipadBlockedRequests = await guardProductionFirebase(ipad);
+  const iphoneBlockedRequests = await guardProductionFirebase(iphone);
+
+  try {
+    await ipad.goto("/?firebaseEmulator=1", { waitUntil: "domcontentloaded" });
+    await signIn(ipad, email, password);
+    await performAndWaitForCloudSave(ipad, () => addQuestion(ipad, "削除後も消えたままの問題"));
+    await performAndWaitForCloudSave(ipad, () => addQuestion(ipad, "残す問題"));
+
+    await iphone.goto("/?firebaseEmulator=1", { waitUntil: "domcontentloaded" });
+    await signIn(iphone, email, password);
+
+    await ipad.locator("#tabBtnManage").click();
+    const deleteRow = ipad.locator(
+      '[data-manage-row]:has-text("削除後も消えたままの問題")'
+    );
+    await deleteRow.locator("[data-delete-question]").check();
+    ipad.once("dialog", dialog => dialog.accept());
+    await performAndWaitForCloudSave(
+      ipad,
+      () => ipad.locator("#manageDeleteCheckedBtn").click()
+    );
+    await expect(ipad.locator("#questionTableBody"))
+      .not.toContainText("削除後も消えたままの問題");
+
+    await iphone.locator("#tabBtnStudy").click();
+    await iphone.locator("#chooseIpad").click();
+    await expect(iphone.locator("#cloudStatus")).toContainText(
+      "他の端末で先にクラウドデータが更新されたため",
+      { timeout: 20_000 }
+    );
+    await expect(iphone.locator("#authStatus")).toContainText(
+      "他端末との保存競合により操作停止中"
+    );
+    await expect(iphone.locator("#tabBtnManage")).toBeHidden();
+
+    iphone.once("dialog", dialog => dialog.accept());
+    await Promise.all([
+      ipad.reload({ waitUntil: "domcontentloaded" }),
+      iphone.reload({ waitUntil: "domcontentloaded" })
+    ]);
+    await Promise.all([
+      expect(ipad.locator("#tabBtnManage")).toBeVisible({ timeout: 20_000 }),
+      expect(iphone.locator("#tabBtnManage")).toBeVisible({ timeout: 20_000 })
+    ]);
+    await Promise.all([
+      ipad.locator("#tabBtnManage").click(),
+      iphone.locator("#tabBtnManage").click()
+    ]);
+    await expect(ipad.locator("#questionTableBody"))
+      .not.toContainText("削除後も消えたままの問題");
+    await expect(iphone.locator("#questionTableBody"))
+      .not.toContainText("削除後も消えたままの問題");
+    await expect(ipad.locator("#questionTableBody")).toContainText("残す問題");
+    await expect(iphone.locator("#questionTableBody")).toContainText("残す問題");
+
+    const stored = await readStoredQuestions(user.localId);
+    expect(stored.questions.map(question => question.question)).toEqual(["残す問題"]);
+    expect(stored.revision).toBe(3);
+    expect(ipadBlockedRequests).toEqual([]);
+    expect(iphoneBlockedRequests).toEqual([]);
+  } finally {
+    await Promise.all([
+      ipadContext.close(),
+      iphoneContext.close()
+    ]);
+  }
+});
+
+test("@authenticated 非dirty端末はpageshowとvisibility復帰で他端末の更新を自動反映する", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const email = `sync-foreground-${Date.now()}-${Math.random().toString(16).slice(2)}@example.test`;
+  const password = "DentalSync!123";
+  await createEmulatorUser(email, password);
+  const writerContext = await browser.newContext({ viewport: { width: 768, height: 1024 } });
+  const readerContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const writer = await writerContext.newPage();
+  const reader = await readerContext.newPage();
+  const writerBlockedRequests = await guardProductionFirebase(writer);
+  const readerBlockedRequests = await guardProductionFirebase(reader);
+
+  try {
+    await writer.goto("/?firebaseEmulator=1", { waitUntil: "domcontentloaded" });
+    await signIn(writer, email, password);
+    await performAndWaitForCloudSave(writer, () => addQuestion(writer, "同期の基準問題"));
+
+    await reader.goto("/?firebaseEmulator=1", { waitUntil: "domcontentloaded" });
+    await signIn(reader, email, password);
+    await reader.locator("#tabBtnManage").click();
+    await expect(reader.locator("#questionTableBody")).toContainText("同期の基準問題");
+
+    await performAndWaitForCloudSave(writer, () => addQuestion(writer, "pageshowで反映する問題"));
+    await reader.evaluate(() => {
+      window.dispatchEvent(new Event("pageshow"));
+    });
+    await expect(reader.locator("#cloudStatus")).toContainText(
+      "他の端末で更新されたクラウド内容を自動反映しました",
+      { timeout: 20_000 }
+    );
+    await expect(reader.locator("#questionTableBody")).toContainText("pageshowで反映する問題");
+
+    await performAndWaitForCloudSave(
+      writer,
+      () => addQuestion(writer, "visibilitychangeで反映する問題")
+    );
+    await reader.evaluate(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await expect(reader.locator("#cloudStatus")).toContainText(
+      "他の端末で更新されたクラウド内容を自動反映しました",
+      { timeout: 20_000 }
+    );
+    await expect(reader.locator("#questionTableBody"))
+      .toContainText("visibilitychangeで反映する問題");
+    expect(writerBlockedRequests).toEqual([]);
+    expect(readerBlockedRequests).toEqual([]);
+  } finally {
+    await Promise.all([
+      writerContext.close(),
+      readerContext.close()
+    ]);
+  }
 });
