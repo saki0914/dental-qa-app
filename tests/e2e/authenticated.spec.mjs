@@ -273,15 +273,31 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
   await page.locator("#pdfTitleInput").fill("E2E画像教材");
   await page.locator("#pdfSubjectInput").fill("E2E歯科学");
   await page.locator("#pdfCategoryInput").fill("E2E,画像暗記");
-  await page.locator("#pdfFileInput").setInputFiles({
-    name: "material.png",
-    mimeType: "image/png",
-    buffer: TEST_PNG
-  });
+  await page.locator("#pdfFileInput").setInputFiles([
+    { name: "material-page-3.png", mimeType: "image/png", buffer: TEST_PNG },
+    { name: "material-page-1.png", mimeType: "image/png", buffer: TEST_PNG },
+    { name: "material-page-2.png", mimeType: "image/png", buffer: TEST_PNG }
+  ]);
+  await expect(page.locator("#pdfFileOrderDescription")).toContainText("この表示順で1ページ目から登録します");
+  await expect(page.locator("#pdfFileOrderList .pdf-file-order-name")).toHaveText([
+    "material-page-3.png",
+    "material-page-1.png",
+    "material-page-2.png"
+  ]);
+  await page.getByRole("button", { name: "material-page-3.pngを下へ移動" }).click();
+  await expect(page.locator("#pdfFileOrderList .pdf-file-order-name")).toHaveText([
+    "material-page-1.png",
+    "material-page-3.png",
+    "material-page-2.png"
+  ]);
   await page.locator("#addPdfBtn").click();
   await expect(page.locator("#pdfEditStatus")).toContainText("教材を追加しました", { timeout: 20_000 });
   await expect(page.locator("#pdfEditTableBody")).toContainText("E2E画像教材");
-  await expect(page.locator("#pdfEditPreview img")).toBeVisible({ timeout: 20_000 });
+  await expect(page.locator("#pdfEditPreview img")).toHaveCount(3);
+  await expect.poll(() => page.locator("#pdfEditPreview img").evaluateAll(
+    images => images.map(image => image.alt)
+  )).toEqual(["material-page-1.png", "material-page-3.png", "material-page-2.png"]);
+  await expect(page.locator("#pdfFileOrderPanel")).toBeHidden();
 
   await page.locator("#clearPdfEditorBtn").click();
   await expect(page.locator("#pdfTitleInput")).toHaveValue("");
@@ -303,14 +319,25 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
   await expect(firstMaterialEditRow.locator("[data-delete-pdf]")).toBeDisabled();
   await expect(firstMaterialEditRow.locator("[data-edit-pdf]")).toHaveText("更新対象");
   await page.locator("#pdfTitleInput").fill("E2E画像教材更新");
-  await page.locator("#pdfFileInput").setInputFiles({
-    name: "material-updated.png",
-    mimeType: "image/png",
-    buffer: TEST_PNG
-  });
+  await page.locator("#pdfFileInput").setInputFiles([
+    { name: "material-updated-2.png", mimeType: "image/png", buffer: TEST_PNG },
+    { name: "material-updated-3.png", mimeType: "image/png", buffer: TEST_PNG },
+    { name: "material-updated-1.png", mimeType: "image/png", buffer: TEST_PNG }
+  ]);
+  await page.getByRole("button", { name: "material-updated-1.pngを上へ移動" }).click();
+  await expect(page.getByRole("button", { name: "material-updated-1.pngを上へ移動" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#pdfFileOrderList .pdf-file-order-name")).toHaveText([
+    "material-updated-1.png",
+    "material-updated-2.png",
+    "material-updated-3.png"
+  ]);
   await page.locator("#updatePdfBtn").click();
   await expect(page.locator("#pdfEditStatus")).toContainText("教材情報と画像を更新しました", { timeout: 20_000 });
   await expect(page.locator("#pdfEditTableBody")).toContainText("E2E画像教材更新");
+  await expect.poll(() => page.locator("#pdfEditPreview img").evaluateAll(
+    images => images.map(image => image.alt)
+  )).toEqual(["material-updated-1.png", "material-updated-2.png", "material-updated-3.png"]);
   await captureVisualPair(page, "image-memory-edit");
 
   await page.locator("#pdfStudyModeBtn").click();
@@ -327,7 +354,10 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
   await expect(page.locator("#pdfTableBody")).not.toContainText("E2E別教科教材");
   await expect(page.locator("#pdfTableBody tr.selected")).toContainText("E2E画像教材更新");
 
-  const materialImage = page.locator("#pdfViewerArea img");
+  await expect.poll(() => page.locator("#pdfViewerArea img").evaluateAll(
+    images => images.map(image => image.alt)
+  )).toEqual(["material-updated-1.png", "material-updated-2.png", "material-updated-3.png"]);
+  const materialImage = page.locator("#pdfViewerArea img").first();
   await expect(materialImage).toBeVisible({ timeout: 20_000 });
   await expect.poll(() => materialImage.evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
 
@@ -429,7 +459,9 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
   await expect(page.locator("#pdfViewerShell")).not.toHaveClass(/is-fullscreen/);
   await expect(page.locator("#pdfMaskManagementPanel #pdfMaskCompactActions")).toBeVisible();
 
-  const touchAction = await page.locator(".pdf-page-wrap").evaluate(node => getComputedStyle(node).touchAction);
+  const touchAction = await page.locator(".pdf-page-wrap").first().evaluate(
+    node => getComputedStyle(node).touchAction
+  );
   expect(touchAction).toContain("pan-x");
   await captureVisualPair(page, "image-memory-study");
 
@@ -487,7 +519,13 @@ test("@authenticated Emulator上でログイン後の問題CRUDと画像暗記�
   await expect(page.locator("#pdfMaskTableBody")).toContainText("24%");
   await expect(page.locator("#pdfMaskTableBody")).toContainText("苦手");
   await expect(page.locator(".pdf-mask").first()).toHaveClass(/is-weak/);
-  await expect(page.locator("#pdfViewerArea img")).toBeVisible({ timeout: 20_000 });
+  await expect.poll(() => page.locator("#pdfViewerArea img").evaluateAll(
+    images => images.map(image => image.alt)
+  ), { timeout: 20_000 }).toEqual([
+    "material-updated-1.png",
+    "material-updated-2.png",
+    "material-updated-3.png"
+  ]);
 
   await page.locator("#pdfEditModeBtn").click();
   const firstDeleteRow = page.locator('#pdfEditTableBody tr:has-text("E2E画像教材更新")');

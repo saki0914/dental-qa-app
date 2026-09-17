@@ -373,6 +373,10 @@
             <span>PDF・画像（更新時は差し替え）</span>
             <input id="pdfFileInput" type="file" accept="application/pdf,image/*" multiple>
           </label>
+          <div id="pdfFileOrderPanel" class="pdf-file-order hidden">
+            <p id="pdfFileOrderDescription" class="pdf-file-order-description"></p>
+            <ol id="pdfFileOrderList" class="pdf-file-order-list" aria-label="画像の登録予定順"></ol>
+          </div>
         </div>
         <div class="pdf-editor-actions">
           <button class="btn primary" id="addPdfBtn" type="button">教材追加</button>

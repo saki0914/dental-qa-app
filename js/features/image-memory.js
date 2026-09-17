@@ -20,6 +20,7 @@ import {
   normalizeImageMaterial,
   normalizeImageMemoryFilter
 } from "../core/image-memory-filters.js";
+import { moveImageMemoryFile } from "../core/image-memory-file-order.js";
 
 export function createImageMemory(dependencies) {
   const {
@@ -53,6 +54,7 @@ export function createImageMemory(dependencies) {
   let pdfGestureStartZoom = 1;
   let pdfPinchAnchor = null;
   let pdfGestureAnchor = null;
+  let pendingPdfFiles = [];
 
 function currentPdfMaterial() {
   return pdfMaterials.find(pdf => pdf.id === selectedPdfId) || null;
@@ -267,7 +269,7 @@ function selectPdfMaterialForEdit(pdfId) {
   editingPdfId = pdf.id;
   pdfDeleteSelectedIds = pdfDeleteSelectedIds.filter(id => id !== editingPdfId);
   fillPdfEditorForm(pdf);
-  if (el.pdfFileInput) el.pdfFileInput.value = "";
+  resetPendingPdfFiles();
   renderPdfTable();
   renderPdfEditPreview();
   setPdfEditStatus(`更新対象: ${pdf.title || "無題教材"}`);
@@ -642,6 +644,108 @@ function isImageFile(file) {
   return !!file && (!!file.type?.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(file.name || ""));
 }
 
+function renderPendingPdfFiles() {
+  if (!el.pdfFileOrderPanel || !el.pdfFileOrderList || !el.pdfFileOrderDescription) return;
+
+  const hasFiles = pendingPdfFiles.length > 0;
+  el.pdfFileOrderPanel.classList.toggle("hidden", !hasFiles);
+  if (!hasFiles) {
+    el.pdfFileOrderDescription.textContent = "";
+    el.pdfFileOrderList.innerHTML = "";
+    return;
+  }
+
+  const pdfFileCount = pendingPdfFiles.filter(isPdfFile).length;
+  const imageFileCount = pendingPdfFiles.filter(isImageFile).length;
+  const canReorder = pendingPdfFiles.length > 1 && imageFileCount === pendingPdfFiles.length;
+  if (canReorder) {
+    el.pdfFileOrderDescription.textContent =
+      "この表示順で1ページ目から登録します。必要に応じて「上へ」「下へ」で順番を整えてください。";
+  } else if (pendingPdfFiles.length === 1 && pdfFileCount === 1) {
+    el.pdfFileOrderDescription.textContent = "PDFは文書内のページ順で登録します。";
+  } else if (pdfFileCount && imageFileCount) {
+    el.pdfFileOrderDescription.textContent =
+      "PDFと画像は同時に登録できません。PDFだけ、または画像だけを選び直してください。";
+  } else if (pdfFileCount > 1) {
+    el.pdfFileOrderDescription.textContent = "PDFは1ファイルずつ選択してください。";
+  } else if (pdfFileCount + imageFileCount !== pendingPdfFiles.length) {
+    el.pdfFileOrderDescription.textContent = "対応していない形式のファイルが含まれています。";
+  } else {
+    el.pdfFileOrderDescription.textContent = "選択したファイルを確認してください。";
+  }
+
+  el.pdfFileOrderList.innerHTML = pendingPdfFiles.map((file, index) => {
+    const fileName = file?.name || `画像${index + 1}`;
+    const moveActions = canReorder
+      ? `
+          <div class="pdf-file-order-actions">
+            <button
+              type="button"
+              class="btn pdf-file-order-move"
+              data-pdf-file-move="up"
+              data-pdf-file-index="${index}"
+              aria-label="${escapeHtml(fileName)}を上へ移動"
+              ${index === 0 ? "disabled" : ""}
+            >上へ</button>
+            <button
+              type="button"
+              class="btn pdf-file-order-move"
+              data-pdf-file-move="down"
+              data-pdf-file-index="${index}"
+              aria-label="${escapeHtml(fileName)}を下へ移動"
+              ${index === pendingPdfFiles.length - 1 ? "disabled" : ""}
+            >下へ</button>
+          </div>
+        `
+      : "";
+
+    return `
+      <li class="pdf-file-order-item" data-pdf-file-order-item="${index}">
+        <span class="pdf-file-order-number" aria-hidden="true">${index + 1}</span>
+        <span class="pdf-file-order-name">${escapeHtml(fileName)}</span>
+        ${moveActions}
+      </li>
+    `;
+  }).join("");
+}
+
+function resetPendingPdfFiles() {
+  pendingPdfFiles = [];
+  if (el.pdfFileInput) el.pdfFileInput.value = "";
+  renderPendingPdfFiles();
+}
+
+function capturePendingPdfFiles() {
+  pendingPdfFiles = Array.from(el.pdfFileInput?.files || []);
+  renderPendingPdfFiles();
+}
+
+function selectedPdfFiles() {
+  return pendingPdfFiles.length
+    ? [...pendingPdfFiles]
+    : Array.from(el.pdfFileInput?.files || []);
+}
+
+function movePendingPdfFile(event) {
+  const button = event.target.closest("[data-pdf-file-move]");
+  if (!button || !el.pdfFileOrderList?.contains(button)) return;
+
+  const fromIndex = Number(button.dataset.pdfFileIndex);
+  const direction = button.dataset.pdfFileMove === "up" ? "up" : "down";
+  const toIndex = fromIndex + (direction === "up" ? -1 : 1);
+  pendingPdfFiles = moveImageMemoryFile(pendingPdfFiles, fromIndex, toIndex);
+  renderPendingPdfFiles();
+
+  const sameDirectionButton = el.pdfFileOrderList.querySelector(
+    `[data-pdf-file-index="${toIndex}"][data-pdf-file-move="${direction}"]`
+  );
+  const reverseDirectionButton = el.pdfFileOrderList.querySelector(
+    `[data-pdf-file-index="${toIndex}"][data-pdf-file-move="${direction === "up" ? "down" : "up"}"]`
+  );
+  const nextButton = sameDirectionButton?.disabled ? reverseDirectionButton : sameDirectionButton;
+  nextButton?.focus();
+}
+
 function readPdfEditorMetadata() {
   const title = String(el.pdfTitleInput?.value || "").trim();
   const subject = String(el.pdfSubjectInput?.value || "").trim();
@@ -666,7 +770,7 @@ function readPdfEditorMetadata() {
 function clearPdfEditorForm() {
   editingPdfId = null;
   fillPdfEditorForm(null);
-  if (el.pdfFileInput) el.pdfFileInput.value = "";
+  resetPendingPdfFiles();
   renderPdfTable();
   renderPdfEditPreview();
   setPdfEditStatus("新しい教材を入力してください。");
@@ -728,7 +832,7 @@ async function addPdfMaterial() {
 
   const metadata = readPdfEditorMetadata();
   if (!metadata) return;
-  const selectedFiles = Array.from(el.pdfFileInput.files || []);
+  const selectedFiles = selectedPdfFiles();
   if (!selectedFiles.length) {
     alert("PDFまたは画像ファイルを選んでください。");
     return;
@@ -752,12 +856,12 @@ async function addPdfMaterial() {
     editingPdfId = pdfId;
     pdfDeleteSelectedIds = pdfDeleteSelectedIds.filter(id => id !== pdfId);
     selectedMaskId = null;
-    el.pdfFileInput.value = "";
     renderPdfTable();
     renderPdfMaskTable();
     renderPdfEditPreview();
     const saved = await requestSave({ showAlerts: true });
     if (!saved) throw new Error("教材データをクラウド保存できませんでした。");
+    resetPendingPdfFiles();
     setPdfEditStatus("教材を追加しました。");
   } catch (error) {
     if (added) pdfMaterials = pdfMaterials.filter(pdf => pdf.id !== pdfId);
@@ -784,7 +888,7 @@ async function updatePdfMaterial() {
   }
   const metadata = readPdfEditorMetadata();
   if (!metadata) return;
-  const selectedFiles = Array.from(el.pdfFileInput.files || []);
+  const selectedFiles = selectedPdfFiles();
 
   if (!selectedFiles.length) {
     Object.assign(pdf, metadata);
@@ -820,7 +924,6 @@ async function updatePdfMaterial() {
     pdfRevealStates[pdf.id] = {};
     selectedMaskId = null;
     selectedMaskIds = [];
-    el.pdfFileInput.value = "";
     renderPdfTable();
     renderPdfMaskTable();
     renderPdfEditPreview();
@@ -828,6 +931,7 @@ async function updatePdfMaterial() {
     const saved = await requestSave({ showAlerts: true });
     if (!saved) throw new Error("更新した教材データをクラウド保存できませんでした。");
     await Promise.all((previous.pages || []).map(page => deletePdfFileByPath(getPdfPageImagePath(page))));
+    resetPendingPdfFiles();
     setPdfEditStatus("教材情報と画像を更新しました。隠し範囲は初期化されています。");
   } catch (error) {
     Object.assign(pdf, {
@@ -1857,6 +1961,7 @@ function renderPdfViewer(preserveScroll = false) {
     }
     pdfAddMaskMode = false;
     pdfDraft = null;
+    resetPendingPdfFiles();
 
     if (selectedPdfId && !pdfMaterials.some(pdf => pdf.id === selectedPdfId)) {
       selectedPdfId = null;
@@ -1867,6 +1972,8 @@ function renderPdfViewer(preserveScroll = false) {
   }
 
   function bindEvents() {
+    el.pdfFileInput?.addEventListener("change", capturePendingPdfFiles);
+    el.pdfFileOrderList?.addEventListener("click", movePendingPdfFile);
     el.addPdfBtn?.addEventListener("click", () => addPdfMaterial().catch(console.error));
     el.updatePdfBtn?.addEventListener("click", () => updatePdfMaterial().catch(console.error));
     el.clearPdfEditorBtn?.addEventListener("click", clearPdfEditorForm);
