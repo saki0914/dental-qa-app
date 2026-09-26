@@ -3,6 +3,8 @@
 !.env.example
 
 node_modules/
+.firebase-emulator-data/
+firebase-export-*/
 .codex/
 
 playwright-report/
@@ -11,6 +13,7 @@ blob-report/
 .playwright/
 
 *.log
+/core
 logs/
 .migration-backups/
 migration-backups/

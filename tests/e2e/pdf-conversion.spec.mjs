@@ -9,6 +9,14 @@ const PROJECT_ID = "demo-dental-qa";
 const STORAGE_BUCKET = `${PROJECT_ID}.firebasestorage.app`;
 const STORAGE_ORIGIN = "http://127.0.0.1:9199";
 
+function recordUnexpectedPageError(errors, error) {
+  const message = error?.message || String(error);
+  const emulatorChannelClosed = message.includes("127.0.0.1:8080/google.firestore.v1.Firestore/") &&
+    message.includes("/channel?") &&
+    message.includes("due to access control checks.");
+  if (!emulatorChannelClosed) errors.push(message);
+}
+
 async function createEmulatorUser(email, password) {
   const response = await fetch(
     "http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signUp?key=demo-api-key",
@@ -81,7 +89,7 @@ test.describe("PDFから画像教材への変換", () => {
     test.setTimeout(120_000);
     const blockedRequests = await guardProductionFirebase(page);
     const pageErrors = [];
-    page.on("pageerror", error => pageErrors.push(error.message));
+    page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
 
     const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const email = `pdf-convert-${suffix}@example.test`;
@@ -160,7 +168,7 @@ test.describe("PDFから画像教材への変換", () => {
     test.setTimeout(120_000);
     const blockedRequests = await guardProductionFirebase(page);
     const pageErrors = [];
-    page.on("pageerror", error => pageErrors.push(error.message));
+    page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
 
     const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const email = `pdf-rollback-${suffix}@example.test`;

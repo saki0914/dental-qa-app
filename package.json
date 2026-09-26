@@ -6,6 +6,11 @@
   "description": "Static dental Q&A learning app development helpers.",
   "scripts": {
     "dev": "http-server . -a 0.0.0.0 -p 3000 -c-1",
+    "local:start": "node scripts/local-dev.mjs",
+    "local:start:lan": "node scripts/local-dev.mjs --lan",
+    "local:seed": "node scripts/local-seed.mjs",
+    "local:reset": "node scripts/local-reset.mjs",
+    "local:smoke": "node scripts/local-smoke.mjs",
     "check": "node scripts/check.mjs",
     "emulators:start": "firebase emulators:start --project demo-dental-qa --only auth,firestore,storage",
     "test:unit": "node --test tests/unit/*.test.mjs",

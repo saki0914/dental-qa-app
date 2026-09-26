@@ -1,8 +1,50 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    match /users/{userId}/{allPaths=**} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
     }
+
+    function isValidNoteImageUpload() {
+      return request.resource != null
+        && request.resource.size > 0
+        && request.resource.size <= 20 * 1024 * 1024
+        && request.resource.contentType in [
+          'image/png',
+          'image/jpeg',
+          'image/webp'
+        ];
+    }
+
+    function isValidNoteJsonUpload() {
+      return request.resource != null
+        && request.resource.size > 0
+        && request.resource.size <= 2 * 1024 * 1024
+        && request.resource.contentType == 'application/json';
+    }
+
+    match /users/{userId}/questions/{allPaths=**} {
+      allow read, write: if isOwner(userId);
+    }
+
+    match /users/{userId}/imageMaterials/{allPaths=**} {
+      allow read, write: if isOwner(userId);
+    }
+
+    match /users/{userId}/notes/{noteId}/assets/{assetId}/{fileName} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidNoteImageUpload();
+    }
+
+    match /users/{userId}/notes/{noteId}/sourcePages/{pageId}/{fileName} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidNoteImageUpload();
+    }
+
+    match /users/{userId}/notes/{noteId}/pages/{pageId}/revisions/{saveId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidNoteJsonUpload();
+    }
+
   }
 }

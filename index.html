@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Dental QA Ultimate</title>
   <link rel="stylesheet" href="./css/app.css">
+  <link rel="stylesheet" href="./css/study-notes.css">
 </head>
 <body>
 <div class="wrap">
@@ -17,6 +18,10 @@
     </div>
     <div class="sub" id="appVersionLabel">学習操作改善版 v10.61</div>
     <div class="banner" id="cloudStatus">Firebase接続を確認中です...</div>
+    <div class="local-environment-banner hidden" id="localEnvironmentBanner" role="status">
+      <strong>LOCAL / FIREBASE EMULATOR</strong>
+      <span>Auth: 接続済み / Firestore: 接続済み / Storage: 接続済み</span>
+    </div>
   </div>
 
   <div class="panel">
@@ -25,7 +30,7 @@
       <button class="tab" data-tab="manage" id="tabBtnManage">問題管理</button>
       <button class="tab" data-tab="auth" id="tabBtnAuth">ログイン</button>
       <button class="tab" data-tab="progress" id="tabBtnProgress">進捗</button>
-      <button class="tab" data-tab="pdf" id="tabBtnPdf">画像暗記</button>
+      <button class="tab" data-tab="pdf" id="tabBtnPdf">ノート・画像暗記</button>
     </div>
 
     <div id="tab-study">
@@ -252,18 +257,160 @@
     </div>
 
     <div id="tab-pdf" class="hidden">
-      <div class="banner hidden" id="pdfLockBanner">ログインすると画像暗記が使えます。</div>
-      <h2>画像暗記</h2>
+      <div class="banner hidden" id="pdfLockBanner">ログインするとノート・画像暗記が使えます。</div>
+      <h2>ノート・画像暗記</h2>
       <div class="sub">
-        教材を選んで画像上の隠し範囲を学習できます。教材の追加・更新・削除は「教材編集」で行います。
+        学習ノートへの書き込み、暗記学習、教材管理を1か所から行えます。
       </div>
 
-      <div class="image-memory-mode-switch" role="group" aria-label="画像暗記の表示切り替え">
-        <button class="image-memory-mode-btn active" id="pdfStudyModeBtn" type="button" aria-pressed="true">学習</button>
-        <button class="image-memory-mode-btn" id="pdfEditModeBtn" type="button" aria-pressed="false">教材編集</button>
+      <div class="image-memory-mode-switch" role="group" aria-label="ノート・画像暗記の表示切り替え">
+        <button class="image-memory-mode-btn active" id="noteModeBtn" type="button" aria-pressed="true">ノート</button>
+        <button class="image-memory-mode-btn" id="pdfStudyModeBtn" type="button" aria-pressed="false">暗記学習</button>
+        <button class="image-memory-mode-btn" id="pdfEditModeBtn" type="button" aria-pressed="false">教材管理</button>
       </div>
 
-      <div id="pdfStudyView" class="image-memory-view">
+      <div id="noteView" class="image-memory-view study-notes-root">
+        <section id="noteListView">
+          <div class="note-list-heading">
+            <div>
+              <h3>学習ノート</h3>
+              <p class="sub">書き込みは背景と分離して保存されます。元PDF・教材画像は変更されません。</p>
+            </div>
+            <button class="btn primary" id="newNoteBtn" type="button">新規ノート</button>
+          </div>
+          <div id="noteListStatus" class="pdf-status">ノートを読み込んでいます...</div>
+          <div id="noteList" class="note-card-grid"></div>
+        </section>
+
+        <section id="noteCreateView" class="hidden" aria-labelledby="noteCreateTitle">
+          <div class="note-editor-header compact">
+            <button class="btn" id="cancelNoteCreateBtn" type="button">一覧へ戻る</button>
+            <h3 id="noteCreateTitle">新規ノート</h3>
+          </div>
+          <label class="field-group"><span>ノート名</span><input id="newNoteTitle" value="新しい学習ノート" maxlength="100"></label>
+          <div class="note-create-grid">
+            <button class="note-create-choice" data-create-note="blank" type="button"><strong>白紙から作成</strong><span>A4縦の白紙を1ページ作成</span></button>
+            <button class="note-create-choice" data-create-note="ruled" type="button"><strong>横罫線から作成</strong><span>標準間隔の横罫線を1ページ作成</span></button>
+            <button class="note-create-choice" data-create-note="pdf" type="button"><strong>PDFから作成</strong><span>PDFの全ページを背景として読み込み</span></button>
+            <button class="note-create-choice" data-create-note="material" type="button"><strong>既存の画像教材から作成</strong><span>教材画像を複製せず参照</span></button>
+          </div>
+          <input id="notePdfInput" class="hidden" type="file" accept="application/pdf,.pdf">
+          <div id="noteMaterialPicker" class="note-material-picker hidden"></div>
+          <div id="noteCreateProgress" class="note-progress hidden" role="status">
+            <p id="noteCreateProgressLabel">PDFを読み込んでいます</p>
+            <progress id="noteCreateProgressBar" max="100" value="0"></progress>
+            <button class="btn ng" id="cancelNoteProgressBtn" type="button">キャンセル</button>
+          </div>
+        </section>
+
+        <section id="noteEditorView" class="note-editor hidden" aria-label="ノート編集">
+          <header class="note-editor-header">
+            <button class="note-icon-button" id="closeNoteBtn" type="button" aria-label="ノート一覧へ戻る">←</button>
+            <input id="noteTitleInput" class="note-title-input" aria-label="ノート名">
+            <span id="notePageCounter" class="note-page-counter">1 / 1</span>
+            <button class="note-icon-button note-mobile-pages-button" id="notePagesBtn" type="button" aria-label="ページ一覧を開く" aria-controls="notePageSidebar" aria-expanded="false">▤</button>
+            <button class="note-icon-button" id="noteUndoBtn" type="button" aria-label="元に戻す" title="元に戻す">↶</button>
+            <button class="note-icon-button" id="noteRedoBtn" type="button" aria-label="やり直す" title="やり直す">↷</button>
+            <button class="btn soft" id="toggleNoteStudyBtn" type="button">暗記モード</button>
+            <span id="noteSaveStatus" class="note-save-status" role="status">保存済み</span>
+            <details class="note-more-menu"><summary aria-label="その他メニュー">•••</summary><div>
+              <button type="button" data-note-action="export">PDFを書き出す</button>
+              <button type="button" data-note-action="rename">ノート名を変更</button>
+              <button type="button" data-note-action="duplicate">ノートを複製</button>
+              <button type="button" data-note-action="delete">ノートを削除</button>
+            </div></details>
+          </header>
+
+          <div class="note-editor-layout">
+            <aside class="note-page-sidebar" id="notePageSidebar">
+              <div class="note-page-actions">
+                <button type="button" data-page-action="add-blank">＋白紙</button>
+                <button type="button" data-page-action="add-ruled">＋罫線</button>
+                <button type="button" data-page-action="add-default">＋既定背景</button>
+              </div>
+              <ol id="notePageList" class="note-page-list"></ol>
+            </aside>
+            <main class="note-workspace">
+              <div id="noteStudyControls" class="note-study-controls hidden">
+                <button class="btn" data-study-action="previous" type="button">前ページ</button>
+                <button class="btn" data-study-action="hide-all" type="button">すべて隠す</button>
+                <button class="btn" data-study-action="show-all" type="button">すべて表示</button>
+                <button class="btn" data-study-action="next" type="button">次ページ</button>
+                <span id="noteMaskCounts"></span>
+              </div>
+              <div id="noteViewport" class="note-viewport">
+                <div id="notePageStage" class="note-page-stage" tabindex="0" aria-label="編集ページ"></div>
+              </div>
+              <div id="noteSelectionActions" class="note-selection-actions hidden">
+                <button type="button" data-selection-action="duplicate">複製</button>
+                <button type="button" data-selection-action="front">前面</button>
+                <button type="button" data-selection-action="back">背面</button>
+                <button type="button" data-selection-action="rotate-left">左90°</button>
+                <button type="button" data-selection-action="rotate-right">右90°</button>
+                <button type="button" data-selection-action="lock">固定/解除</button>
+                <button type="button" data-selection-action="crop">トリミング</button>
+                <button type="button" data-selection-action="delete">削除</button>
+              </div>
+            </main>
+          </div>
+
+          <div class="note-toolbar" role="toolbar" aria-label="ノート編集ツール">
+            <button type="button" data-note-tool="pan" aria-label="手のひら・移動" title="手のひら・移動">✋<span>移動</span></button>
+            <button type="button" data-note-tool="select" aria-label="選択・投げ縄" title="選択・投げ縄">⬚<span>選択</span></button>
+            <button type="button" data-note-tool="pen" class="active" aria-label="ペン" title="ペン">✎<span>ペン</span></button>
+            <button type="button" data-note-tool="highlighter" aria-label="ハイライト" title="ハイライト">▰<span>蛍光</span></button>
+            <button type="button" data-note-tool="eraser-object" aria-label="消しゴム" title="消しゴム">⌫<span>消す</span></button>
+            <button type="button" data-note-tool="shape" aria-label="図形" title="図形">○<span>図形</span></button>
+            <button type="button" data-note-tool="text" aria-label="テキスト" title="テキスト">T<span>文字</span></button>
+            <button type="button" data-note-tool="image" aria-label="画像" title="画像">▧<span>画像</span></button>
+            <button type="button" data-note-tool="mask" aria-label="暗記マスク" title="暗記マスク">■<span>マスク</span></button>
+            <button type="button" id="noteStyleBtn" aria-label="色・線設定" title="色・線設定"><i id="noteCurrentColor"></i><span>設定</span></button>
+            <button type="button" id="noteBackgroundBtn" aria-label="ページ背景設定" title="ページ背景設定">▤<span>背景</span></button>
+          </div>
+          <div id="noteToolSettings" class="note-tool-settings hidden">
+            <label>色 <input id="noteColorInput" type="color" value="#111111"></label>
+            <label>太さ <input id="noteWidthInput" type="range" min="1" max="100" value="25"></label>
+            <label>透明度 <input id="noteOpacityInput" type="range" min="5" max="100" value="100"></label>
+            <label>消しゴム <select id="noteEraserMode"><option value="object">オブジェクト</option><option value="pixel">ピクセル</option></select></label>
+            <label>図形 <select id="noteShapeType"><option value="line">直線</option><option value="arrow">矢印</option><option value="rectangle">四角形</option><option value="rounded-rectangle">角丸四角形</option><option value="ellipse">円・楕円</option><option value="triangle">三角形</option><option value="star">星</option></select></label>
+            <label>線種 <select id="noteLineStyle"><option value="solid">実線</option><option value="dashed">破線</option><option value="dotted">点線</option></select></label>
+            <label>塗り <input id="noteFillColor" type="color" value="#ff0000"></label>
+            <label>塗り透明度 <input id="noteFillOpacity" type="range" min="0" max="100" value="0"></label>
+            <label>文字 <select id="noteFontFamily"><option value="system-sans">システムゴシック</option><option value="system-serif">システム明朝</option><option value="monospace">等幅</option></select></label>
+            <label>文字サイズ <input id="noteFontSize" type="range" min="10" max="80" value="25"></label>
+            <label><input id="noteFontBold" type="checkbox"> 太字</label>
+            <label><input id="noteFontItalic" type="checkbox"> 斜体</label>
+            <label>揃え <select id="noteTextAlign"><option value="left">左</option><option value="center">中央</option><option value="right">右</option></select></label>
+            <label><input id="noteFingerDraw" type="checkbox" checked> 指で描画する</label>
+          </div>
+          <input id="noteImagePhotoInput" class="hidden" type="file" accept="image/*">
+          <input id="noteImageFileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp">
+          <div id="notePasteFallback" class="note-paste-fallback hidden" tabindex="0" contenteditable="true">ここを長押しして「ペースト」を選択してください</div>
+        </section>
+
+        <dialog id="noteExportDialog" class="note-export-dialog">
+          <form method="dialog">
+            <h3>PDFを書き出す</h3>
+            <label>PDFの用途<select id="noteExportPurpose"><option value="ai">AI共有用</option><option value="study">学習用</option><option value="screen">画面どおり</option></select></label>
+            <label>ページ範囲<select id="noteExportRangeMode"><option value="all">全ページ</option><option value="current">現在ページ</option><option value="custom">ページ範囲指定</option></select></label>
+            <input id="noteExportRange" class="hidden" placeholder="例: 1-3,5">
+            <label>画質<select id="noteExportQuality"><option value="compact">軽量</option><option value="standard" selected>標準</option><option value="high">高画質</option></select></label>
+            <label>ファイル名<input id="noteExportFilename"></label>
+            <label><input id="noteExportPageNumbers" type="checkbox"> ページ番号を付ける</label>
+            <progress id="noteExportProgress" max="100" value="0"></progress>
+            <p id="noteExportStatus"></p>
+            <div class="note-dialog-actions">
+              <button class="btn primary" id="createNotePdfBtn" type="button">PDFを作成</button>
+              <button class="btn" id="downloadNotePdfBtn" type="button" disabled>PDFをダウンロード</button>
+              <button class="btn" id="shareNotePdfBtn" type="button" disabled>PDFを共有</button>
+              <button class="btn ng" id="cancelNotePdfBtn" type="button">キャンセル</button>
+              <button class="btn" value="close">閉じる</button>
+            </div>
+          </form>
+        </dialog>
+      </div>
+
+      <div id="pdfStudyView" class="image-memory-view hidden">
         <div class="study-filter-grid pdf-filter-grid">
           <label class="field-group">
             <span>教材を検索</span>
@@ -400,6 +547,7 @@
                 <th>教科</th>
                 <th>カテゴリ</th>
                 <th style="width:72px;">画像</th>
+                <th style="width:130px;">ノート</th>
               </tr>
             </thead>
             <tbody id="pdfEditTableBody"></tbody>
@@ -411,6 +559,7 @@
   </div>
 </div>
 
+<script src="./vendor/pdf-lib/pdf-lib.min.js"></script>
 <script type="module" src="./js/app.js"></script>
 </body>
 </html>

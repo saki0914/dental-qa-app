@@ -1,0 +1,213 @@
+import { assertNonEmptyBlob, canvasToVerifiedBlob } from "./file-validator.js";
+
+function loadImage(blob) {
+  assertNonEmptyBlob(blob, "描画画像");
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => resolve({ image, revoke: () => URL.revokeObjectURL(url) });
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error("画像をデコードできませんでした。")); };
+    image.src = url;
+  });
+}
+
+function canvasPath(context, points, width, height) {
+  if (!points?.length) return;
+  context.beginPath();
+  context.moveTo(points[0].x * width, points[0].y * height);
+  for (let index = 1; index < points.length; index += 1) {
+    const point = points[index];
+    context.lineTo(point.x * width, point.y * height);
+  }
+}
+
+function drawPaper(context, page, width, height) {
+  const background = page.background || {};
+  context.fillStyle = background.paperColor || "#ffffff";
+  context.fillRect(0, 0, width, height);
+  if (background.type !== "ruled" && background.ruleType !== "ruled") return;
+  const spacing = Math.max(10, Number(background.ruleSpacingRatio || 0.035) * height);
+  context.strokeStyle = background.ruleColor || "#d9dee7";
+  context.globalAlpha = Number(background.ruleOpacity ?? 0.7);
+  context.lineWidth = Math.max(1, Number(background.ruleWidthRatio || 0.001) * width);
+  for (let y = spacing; y < height; y += spacing) {
+    context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke();
+  }
+  context.globalAlpha = 1;
+}
+
+async function drawBlobCover(context, blob, x, y, width, height, crop = null, rotation = 0, opacity = 1) {
+  const loaded = await loadImage(blob);
+  try {
+    const source = crop || { x: 0, y: 0, width: 1, height: 1 };
+    const sx = source.x * loaded.image.naturalWidth;
+    const sy = source.y * loaded.image.naturalHeight;
+    const sw = source.width * loaded.image.naturalWidth;
+    const sh = source.height * loaded.image.naturalHeight;
+    context.save();
+    context.globalAlpha = opacity;
+    context.translate(x + width / 2, y + height / 2);
+    context.rotate(Number(rotation || 0) * Math.PI / 180);
+    context.drawImage(loaded.image, sx, sy, sw, sh, -width / 2, -height / 2, width, height);
+    context.restore();
+  } finally {
+    loaded.revoke();
+  }
+}
+
+function drawShape(context, element, width, height) {
+  const bounds = element.bounds;
+  const x = bounds.x * width;
+  const y = bounds.y * height;
+  const w = bounds.width * width;
+  const h = bounds.height * height;
+  const style = element.style || {};
+  context.save();
+  context.translate(x + w / 2, y + h / 2);
+  context.rotate(Number(element.rotation || 0) * Math.PI / 180);
+  context.translate(-w / 2, -h / 2);
+  context.globalAlpha = Number(style.strokeOpacity ?? 1);
+  context.strokeStyle = style.strokeColor || "#111111";
+  context.lineWidth = Math.max(1, Number(style.strokeWidthRatio || 0.002) * width);
+  context.setLineDash(style.lineStyle === "dashed" ? [12, 8] : style.lineStyle === "dotted" ? [2, 7] : []);
+  context.fillStyle = style.fillColor || "transparent";
+
+  const path = new Path2D();
+  if (element.shapeType === "line" || element.shapeType === "arrow") {
+    path.moveTo(0, h); path.lineTo(w, 0);
+  } else if (element.shapeType === "ellipse") {
+    path.ellipse(w / 2, h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+  } else if (element.shapeType === "triangle") {
+    path.moveTo(w / 2, 0); path.lineTo(w, h); path.lineTo(0, h); path.closePath();
+  } else if (element.shapeType === "star") {
+    for (let index = 0; index < 10; index += 1) {
+      const radius = index % 2 ? Math.min(w, h) * 0.22 : Math.min(w, h) * 0.5;
+      const angle = -Math.PI / 2 + index * Math.PI / 5;
+      const px = w / 2 + Math.cos(angle) * radius;
+      const py = h / 2 + Math.sin(angle) * radius;
+      index ? path.lineTo(px, py) : path.moveTo(px, py);
+    }
+    path.closePath();
+  } else if (element.shapeType === "rounded-rectangle") {
+    path.roundRect(0, 0, w, h, Math.min(w, h) * 0.12);
+  } else {
+    path.rect(0, 0, w, h);
+  }
+  if (style.fillOpacity > 0 && element.shapeType !== "line" && element.shapeType !== "arrow") {
+    context.globalAlpha = Number(style.fillOpacity);
+    context.fill(path);
+  }
+  context.globalAlpha = Number(style.strokeOpacity ?? 1);
+  context.stroke(path);
+  if (element.shapeType === "arrow") {
+    const angle = Math.atan2(-h, w);
+    context.beginPath();
+    context.moveTo(w, 0);
+    context.lineTo(w - 18 * Math.cos(angle - 0.55), -18 * Math.sin(angle - 0.55));
+    context.moveTo(w, 0);
+    context.lineTo(w - 18 * Math.cos(angle + 0.55), -18 * Math.sin(angle + 0.55));
+    context.stroke();
+  }
+  context.restore();
+}
+
+function drawText(context, element, width, height) {
+  const bounds = element.bounds;
+  const style = element.style || {};
+  const x = bounds.x * width;
+  const y = bounds.y * height;
+  const boxWidth = bounds.width * width;
+  const fontSize = Math.max(8, Number(style.fontSizeRatio || 0.025) * height);
+  const family = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
+  context.save();
+  context.translate(x + boxWidth / 2, y + bounds.height * height / 2);
+  context.rotate(Number(element.rotation || 0) * Math.PI / 180);
+  context.translate(-boxWidth / 2, -bounds.height * height / 2);
+  context.globalAlpha = Number(style.opacity ?? 1);
+  context.fillStyle = style.color || "#111111";
+  context.font = `${style.fontStyle || "normal"} ${style.fontWeight || "normal"} ${fontSize}px ${family}`;
+  context.textBaseline = "top";
+  context.textAlign = style.textAlign || "left";
+  const anchorX = style.textAlign === "center" ? boxWidth / 2 : style.textAlign === "right" ? boxWidth : 0;
+  String(element.text || "").split("\n").forEach((line, index) => context.fillText(line, anchorX, index * fontSize * 1.25, boxWidth));
+  context.restore();
+}
+
+function shouldDrawMask(mask, options) {
+  if (options.maskMode === "none") return false;
+  if (options.maskMode === "all") return true;
+  return options.revealedMaskIds?.has(mask.id) !== true;
+}
+
+export async function renderNotePageToCanvas({
+  page,
+  content,
+  materialMasks = [],
+  resolveBackgroundBlob,
+  resolveAssetBlob,
+  width,
+  height,
+  maskMode = "none",
+  revealedMaskIds = new Set(),
+  pageNumber = null,
+  signal
+}) {
+  if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(width));
+  canvas.height = Math.max(1, Math.round(height));
+  const context = canvas.getContext("2d", { alpha: false });
+  drawPaper(context, page, canvas.width, canvas.height);
+
+  if (["pdf-source-page", "material-page"].includes(page.background?.type)) {
+    const blob = await resolveBackgroundBlob(page);
+    await drawBlobCover(context, blob, 0, 0, canvas.width, canvas.height);
+  }
+
+  const elements = [...(content.elements || [])].sort((a, b) => Number(a.zIndex || 0) - Number(b.zIndex || 0));
+  for (const element of elements) {
+    if (element.type === "image") {
+      const blob = await resolveAssetBlob(element.assetId, element.assetNoteId);
+      const bounds = element.bounds;
+      await drawBlobCover(context, blob, bounds.x * canvas.width, bounds.y * canvas.height,
+        bounds.width * canvas.width, bounds.height * canvas.height, element.crop, element.rotation, element.opacity);
+    } else if (element.type === "highlighter") {
+      context.save();
+      context.globalAlpha = Number(element.style?.opacity ?? 0.3);
+      context.strokeStyle = element.style?.color || "#fff176";
+      context.lineWidth = Number(element.style?.widthRatio || 0.025) * canvas.width;
+      context.lineCap = "round"; context.lineJoin = "round";
+      canvasPath(context, element.points, canvas.width, canvas.height); context.stroke(); context.restore();
+    } else if (element.type === "stroke") {
+      context.save();
+      context.globalAlpha = Number(element.style?.opacity ?? 1);
+      context.strokeStyle = element.style?.color || "#111111";
+      context.lineWidth = Number(element.style?.widthRatio || 0.0025) * canvas.width;
+      context.lineCap = "round"; context.lineJoin = "round";
+      canvasPath(context, element.points, canvas.width, canvas.height); context.stroke(); context.restore();
+    } else if (element.type === "shape") {
+      drawShape(context, element, canvas.width, canvas.height);
+    } else if (element.type === "text") {
+      drawText(context, element, canvas.width, canvas.height);
+    }
+  }
+
+  const masks = [...materialMasks, ...(content.noteMasks || [])];
+  masks.filter(mask => shouldDrawMask(mask, { maskMode, revealedMaskIds })).forEach(mask => {
+    context.fillStyle = mask.weak ? "#ef4444" : "#111827";
+    context.fillRect(mask.x * canvas.width, mask.y * canvas.height, mask.width * canvas.width, mask.height * canvas.height);
+  });
+  if (pageNumber != null) {
+    const size = Math.max(16, canvas.width * 0.012);
+    context.font = `${size}px sans-serif`;
+    context.textAlign = "right";
+    context.textBaseline = "bottom";
+    context.fillStyle = "rgba(17,24,39,.72)";
+    context.fillText(String(pageNumber), canvas.width - size, canvas.height - size * 0.6);
+  }
+  return canvas;
+}
+
+export async function noteCanvasToJpeg(canvas, quality) {
+  return canvasToVerifiedBlob(canvas, "image/jpeg", quality, "PDF書き出しページ");
+}

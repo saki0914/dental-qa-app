@@ -14,7 +14,10 @@ COPY --from=java-runtime /opt/java/openjdk /opt/java/openjdk
 ENV JAVA_HOME=/opt/java/openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-RUN npm install -g "@openai/codex@${CODEX_VERSION}" "http-server@${HTTP_SERVER_VERSION}" \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends poppler-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g "@openai/codex@${CODEX_VERSION}" "http-server@${HTTP_SERVER_VERSION}" \
     && npm cache clean --force \
     && mkdir -p /home/node/.codex \
     && chown -R node:node /home/node/.codex \

@@ -14,6 +14,7 @@
 - 問題の検索 / 追加 / 更新 / 削除
 - メールアドレス + パスワードでログイン
 - Firestore へのクラウド保存
+- 学習ノート（手書き・画像・暗記マスク・PDF出力）
 
 ## 使い方
 
@@ -50,6 +51,10 @@ Cloud Storage for Firebaseを利用するには、FirebaseプロジェクトのB
 - `js/services/`: Firestoreの読込・書込
 
 画像付き問題の一括登録形式とMac/iPhone/iPadでの運用は、[`docs/QUESTION_IMPORT.md`](docs/QUESTION_IMPORT.md)を参照してください。
+
+ノートから生成するPDFは端末へのダウンロードまたは対応端末の共有シートにだけ渡し、Firebase Storageには保存しません。PDF出力用のpdf-libはリポジトリ内へ固定していますが、PDF取込用のpdf.jsは別ライブラリで、現在は外部CDNから読み込みます。
+
+教材を削除する場合、連携ノートのルート文書も教材データと同じFirestore transactionで論理削除します。復旧と後続クリーンアップのためpages/assetsサブコレクションはその場では削除しません。transactionの書込上限へ近づかないよう一度に扱う連携ノートは100件までとし、超過時は処理を開始せず、ノート一覧で不要な連携ノートを先に削除するよう案内します。
 
 ### 5. 公開する
 GitHub Pages などに `index.html` を置けば使えます。
@@ -131,7 +136,9 @@ npm run test:rules
 npm run test:e2e:authenticated
 ```
 
-Emulatorは実在しない `demo-dental-qa` プロジェクトIDに固定されています。アプリ側の接続切替も `localhost` または `127.0.0.1` で `?firebaseEmulator=1` を指定した場合だけ有効です。手動確認では、別ターミナルで `npm run emulators:start` を起動してから `http://localhost:3000/?firebaseEmulator=1` を開きます。
+Emulatorは実在しない `demo-dental-qa` プロジェクトIDに固定されています。ローカル一式は `npm run local:start` で起動し、`http://localhost:3000/?firebaseEmulator=1` を開きます。初期データ作成、疎通確認、保存データの初期化には、それぞれ `npm run local:seed`、`npm run local:smoke`、`npm run local:reset` を使用できます。
+
+同じLAN上のiPadなどから確認する場合だけ `npm run local:start:lan` を使用します。このモードはHTTPサーバーとFirebase Emulatorを `0.0.0.0` へバインドするため、同一LAN上の他端末からテスト用Auth・Firestore・Storageへ到達できます。信頼できる私用LANでのみ起動し、公共Wi-Fi・共有ネットワークでは使用しないでください。確認後はプロセスを終了し、OSのファイアウォールでポート3000/4000/8080/9099/9199を外部へ公開しないでください。
 
 Firebase CLIのデフォルトプロジェクトも誤操作防止のため `demo-dental-qa` です。本番へルールを反映するときだけ、上記のように `--project production` を明示してください。
 

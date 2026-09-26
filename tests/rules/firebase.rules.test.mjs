@@ -13,8 +13,12 @@ import {
   doc,
   getDoc,
   getDocs,
+  query,
+  serverTimestamp,
   setDoc,
-  updateDoc
+  updateDoc,
+  where,
+  writeBatch
 } from "firebase/firestore";
 import {
   deleteObject,
@@ -27,6 +31,7 @@ import {
 import {
   deleteQuestionImageFiles
 } from "../../js/core/question-image-delete.js";
+import { splitLinkedNoteWrites } from "../../js/core/note-material-mutation.js";
 
 const PROJECT_ID = "demo-dental-qa";
 let testEnv;
@@ -78,6 +83,103 @@ test("Firestoreは本人のusers/{uid}/app配下だけを許可する", async ()
   await assertSucceeds(deleteDoc(ownRef));
 });
 
+test("Firestoreは本人のノート階層だけを許可する", async () => {
+  const aliceDb = testEnv.authenticatedContext("alice").firestore();
+  const bobDb = testEnv.authenticatedContext("bob").firestore();
+  const guestDb = testEnv.unauthenticatedContext().firestore();
+  const noteRef = doc(aliceDb, "users/alice/notes/note-1");
+  const pageRef = doc(aliceDb, "users/alice/notes/note-1/pages/page-1");
+  const assetRef = doc(aliceDb, "users/alice/notes/note-1/assets/asset-1");
+
+  await assertSucceeds(setDoc(noteRef, { title: "ノート", status: "ready" }));
+  await assertSucceeds(setDoc(pageRef, { order: 1, contentRevision: 0 }));
+  await assertSucceeds(setDoc(assetRef, { storagePath: "users/alice/notes/note-1/assets/asset-1/original.png" }));
+  await assertSucceeds(getDoc(pageRef));
+
+  await assertFails(getDoc(doc(bobDb, "users/alice/notes/note-1")));
+  await assertFails(setDoc(doc(bobDb, "users/alice/notes/note-1/pages/page-1"), { denied: true }));
+  await assertFails(setDoc(doc(guestDb, "users/alice/notes/note-1"), { denied: true }));
+});
+
+test("materialRefsで連携ノートを検索し、教材ロック後にbatchで論理削除できる", async () => {
+  const aliceDb = testEnv.authenticatedContext("alice").firestore();
+  const materialRef = doc(aliceDb, "users/alice/app/pdfMaterials");
+  await Promise.all([
+    setDoc(materialRef, { pdfMaterials: [{ id: "material-1", status: "ready" }] }),
+    setDoc(doc(aliceDb, "users/alice/notes/note-linked-1"), {
+      title: "連携ノート1", materialRefs: ["material-1"], deletedAt: null
+    }),
+    setDoc(doc(aliceDb, "users/alice/notes/note-linked-2"), {
+      title: "連携ノート2", materialRefs: ["material-1", "material-2"], deletedAt: null
+    }),
+    setDoc(doc(aliceDb, "users/alice/notes/note-other"), {
+      title: "非連携ノート", materialRefs: ["material-2"], deletedAt: null
+    })
+  ]);
+
+  await assertSucceeds(updateDoc(materialRef, {
+    pdfMaterials: [{ id: "material-1", status: "archiving" }]
+  }));
+  const linked = await assertSucceeds(getDocs(query(
+    collection(aliceDb, "users/alice/notes"),
+    where("materialRefs", "array-contains", "material-1")
+  )));
+  assert.equal(linked.size, 2);
+
+  const batch = writeBatch(aliceDb);
+  linked.docs.forEach(snapshot => batch.update(snapshot.ref, {
+    deletedAt: "logical-delete",
+    deletedReason: "material-deleted"
+  }));
+  await assertSucceeds(batch.commit());
+  await assertSucceeds(updateDoc(materialRef, { pdfMaterials: [] }));
+
+  assert.deepEqual((await getDoc(materialRef)).data()?.pdfMaterials, []);
+  assert.equal((await getDoc(doc(aliceDb, "users/alice/notes/note-linked-1"))).data()?.deletedReason, "material-deleted");
+  assert.equal((await getDoc(doc(aliceDb, "users/alice/notes/note-linked-2"))).data()?.deletedReason, "material-deleted");
+  assert.equal((await getDoc(doc(aliceDb, "users/alice/notes/note-other"))).data()?.deletedAt, null);
+});
+
+test("500件を超える連携ノートを複数batchへ分けて論理削除できる", async () => {
+  const aliceDb = testEnv.authenticatedContext("alice").firestore();
+  const references = Array.from(
+    { length: 501 },
+    (_, index) => doc(aliceDb, "users", "alice", "notes", `note-${String(index).padStart(3, "0")}`)
+  );
+  for (const referenceChunk of splitLinkedNoteWrites(references)) {
+    const seedBatch = writeBatch(aliceDb);
+    referenceChunk.forEach(reference => seedBatch.set(reference, {
+      title: "分割batch検証",
+      materialRefs: ["material-large"],
+      deletedAt: null
+    }));
+    await assertSucceeds(seedBatch.commit());
+  }
+
+  const linked = await assertSucceeds(getDocs(query(
+    collection(aliceDb, "users/alice/notes"),
+    where("materialRefs", "array-contains", "material-large")
+  )));
+  assert.equal(linked.size, 501);
+  const chunks = splitLinkedNoteWrites(linked.docs);
+  assert.deepEqual(chunks.map(chunk => chunk.length), [500, 1]);
+  for (const snapshotChunk of chunks) {
+    const deleteBatch = writeBatch(aliceDb);
+    snapshotChunk.forEach(snapshot => deleteBatch.update(snapshot.ref, {
+      deletedAt: serverTimestamp(),
+      deletedReason: "material-deleted",
+      updatedAt: serverTimestamp()
+    }));
+    await assertSucceeds(deleteBatch.commit());
+  }
+
+  const deleted = await getDocs(query(
+    collection(aliceDb, "users/alice/notes"),
+    where("materialRefs", "array-contains", "material-large")
+  ));
+  assert.equal(deleted.docs.filter(snapshot => snapshot.data().deletedReason === "material-deleted").length, 501);
+});
+
 test("Storageは本人のusers/{uid}配下だけを許可する", async () => {
   const bytes = new Uint8Array([137, 80, 78, 71]);
   const aliceStorage = testEnv.authenticatedContext("alice").storage();
@@ -98,6 +200,63 @@ test("Storageは本人のusers/{uid}配下だけを許可する", async () => {
   await assertFails(uploadBytes(ref(guestStorage, ownPath), bytes));
   await assertFails(uploadBytes(ref(aliceStorage, "public/page-1.png"), bytes));
   await assertSucceeds(deleteObject(ref(aliceStorage, ownPath)));
+});
+
+test("Storageのノート画像パスは画像だけを許可する", async () => {
+  const bytes = new Uint8Array([137, 80, 78, 71]);
+  const oversizedBytes = new Uint8Array(20 * 1024 * 1024 + 1);
+  const aliceStorage = testEnv.authenticatedContext("alice").storage();
+  const bobStorage = testEnv.authenticatedContext("bob").storage();
+  const guestStorage = testEnv.unauthenticatedContext().storage();
+  const assetPath = "users/alice/notes/note-1/assets/asset-1/original.png";
+  const sourcePath = "users/alice/notes/note-1/sourcePages/page-1/background.jpg";
+
+  await assertSucceeds(uploadBytes(ref(aliceStorage, assetPath), bytes, { contentType: "image/png" }));
+  await assertSucceeds(uploadBytes(ref(aliceStorage, sourcePath), bytes, { contentType: "image/jpeg" }));
+  await assertFails(uploadBytes(ref(aliceStorage, `${assetPath}.empty`), new Uint8Array(), {
+    contentType: "image/png"
+  }));
+  await assertFails(uploadBytes(ref(aliceStorage, `${assetPath}.json`), bytes, { contentType: "application/json" }));
+  await assertFails(uploadBytes(ref(aliceStorage, `${sourcePath}.json`), bytes, { contentType: "application/json" }));
+  await assertFails(uploadBytes(ref(aliceStorage, `${assetPath}.large`), oversizedBytes, {
+    contentType: "image/png"
+  }));
+  await assertFails(uploadBytes(ref(aliceStorage, `${sourcePath}.large`), oversizedBytes, {
+    contentType: "image/png"
+  }));
+  await assertFails(uploadBytes(ref(bobStorage, assetPath), bytes, { contentType: "image/png" }));
+  await assertFails(uploadBytes(ref(guestStorage, assetPath), bytes, { contentType: "image/png" }));
+  await assertSucceeds(getBytes(ref(aliceStorage, assetPath)));
+  await assertFails(getBytes(ref(bobStorage, assetPath)));
+});
+
+test("Storageのノートページリビジョンは小さいJSONだけを許可する", async () => {
+  const aliceStorage = testEnv.authenticatedContext("alice").storage();
+  const jsonPath = "users/alice/notes/note-1/pages/page-1/revisions/save-1.json";
+  const jsonBytes = new TextEncoder().encode("{}");
+
+  await assertSucceeds(uploadBytes(ref(aliceStorage, jsonPath), jsonBytes, {
+    contentType: "application/json"
+  }));
+  await assertFails(uploadBytes(ref(aliceStorage, `${jsonPath}.empty`), new Uint8Array(), {
+    contentType: "application/json"
+  }));
+  await assertFails(uploadBytes(ref(aliceStorage, `${jsonPath}.png`), jsonBytes, {
+    contentType: "image/png"
+  }));
+  await assertFails(uploadBytes(ref(aliceStorage, `${jsonPath}.large`), new Uint8Array(2 * 1024 * 1024 + 1), {
+    contentType: "application/json"
+  }));
+  await assertFails(uploadBytes(
+    ref(aliceStorage, "users/alice/notes/note-1/unexpected/file.json"),
+    jsonBytes,
+    { contentType: "application/json" }
+  ));
+  await assertFails(uploadBytes(
+    ref(aliceStorage, "users/alice/notes/note-1/exports/note.pdf"),
+    new TextEncoder().encode("%PDF-1.7"),
+    { contentType: "application/pdf" }
+  ));
 });
 
 test("問題画像一括削除は本人のquestions配下をStorageから削除する", async () => {

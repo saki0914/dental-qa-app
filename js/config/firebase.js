@@ -7,7 +7,8 @@ import {
 } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-auth.js";
 import {
   connectFirestoreEmulator,
-  getFirestore
+  getFirestore,
+  initializeFirestore
 } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
 import {
   connectStorageEmulator,
@@ -35,9 +36,29 @@ const EMULATOR_FIREBASE_CONFIG = {
 };
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
+function isPrivateIpv4(hostname) {
+  const parts = String(hostname || "").split(".").map(Number);
+  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+  return parts[0] === 10 ||
+    (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+    (parts[0] === 192 && parts[1] === 168);
+}
+
+function getRequestedEmulatorHost(location) {
+  const requested = new URLSearchParams(location?.search || "").get("emulatorHost") || "";
+  if (!requested) return LOCAL_HOSTS.has(location?.hostname) ? "127.0.0.1" : "";
+  if (LOCAL_HOSTS.has(requested) || isPrivateIpv4(requested)) return requested;
+  return "";
+}
+
 export function isFirebaseEmulatorEnabled(location = globalThis.location) {
-  if (!location || !LOCAL_HOSTS.has(location.hostname)) return false;
-  return new URLSearchParams(location.search).get("firebaseEmulator") === "1";
+  if (!location) return false;
+  const requested = new URLSearchParams(location.search).get("firebaseEmulator") === "1";
+  if (!requested) return false;
+  return LOCAL_HOSTS.has(location.hostname) ||
+    (isPrivateIpv4(location.hostname) && getRequestedEmulatorHost(location) === location.hostname);
 }
 
 export function initializeFirebaseServices(location = globalThis.location) {
@@ -48,14 +69,18 @@ export function initializeFirebaseServices(location = globalThis.location) {
   const auth = initializeAuth(app, {
     persistence: [indexedDBLocalPersistence, browserLocalPersistence]
   });
-  const db = getFirestore(app);
+  const db = useEmulators
+    ? initializeFirestore(app, { experimentalForceLongPolling: true })
+    : getFirestore(app);
   const storage = getStorage(app);
 
   if (useEmulators) {
-    connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
-    connectFirestoreEmulator(db, "127.0.0.1", 8080);
-    connectStorageEmulator(storage, "127.0.0.1", 9199);
+    const emulatorHost = getRequestedEmulatorHost(location);
+    connectAuthEmulator(auth, `http://${emulatorHost}:9099`, { disableWarnings: true });
+    connectFirestoreEmulator(db, emulatorHost, 8080);
+    connectStorageEmulator(storage, emulatorHost, 9199);
+    return { app, auth, db, storage, useEmulators, emulatorHost };
   }
 
-  return { app, auth, db, storage, useEmulators };
+  return { app, auth, db, storage, useEmulators, emulatorHost: "" };
 }

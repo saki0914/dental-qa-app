@@ -35,6 +35,8 @@ npm run test:all
 
 `npm run test:e2e`はPlaywrightの`webServer`設定により、テスト前に既存の`npm run dev`を起動します。CI以外では既存の`http://127.0.0.1:3000`サーバーを再利用できます。`npm run test:e2e:authenticated`はFirebase Local Emulator Suite上でテストユーザーを作成し、FirestoreとStorageへの保存を検証します。本番Firebaseは使用しません。
 
+`npm run local:start:lan`は実機確認専用です。Emulatorを全ネットワークインターフェースへ公開するため、信頼できる私用LAN以外では実行しないでください。公共Wi-Fiでは使用せず、確認後は必ず終了してください。
+
 ## 現在の自動テスト範囲
 
 - 未ログイン状態
@@ -52,12 +54,22 @@ npm run test:all
 - Firebase Emulator上での画像教材アップロード・更新・削除とマスク操作
 - 実行時に生成した複数ページPDFの画像変換、Firestore・Storageへの永続化
 - PDF変換後の中間アップロード失敗時に、先行して保存したページ画像を削除すること
+- 白紙・横罫線・PDFノートの作成とページ順
+- ペン、画像、ノート専用マスクのページ単位保存と再読込
+- 画像Storage失敗時のIndexedDB保持と再読込後の再送
+- ページ追加・並び替え・削除時の`orderRevision`競合検出と再試行
+- ノートPDFの生成、ダウンロード、0バイト防止、ページ数
+- PDFノートが既存`pdfMaterials`へ追加されないこと
+- 教材から既定ノートを繰り返し開いても重複作成しないこと
+- ノート用Firestore・Storageの所有者、サイズ、MIMEルール
+- 教材を`archiving`状態へ先にロックし、`materialRefs`で取得した連携ノートを最大500件ずつ論理削除してから教材更新・削除を確定すること
+- `archiving`中の教材から新しい連携ノートを作成できないこと
+- ノートPDFは端末へのダウンロード・共有だけを行い、StorageへのPDFアップロードを許可しないこと
 
 未ログインE2Eは管理操作を行わず、認証付きE2Eは`demo-dental-qa`のFirebase Emulatorだけを使用します。どちらもFirebase本番データへの書き込み・更新・削除は行いません。
 
 ## 現在の対象外
 
-- ピンチズーム
 - 本番環境の実ユーザーでのログイン・新規登録
 - 本番Firestore・Storageへの書き込み
 - PDF取込（pdf.js）に使う外部CDNが停止・遮断された場合の代替経路
@@ -65,6 +77,10 @@ npm run test:all
 - ソフトウェアキーボード
 - iPhone・iPad実機固有の操作
 - ピクセル単位のスクリーンショット比較
+- iPadのプレビューアプリからの実クリップボード画像
+- Web Share APIの実共有シート
+
+ノートPDFの出力に使うpdf-libは`vendor/pdf-lib/`からローカル読込します。一方、PDF取込とページ画像化に使うpdf.jsは引き続き外部CDN依存で、両者は別の処理経路です。生成したPDFはブラウザ内で作成し、ダウンロードまたはWeb Share APIへ渡すだけで、Firebase Storageへ保存しません。
 
 認証付きテストはFirebase Local Emulator Suite内で完結させ、本番Firebaseへの接続試行もテスト中に遮断・検出します。
 
@@ -77,7 +93,7 @@ npm run test:all
 - マスクのドラッグ
 - ソフトウェアキーボード表示時
 - 画面回転
-- GitHub Pages公開後
+- 本番公開後
 
 Playwrightの端末エミュレーションは実機確認の代わりにはなりません。特にiPhone/iPadのSafari、タッチ、ピンチズーム、ソフトウェアキーボード、画面回転は実機で確認してください。
 
@@ -92,7 +108,7 @@ Playwrightの端末エミュレーションは実機確認の代わりにはな�
 
 ## セレクター方針
 
-`index.html`は変更せず、既存DOMだけを使います。優先順位は次の通りです。
+UI変更時も安定したセレクターを付与します。優先順位は次の通りです。
 
 1. 既存の`id`
 2. roleとaccessible name

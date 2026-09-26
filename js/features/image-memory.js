@@ -22,7 +22,19 @@ import {
 } from "../core/image-memory-filters.js";
 import { moveImageMemoryFile } from "../core/image-memory-file-order.js";
 import { assertNonEmptyBlob } from "../core/file-validator.js";
+import {
+  isMaterialArchiving,
+  markMaterialArchiving,
+  markMaterialReady
+} from "../core/note-material-mutation.js";
 import { convertPdfToImageFiles } from "../core/pdf-converter.js";
+import {
+  captureElementZoomAnchor,
+  clampPageZoom,
+  getTwoPointCenter,
+  getTwoPointDistance,
+  restoreElementZoomAnchor
+} from "../core/page-zoom-controller.js";
 
 export function createImageMemory(dependencies) {
   const {
@@ -31,7 +43,14 @@ export function createImageMemory(dependencies) {
     getStorage,
     getQuestionSubjects = () => [],
     requestAutoSave,
-    requestSave
+    requestSave,
+    onViewModeChange = () => {},
+    onOpenMaterialNote = null,
+    confirmMaterialReplacement = null,
+    finalizeMaterialReplacement = null,
+    confirmMaterialDeletion = null,
+    archiveMaterialLinkedNotes = null,
+    finalizeMaterialDeletion = null
   } = dependencies;
 
   let pdfMaterials = [];
@@ -200,6 +219,7 @@ function renderPdfViewMode() {
 function setPdfViewMode(mode, { save = true } = {}) {
   pdfViewMode = mode === "edit" ? "edit" : "study";
   renderPdfViewMode();
+  onViewModeChange(pdfViewMode);
   if (pdfViewMode === "edit") {
     fillPdfEditorForm(currentEditingPdfMaterial());
     renderPdfEditPreview();
@@ -339,7 +359,7 @@ function renderPdfTable() {
           const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
           const revealed = masks.filter(mask => revealMap[mask.id]).length;
           const fileLabel = pages.length ? `${pages.length}枚` : (pdf.pdfName || "旧PDF");
-          const detail = [pdf.subject, ...pdf.categories].filter(Boolean).join(" / ");
+          const detail = [pdf.subject, ...pdf.categories, isMaterialArchiving(pdf) ? "差し替え・削除処理中" : ""].filter(Boolean).join(" / ");
           return `
             <tr class="${selectedPdfId === pdf.id ? "selected" : ""}" data-pdf-id="${escapeHtml(pdf.id)}">
               <td>${escapeHtml(pdf.title || "無題教材")}<div class="pdf-material-meta">${escapeHtml(detail)}</div></td>
@@ -359,6 +379,7 @@ function renderPdfTable() {
           const pages = Array.isArray(pdf.pages) ? pdf.pages : [];
           const isEditing = editingPdfId === pdf.id;
           const checked = pdfDeleteSelectedIds.includes(pdf.id);
+          const archiving = isMaterialArchiving(pdf);
           return `
             <tr class="${isEditing ? "pdf-editing-row" : ""}" data-edit-pdf-row="${escapeHtml(pdf.id)}">
               <td>
@@ -380,14 +401,15 @@ function renderPdfTable() {
                   ${isEditing ? "更新対象" : "編集"}
                 </button>
               </td>
-              <td>${escapeHtml(pdf.title || "無題教材")}</td>
+              <td>${escapeHtml(pdf.title || "無題教材")}${archiving ? '<div class="pdf-material-meta">差し替え・削除処理中</div>' : ""}</td>
               <td>${escapeHtml(pdf.subject)}</td>
               <td>${escapeHtml(pdf.categories.join(" / ") || "未登録")}</td>
               <td>${pages.length ? `${pages.length}枚` : "旧PDF"}</td>
+              <td><button type="button" class="btn soft" data-open-note="${escapeHtml(pdf.id)}" ${archiving ? "disabled" : ""}>ノートで開く</button></td>
             </tr>
           `;
         }).join("")
-      : '<tr><td colspan="6">画像教材がありません。</td></tr>';
+      : '<tr><td colspan="7">画像教材がありません。</td></tr>';
   }
 
   [...(el.pdfTableBody?.querySelectorAll("tr[data-pdf-id]") || [])].forEach(row => {
@@ -401,9 +423,19 @@ function renderPdfTable() {
     });
   });
 
+  [...(el.pdfEditTableBody?.querySelectorAll("[data-open-note]") || [])].forEach(button => {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      Promise.resolve(onOpenMaterialNote?.(button.dataset.openNote)).catch(error => {
+        console.error(error);
+        alert("教材連携ノートを開けませんでした。\n" + (error?.message || error));
+      });
+    });
+  });
+
   [...(el.pdfEditTableBody?.querySelectorAll("[data-edit-pdf-row]") || [])].forEach(row => {
     row.addEventListener("click", event => {
-      if (event.target.closest("[data-delete-pdf], [data-edit-pdf]")) return;
+      if (event.target.closest("[data-delete-pdf], [data-edit-pdf], [data-open-note]")) return;
       selectPdfMaterialForEdit(row.dataset.editPdfRow);
     });
   });
@@ -752,6 +784,7 @@ async function addPdfMaterial() {
       ...metadata,
       ...uploadResult,
       masks: [],
+      status: "ready"
     }));
     added = true;
 
@@ -806,24 +839,39 @@ async function updatePdfMaterial() {
     `画像を差し替えると、位置が合わなくなるため${masks.length}件の隠し範囲を削除します。\n\n画像を差し替えますか？`
   )) return;
 
-  const previous = {
-    title: pdf.title,
-    subject: pdf.subject,
-    categories: pdf.categories,
-    tags: pdf.tags,
-    pages: pdf.pages,
-    masks: pdf.masks,
-    sourceType: pdf.sourceType,
-    sourceName: pdf.sourceName,
-    pdfUrl: pdf.pdfUrl,
-    pdfName: pdf.pdfName,
-    revealState: pdfRevealStates[pdf.id]
-  };
+  const previous = structuredClone(pdf);
+  const previousRevealState = structuredClone(pdfRevealStates[pdf.id] || {});
   let uploadResult = null;
+  let replacementDecision = null;
+  let lockedState = null;
 
   try {
     uploadResult = await prepareAndUploadPdfPages(pdf.id, selectedFiles);
+    if (confirmMaterialReplacement) {
+      replacementDecision = await confirmMaterialReplacement(pdf, uploadResult.pages.length);
+      if (!replacementDecision?.allowed) {
+        await Promise.all(uploadResult.pages.map(page => deletePdfFileByPath(page.imagePath)));
+        uploadResult = null;
+        setPdfEditStatus("教材の差し替えをキャンセルしました。");
+        return;
+      }
+    }
+    markMaterialArchiving(pdf, "replacement");
+    renderPdfTable();
+    setPdfEditStatus("教材をロックし、連携ノートを確認しています...");
+    const locked = await requestSave({ showAlerts: true });
+    if (!locked) throw new Error("教材を差し替え処理中として保存できませんでした。");
+    lockedState = {
+      status: pdf.status,
+      archivingOperation: pdf.archivingOperation,
+      archivingStartedAt: pdf.archivingStartedAt
+    };
+    if (replacementDecision?.reset) {
+      if (!archiveMaterialLinkedNotes) throw new Error("連携ノートの削除サービスを利用できません。");
+      await archiveMaterialLinkedNotes(replacementDecision, "replacement");
+    }
     Object.assign(pdf, metadata, uploadResult, { masks: [], pdfUrl: "", pdfName: "" });
+    markMaterialReady(pdf);
     pdfRevealStates[pdf.id] = {};
     selectedMaskId = null;
     selectedMaskIds = [];
@@ -833,23 +881,14 @@ async function updatePdfMaterial() {
 
     const saved = await requestSave({ showAlerts: true });
     if (!saved) throw new Error("更新した教材データをクラウド保存できませんでした。");
+    await finalizeMaterialReplacement?.(replacementDecision);
     await Promise.all((previous.pages || []).map(page => deletePdfFileByPath(getPdfPageImagePath(page))));
     resetPendingPdfFiles();
     setPdfEditStatus("教材情報と画像を更新しました。隠し範囲は初期化されています。");
   } catch (error) {
-    Object.assign(pdf, {
-      title: previous.title,
-      subject: previous.subject,
-      categories: previous.categories,
-      tags: previous.tags,
-      pages: previous.pages,
-      masks: previous.masks,
-      sourceType: previous.sourceType,
-      sourceName: previous.sourceName,
-      pdfUrl: previous.pdfUrl,
-      pdfName: previous.pdfName
-    });
-    pdfRevealStates[pdf.id] = previous.revealState || {};
+    Object.keys(pdf).forEach(key => delete pdf[key]);
+    Object.assign(pdf, previous, lockedState || {});
+    pdfRevealStates[pdf.id] = previousRevealState;
     if (uploadResult?.pages?.length) {
       await Promise.all(uploadResult.pages.map(page => deletePdfFileByPath(page.imagePath)));
     }
@@ -857,7 +896,8 @@ async function updatePdfMaterial() {
     renderPdfMaskTable();
     renderPdfEditPreview();
     console.error(error);
-    setPdfEditStatus("教材更新に失敗しました。\n" + (error.message || error));
+    const lockMessage = lockedState ? "\n教材は安全のため差し替え・削除処理中のままです。再実行してください。" : "";
+    setPdfEditStatus("教材更新に失敗しました。\n" + (error.message || error) + lockMessage);
     alert("教材更新に失敗しました。\n\n" + (error.message || error));
   }
 }
@@ -883,40 +923,61 @@ async function deleteCheckedPdfMaterials() {
     `削除対象:\n${preview}${extra}`
   );
   if (!ok) return;
+  const deletionDecision = confirmMaterialDeletion
+    ? await confirmMaterialDeletion(targets)
+    : { allowed: true, materialIds: targets.map(material => material.id) };
+  if (!deletionDecision?.allowed) return;
 
-  const previousMaterials = pdfMaterials;
-  const previousRevealStates = pdfRevealStates;
+  const previousMaterials = structuredClone(pdfMaterials);
+  const previousRevealStates = structuredClone(pdfRevealStates);
   const previousSelectedPdfId = selectedPdfId;
   const idSet = new Set(ids);
-  pdfMaterials = pdfMaterials.filter(pdf => !idSet.has(pdf.id));
-  pdfRevealStates = Object.fromEntries(
-    Object.entries(pdfRevealStates).filter(([pdfId]) => !idSet.has(pdfId))
-  );
-  pdfDeleteSelectedIds = [];
-
-  if (selectedPdfId && idSet.has(selectedPdfId)) {
-    selectedPdfId = pdfMaterials[0]?.id || null;
-  }
-
-  selectedMaskId = null;
-  selectedMaskIds = [];
-
-  renderPdfTable();
-  renderPdfMaskTable();
-  renderPdfViewer();
-  renderPdfEditPreview();
-  setPdfEditStatus(`${targets.length}件の画像教材を削除しています...`);
+  let lockedStates = null;
 
   try {
+    targets.forEach(material => markMaterialArchiving(material, "deletion"));
+    renderPdfTable();
+    setPdfEditStatus(`${targets.length}件の教材をロックし、連携ノートを確認しています...`);
+    const locked = await requestSave({ showAlerts: true });
+    if (!locked) throw new Error("教材を削除処理中として保存できませんでした。");
+    lockedStates = new Map(targets.map(material => [material.id, {
+      status: material.status,
+      archivingOperation: material.archivingOperation,
+      archivingStartedAt: material.archivingStartedAt
+    }]));
+    if (!archiveMaterialLinkedNotes) throw new Error("連携ノートの削除サービスを利用できません。");
+    await archiveMaterialLinkedNotes(deletionDecision, "deletion");
+
+    pdfMaterials = pdfMaterials.filter(pdf => !idSet.has(pdf.id));
+    pdfRevealStates = Object.fromEntries(
+      Object.entries(pdfRevealStates).filter(([pdfId]) => !idSet.has(pdfId))
+    );
+    pdfDeleteSelectedIds = [];
+    if (selectedPdfId && idSet.has(selectedPdfId)) selectedPdfId = pdfMaterials[0]?.id || null;
+    selectedMaskId = null;
+    selectedMaskIds = [];
+    renderPdfTable();
+    renderPdfMaskTable();
+    renderPdfViewer();
+    renderPdfEditPreview();
+    setPdfEditStatus(`${targets.length}件の画像教材を削除しています...`);
+
     const saved = await requestSave({
       allowEmptyPdfMaterials: true,
       showAlerts: true
     });
     if (!saved) throw new Error("削除後の教材データをクラウド保存できませんでした。");
+    await finalizeMaterialDeletion?.(deletionDecision);
     await Promise.all(targets.map(deletePdfStorageFiles));
     setPdfEditStatus(`${targets.length}件の画像教材を削除しました。`);
   } catch (error) {
     pdfMaterials = previousMaterials;
+    if (lockedStates) {
+      pdfMaterials.forEach(material => {
+        const lockedState = lockedStates.get(material.id);
+        if (lockedState) Object.assign(material, lockedState);
+      });
+    }
     pdfRevealStates = previousRevealStates;
     selectedPdfId = previousSelectedPdfId;
     pdfDeleteSelectedIds = ids;
@@ -925,7 +986,8 @@ async function deleteCheckedPdfMaterials() {
     renderPdfViewer();
     renderPdfEditPreview();
     console.error(error);
-    setPdfEditStatus("教材削除に失敗しました。\n" + (error.message || error));
+    const lockMessage = lockedStates ? "\n教材は安全のため差し替え・削除処理中のままです。再実行してください。" : "";
+    setPdfEditStatus("教材削除に失敗しました。\n" + (error.message || error) + lockMessage);
     alert("教材削除に失敗しました。\n\n" + (error.message || error));
   }
 }
@@ -1084,20 +1146,15 @@ function resetPdfRevealState() {
 
 
 function clampPdfZoom(value) {
-  return Math.min(5, Math.max(0.8, value));
+  return clampPageZoom(value);
 }
 
 function getTouchDistance(touches) {
-  const dx = touches[0].clientX - touches[1].clientX;
-  const dy = touches[0].clientY - touches[1].clientY;
-  return Math.hypot(dx, dy);
+  return getTwoPointDistance(touches);
 }
 
 function getTouchCenter(touches) {
-  return {
-    x: (touches[0].clientX + touches[1].clientX) / 2,
-    y: (touches[0].clientY + touches[1].clientY) / 2
-  };
+  return getTwoPointCenter(touches);
 }
 
 function applyPdfZoom() {
@@ -1123,38 +1180,21 @@ function getViewerCenter() {
 }
 
 function capturePdfZoomAnchor(clientX, clientY) {
-  if (!el.pdfViewerArea) return null;
-  let pageWrap = document.elementFromPoint(clientX, clientY)?.closest?.(".pdf-page-wrap");
-  if (!pageWrap || !el.pdfViewerArea.contains(pageWrap)) {
-    const pages = [...el.pdfViewerArea.querySelectorAll(".pdf-page-wrap")];
-    pageWrap = pages.find(page => {
-      const rect = page.getBoundingClientRect();
-      return clientY >= rect.top && clientY <= rect.bottom;
-    }) || pages[0];
-  }
-  if (!pageWrap) return null;
-
-  const rect = pageWrap.getBoundingClientRect();
-  return {
-    pageNumber: pageWrap.dataset.page,
-    xRatio: Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)),
-    yRatio: Math.min(1, Math.max(0, (clientY - rect.top) / rect.height))
-  };
+  const anchor = captureElementZoomAnchor(el.pdfViewerArea, clientX, clientY, ".pdf-page-wrap", "page");
+  return anchor ? { ...anchor, pageNumber: anchor.elementKey } : null;
 }
 
 function restorePdfZoomAnchor(anchor, clientX, clientY) {
-  if (!anchor || !el.pdfViewerArea) return;
-  const pageWrap = el.pdfViewerArea.querySelector(`.pdf-page-wrap[data-page="${anchor.pageNumber}"]`);
-  if (!pageWrap) return;
-  const rect = pageWrap.getBoundingClientRect();
-  const anchoredClientX = rect.left + rect.width * anchor.xRatio;
-  const anchoredClientY = rect.top + rect.height * anchor.yRatio;
-  el.pdfViewerArea.scrollLeft += anchoredClientX - clientX;
-  el.pdfViewerArea.scrollTop += anchoredClientY - clientY;
-
-  const adjustedRect = pageWrap.getBoundingClientRect();
-  const residualY = adjustedRect.top + adjustedRect.height * anchor.yRatio - clientY;
-  if (Math.abs(residualY) > 0.5) window.scrollBy(0, residualY);
+  if (!anchor) return;
+  restoreElementZoomAnchor(
+    el.pdfViewerArea,
+    { ...anchor, elementKey: anchor.pageNumber },
+    clientX,
+    clientY,
+    ".pdf-page-wrap",
+    "page",
+    residualY => { if (Math.abs(residualY) > 0.5) window.scrollBy(0, residualY); }
+  );
 }
 
 function zoomPdfAt(nextZoom, clientX, clientY, anchor = null) {
@@ -1936,6 +1976,8 @@ function renderPdfViewer(preserveScroll = false) {
     renderMasks: renderPdfMaskTable,
     renderEditor: renderPdfEditPreview,
     renderViewer: renderPdfViewer,
-    serialize
+    serialize,
+    getMaterials: () => pdfMaterials.map(pdf => normalizeImageMaterial(pdf)),
+    setViewMode: setPdfViewMode
   };
 }

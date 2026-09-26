@@ -31,6 +31,7 @@ import {
 } from "./core/study-filters.js";
 import { createImageMemory } from "./features/image-memory.js";
 import { createQuestionManager } from "./features/question-manager.js";
+import { createStudyNotes } from "./features/study-notes.js";
 import {
   CloudSaveConflictError,
   readCloudState,
@@ -56,6 +57,7 @@ let auth = null;
 let db = null;
 let storage = null;
 let currentUser = null;
+let useFirebaseEmulators = false;
 
 let allQuestions = [];
 let filteredQuestions = [];
@@ -137,6 +139,9 @@ const el = {
   progressLockBanner: document.getElementById("progressLockBanner"),
   pdfLockBanner: document.getElementById("pdfLockBanner"),
   tabBtnPdf: document.getElementById("tabBtnPdf"),
+  noteModeBtn: document.getElementById("noteModeBtn"),
+  noteView: document.getElementById("noteView"),
+  localEnvironmentBanner: document.getElementById("localEnvironmentBanner"),
   pdfStudyModeBtn: document.getElementById("pdfStudyModeBtn"),
   pdfEditModeBtn: document.getElementById("pdfEditModeBtn"),
   pdfStudyView: document.getElementById("pdfStudyView"),
@@ -290,13 +295,44 @@ const questionManager = createQuestionManager({
   requestSave: options => saveToCloud(options)
 });
 
+let studyNotes = null;
+
+function setCombinedImageNoteMode(mode) {
+  const normalized = ["note", "study", "edit"].includes(mode) ? mode : "note";
+  el.noteView?.classList.toggle("hidden", normalized !== "note");
+  el.pdfStudyView?.classList.toggle("hidden", normalized !== "study");
+  el.pdfEditView?.classList.toggle("hidden", normalized !== "edit");
+  [[el.noteModeBtn, "note"], [el.pdfStudyModeBtn, "study"], [el.pdfEditModeBtn, "edit"]].forEach(([button, value]) => {
+    button?.classList.toggle("active", normalized === value);
+    button?.setAttribute("aria-pressed", String(normalized === value));
+  });
+}
+
 const imageMemory = createImageMemory({
   el,
   getCurrentUser: () => isInteractionReady() ? currentUser : null,
   getStorage: () => storage,
   getQuestionSubjects: () => getStudySubjects(allQuestions),
   requestAutoSave: options => autoSaveToCloud(options),
-  requestSave: options => saveToCloud(options)
+  requestSave: options => saveToCloud(options),
+  onViewModeChange: mode => setCombinedImageNoteMode(mode),
+  onOpenMaterialNote: materialId => studyNotes?.openMaterialNote(materialId),
+  confirmMaterialReplacement: (material, pageCount) => studyNotes?.confirmMaterialReplacement(material, pageCount),
+  finalizeMaterialReplacement: decision => studyNotes?.finalizeMaterialReplacement(decision),
+  confirmMaterialDeletion: materials => studyNotes?.confirmMaterialDeletion(materials),
+  archiveMaterialLinkedNotes: (decision, operation) => studyNotes?.archiveMaterialLinkedNotes(decision, operation),
+  finalizeMaterialDeletion: decision => studyNotes?.finalizeMaterialDeletion(decision)
+});
+
+studyNotes = createStudyNotes({
+  getCurrentUser: () => isInteractionReady() ? currentUser : null,
+  getDb: () => db,
+  getStorage: () => storage,
+  getMaterials: () => imageMemory.getMaterials(),
+  activateSection: mode => {
+    setCombinedImageNoteMode(mode);
+    if (mode === "note") void studyNotes.refresh();
+  }
 });
 
 function renderManageTable() { questionManager.render(); }
@@ -1175,6 +1211,7 @@ function applyState(state) {
     renderPdfTable();
     renderPdfMaskTable();
     renderPdfViewer();
+    setCombinedImageNoteMode("note");
     if (el.studyFilterMigrationNotice) {
       el.studyFilterMigrationNotice.classList.toggle("hidden", !migratedLegacyStudyFilters);
       el.studyFilterMigrationNotice.textContent = migratedLegacyStudyFilters
@@ -1245,7 +1282,7 @@ function updateLoginLockedUI() {
     "editSubject","searchInput","editQuestion","editAnswers","editExplanation","editOrderedAnswers","editImageFile","removeImageBtn","editImageName",
     "addBtn","updateBtn","deleteBtn","clearFormBtn","bulkImportFile","bulkImportImageFiles","bulkImportValidateBtn","bulkImportExecuteBtn","bulkImportResetBtn",
     "resetProgressBtn",
-    "pdfStudyModeBtn","pdfEditModeBtn","pdfSearchInput","pdfSubjectFilterSelect","pdfCategoryFilterSelect","pdfFullscreenBtn",
+    "noteModeBtn","newNoteBtn","pdfStudyModeBtn","pdfEditModeBtn","pdfSearchInput","pdfSubjectFilterSelect","pdfCategoryFilterSelect","pdfFullscreenBtn",
     "pdfTitleInput","pdfSubjectInput","pdfCategoryInput","pdfFileInput","addPdfBtn","updatePdfBtn","clearPdfEditorBtn",
     "pdfSelectAllDeleteBtn","pdfClearDeleteSelectionBtn","pdfDeleteCheckedBtn",
     "maskPageInput","maskXInput","maskYInput","maskWInput","maskHInput",
@@ -1274,7 +1311,8 @@ function clearLocalState() {
 async function initFirebase() {
   try {
     el.cloudStatus.textContent = "Firebase初期化中です...";
-    ({ app, auth, db, storage } = initializeFirebaseServices());
+    ({ app, auth, db, storage, useEmulators: useFirebaseEmulators } = initializeFirebaseServices());
+    el.localEnvironmentBanner?.classList.toggle("hidden", !useFirebaseEmulators);
     el.cloudStatus.textContent = "Firebase初期化完了です。ログイン状態を確認しています...";
 
     onAuthStateChanged(auth, async user => {
@@ -1282,6 +1320,7 @@ async function initFirebase() {
       saveCoordinator.setSession(null);
       activeSyncSession = null;
       currentUser = user || null;
+      studyNotes.resetForUserChange();
       clearLocalState();
 
       if (!user) {
@@ -1327,6 +1366,7 @@ async function initFirebase() {
           : "Firebase接続済みです。クラウド保存データがないため、空の初期状態を表示しています。";
         updateLoginLockedUI();
         showTab("study");
+        void studyNotes.refresh();
       } catch (error) {
         if (!isSyncSessionCurrent(session)) return;
         console.error(error);
@@ -1370,6 +1410,14 @@ async function signInUser() {
 async function signOutUser() {
   if (!auth) return;
   const session = activeSyncSession;
+
+  if (currentUser) {
+    const noteResults = await studyNotes.flush();
+    if (noteResults.some(result => result instanceof Error)) {
+      const proceed = confirm("ノートのクラウド保存が完了していません。端末内下書きは保持されています。ログアウトしますか？");
+      if (!proceed) return;
+    }
+  }
 
   if (session && saveCoordinator.isDirty(session)) {
     el.cloudStatus.textContent = "未保存の変更を保存してからログアウトします...";
@@ -1578,7 +1626,10 @@ function autoSaveToCloud(options = {}) {
 }
 
 document.querySelectorAll(".tab").forEach(tab => {
-  tab.addEventListener("click", () => showTab(tab.dataset.tab));
+  tab.addEventListener("click", () => {
+    showTab(tab.dataset.tab);
+    if (tab.dataset.tab === "pdf") setCombinedImageNoteMode("study");
+  });
 });
 
 window.addEventListener("scroll", updateFloatingStudyActions, { passive: true });
