@@ -24,13 +24,16 @@ Dev Containerを再構築した後は、`postCreateCommand`が完了している
 
 ```bash
 npm run check
+npm run test:unit
+npm run test:rules
 npm run test:e2e
+npm run test:e2e:authenticated
 npm run test:e2e:headed
 npm run test:e2e:report
 npm run test:all
 ```
 
-`npm run test:e2e`はPlaywrightの`webServer`設定により、テスト前に既存の`npm run dev`を起動します。CI以外では既存の`http://127.0.0.1:3000`サーバーを再利用できます。
+`npm run test:e2e`はPlaywrightの`webServer`設定により、テスト前に既存の`npm run dev`を起動します。CI以外では既存の`http://127.0.0.1:3000`サーバーを再利用できます。`npm run test:e2e:authenticated`はFirebase Local Emulator Suite上でテストユーザーを作成し、FirestoreとStorageへの保存を検証します。本番Firebaseは使用しません。
 
 ## 現在の自動テスト範囲
 
@@ -45,29 +48,25 @@ npm run test:all
 - JavaScriptの`pageerror`
 - `console.error`の収集と失敗扱い
 - Firebaseへの危険な書き込み系通信が発生していないこと
+- Firebase Emulator上でのログイン後の問題CRUD、一括登録・削除、進捗保存
+- Firebase Emulator上での画像教材アップロード・更新・削除とマスク操作
+- 実行時に生成した複数ページPDFの画像変換、Firestore・Storageへの永続化
+- PDF変換後の中間アップロード失敗時に、先行して保存したページ画像を削除すること
 
-テストはログインせず、管理操作をクリックせず、Firebase本番データへ書き込み・更新・削除を行わない前提です。
+未ログインE2Eは管理操作を行わず、認証付きE2Eは`demo-dental-qa`のFirebase Emulatorだけを使用します。どちらもFirebase本番データへの書き込み・更新・削除は行いません。
 
 ## 現在の対象外
 
-- 実ユーザーでのログイン
-- 新規登録
-- 問題CRUD
-- 一括登録
-- 一括削除
-- 画像・PDFアップロード
-- 画像削除
-- 教材削除
-- マスク追加
-- マスク削除
-- 進捗保存・リセット
-- Firebaseへの書き込み
 - ピンチズーム
+- 本番環境の実ユーザーでのログイン・新規登録
+- 本番Firestore・Storageへの書き込み
+- PDF取込（pdf.js）に使う外部CDNが停止・遮断された場合の代替経路
+- 進捗リセット
 - ソフトウェアキーボード
 - iPhone・iPad実機固有の操作
 - ピクセル単位のスクリーンショット比較
 
-ログイン後機能は本番Firebaseに影響する可能性があるため、Firebase Local Emulator Suiteやテスト専用アカウントを整備するまで自動化しません。
+認証付きテストはFirebase Local Emulator Suite内で完結させ、本番Firebaseへの接続試行もテスト中に遮断・検出します。
 
 ## 手動確認が必要な項目
 
@@ -115,11 +114,5 @@ Playwrightの端末エミュレーションは実機確認の代わりにはな�
 
 ## 今後の課題
 
-- Firebase Local Emulator Suite
-- テスト専用アカウント
-- ログイン後テスト
-- CRUDテスト
-- Storageテスト
-- マスク操作テスト
 - 視覚回帰テスト
 - GitHub ActionsによるCI

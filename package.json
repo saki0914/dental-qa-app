@@ -25,5 +25,8 @@
     "firebase": "12.16.0",
     "firebase-tools": "15.24.0",
     "http-server": "^14.1.1"
+  },
+  "dependencies": {
+    "pdf-lib": "1.17.1"
   }
 }

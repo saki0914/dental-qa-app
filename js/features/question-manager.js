@@ -22,6 +22,7 @@ import {
   deleteQuestionImageFiles,
   restoreFailedQuestionDeletes
 } from "../core/question-image-delete.js";
+import { assertNonEmptyBlob } from "../core/file-validator.js";
 
 export function createQuestionManager(dependencies) {
   const {
@@ -865,6 +866,7 @@ function renderManageTable() {
 
 async function uploadQuestionImage(questionId, file, onPathCreated = null) {
   if (!getStorage() || !getCurrentUser() || !file) return { imageUrl: "", imagePath: "", imageName: "" };
+  assertNonEmptyBlob(file, "問題画像");
   const safeName = (file.name || "image").replace(/[^a-zA-Z0-9._-]/g, "_");
   const path = `users/${getCurrentUser().uid}/questions/${questionId}/${Date.now()}_${safeName}`;
   if (onPathCreated) onPathCreated(path);

@@ -21,6 +21,8 @@ import {
   normalizeImageMemoryFilter
 } from "../core/image-memory-filters.js";
 import { moveImageMemoryFile } from "../core/image-memory-file-order.js";
+import { assertNonEmptyBlob } from "../core/file-validator.js";
+import { convertPdfToImageFiles } from "../core/pdf-converter.js";
 
 export function createImageMemory(dependencies) {
   const {
@@ -482,9 +484,7 @@ function renderPdfMaskTable() {
 async function uploadPdfFile(pdfId, file, pageNumber = 1) {
   if (!getStorage() || !getCurrentUser() || !file) return { imageUrl: "", imagePath: "", imageName: "" };
 
-  if (typeof file.size === "number" && file.size <= 0) {
-    throw new Error("画像ファイルが0バイトです。保存を停止しました。");
-  }
+  assertNonEmptyBlob(file, "画像ファイル");
 
   const safeName = (file.name || `page_${pageNumber}.jpg`).replace(/[^a-zA-Z0-9._-]/g, "_");
   const path = `users/${getCurrentUser().uid}/imageMaterials/${pdfId}/page_${pageNumber}_${Date.now()}_${safeName}`;
@@ -510,111 +510,6 @@ async function deletePdfFileByPath(path) {
     console.warn("教材削除をスキップ:", error);
   }
 }
-
-
-let cachedPdfJsLib = null;
-
-async function getPdfJsLibForConvert() {
-  if (cachedPdfJsLib) return cachedPdfJsLib;
-  cachedPdfJsLib = await import("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs");
-  cachedPdfJsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
-  return cachedPdfJsLib;
-}
-
-function canvasToBlob(canvas, type = "image/jpeg", quality = 0.9) {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(blob => {
-      if (blob) {
-        resolve(blob);
-      } else {
-        reject(new Error("PDFページの画像化に失敗しました。"));
-      }
-    }, type, quality);
-  });
-}
-
-async function convertPdfToImageFiles(pdfFile, onProgress) {
-  const pdfjsLib = await getPdfJsLibForConvert();
-  const arrayBuffer = await pdfFile.arrayBuffer();
-
-  const loadingTask = pdfjsLib.getDocument({
-    data: arrayBuffer,
-    useSystemFonts: true,
-    disableFontFace: false,
-    cMapUrl: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/cmaps/",
-    cMapPacked: true,
-    standardFontDataUrl: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/standard_fonts/"
-  });
-
-  const pdfDoc = await loadingTask.promise;
-  const imageFiles = [];
-
-  for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber++) {
-    if (onProgress) onProgress(pageNumber, pdfDoc.numPages, "converting");
-
-    const page = await pdfDoc.getPage(pageNumber);
-    const baseViewport = page.getViewport({ scale: 1 });
-
-    // PowerPoint由来PDFは細かい文字や図形が多いため、やや高解像度で画像化する。
-    // PowerPoint PDFs often have small text/shapes, so render at a higher resolution.
-    const targetWidth = 2200;
-    const scale = Math.min(3.2, Math.max(1.8, targetWidth / baseViewport.width));
-    const viewport = page.getViewport({ scale });
-
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d", { alpha: false });
-    canvas.width = Math.floor(viewport.width);
-    canvas.height = Math.floor(viewport.height);
-
-    // 透明背景や白抜け対策として、先に白で塗る。
-    // Fill white first to avoid transparent/background rendering gaps.
-    context.save();
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.restore();
-
-    const renderOptions = {
-      canvasContext: context,
-      viewport,
-      background: "white"
-    };
-
-    if (pdfjsLib.AnnotationMode) {
-      renderOptions.annotationMode = pdfjsLib.AnnotationMode.ENABLE;
-    }
-
-    await page.render(renderOptions).promise;
-
-    const blob = await canvasToBlob(canvas, "image/jpeg", 0.92);
-    const baseName = (pdfFile.name || "converted.pdf").replace(/\.pdf$/i, "");
-    const imageName = `${baseName}_page_${String(pageNumber).padStart(3, "0")}.jpg`;
-    const imageFile = new File([blob], imageName, { type: "image/jpeg" });
-    imageFiles.push(imageFile);
-
-    canvas.width = 1;
-    canvas.height = 1;
-  }
-
-  return imageFiles;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -790,39 +685,47 @@ async function prepareAndUploadPdfPages(pdfId, selectedFiles) {
     throw new Error("PDFは1ファイルずつ登録してください。複数ページPDFは自動でページごとに画像化されます。");
   }
 
-  let filesToUpload = imageFiles;
   if (pdfFiles.length === 1) {
     const pdfFile = pdfFiles[0];
     setPdfEditStatus("PDFを画像に変換しています...");
-    filesToUpload = await convertPdfToImageFiles(pdfFile, (page, total, stage) => {
-      if (stage === "converting") {
-        setPdfEditStatus(`PDFを画像に変換しています... ${page}/${total}ページ`);
-      }
-    });
+    const pages = [];
+    try {
+      await convertPdfToImageFiles(pdfFile, (page, total, stage) => {
+        const action = stage === "converted" ? "アップロードしました" : "画像に変換しています";
+        setPdfEditStatus(`PDFを${action}... ${page}/${total}ページ`);
+      }, {
+        onPage: async ({ file, pageNumber, totalPages }) => {
+          const meta = await uploadPdfFile(pdfId, file, pageNumber);
+          pages.push({ page: pageNumber, ...meta });
+          setPdfEditStatus(`画像をアップロードしています... ${pageNumber}/${totalPages}`);
+        }
+      });
+    } catch (error) {
+      await Promise.all(pages.map(page => deletePdfFileByPath(page.imagePath)));
+      throw error;
+    }
+    if (!pages.length) throw new Error("PDFから登録用画像を作成できませんでした。");
+    return { pages, sourceType: "pdf-converted", sourceName: pdfFile.name };
   }
 
-  if (!filesToUpload.length) {
-    throw new Error("PDFまたは画像から登録用画像を作成できませんでした。");
-  }
-
+  if (!imageFiles.length) throw new Error("画像から登録用画像を作成できませんでした。");
   const pages = [];
   try {
-    setPdfEditStatus(`画像をアップロードしています... 0/${filesToUpload.length}`);
-    for (let index = 0; index < filesToUpload.length; index++) {
+    setPdfEditStatus(`画像をアップロードしています... 0/${imageFiles.length}`);
+    for (let index = 0; index < imageFiles.length; index++) {
       const pageNumber = index + 1;
-      const meta = await uploadPdfFile(pdfId, filesToUpload[index], pageNumber);
+      const meta = await uploadPdfFile(pdfId, imageFiles[index], pageNumber);
       pages.push({ page: pageNumber, ...meta });
-      setPdfEditStatus(`画像をアップロードしています... ${pageNumber}/${filesToUpload.length}`);
+      setPdfEditStatus(`画像をアップロードしています... ${pageNumber}/${imageFiles.length}`);
     }
   } catch (error) {
     await Promise.all(pages.map(page => deletePdfFileByPath(page.imagePath)));
     throw error;
   }
-
   return {
     pages,
-    sourceType: pdfFiles.length === 1 ? "pdf-converted" : "images",
-    sourceName: pdfFiles.length === 1 ? pdfFiles[0].name : ""
+    sourceType: "images",
+    sourceName: ""
   };
 }
 
