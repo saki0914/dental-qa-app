@@ -3,7 +3,7 @@ import {
   uploadBytes,
   getDownloadURL,
   deleteObject
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-storage.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-storage.js";
 import {
   escapeHtml,
   normalizePdfTags,
@@ -22,10 +22,12 @@ import {
 } from "../core/image-memory-filters.js";
 import { moveImageMemoryFile } from "../core/image-memory-file-order.js";
 import { assertNonEmptyBlob } from "../core/file-validator.js";
+import { randomId } from "../core/id.js";
 import {
   assignMaterialDefaultNoteId,
   getMaterialDefaultNoteId,
   isMaterialArchiving,
+  isMaterialArchivingExpired,
   markMaterialArchiving,
   markMaterialReady
 } from "../core/note-material-mutation.js";
@@ -407,7 +409,10 @@ function renderPdfTable() {
               <td>${escapeHtml(pdf.subject)}</td>
               <td>${escapeHtml(pdf.categories.join(" / ") || "未登録")}</td>
               <td>${pages.length ? `${pages.length}枚` : "旧PDF"}</td>
-              <td><button type="button" class="btn soft" data-open-note="${escapeHtml(pdf.id)}" ${archiving ? "disabled" : ""}>ノートで開く</button></td>
+              <td>
+                <button type="button" class="btn soft" data-open-note="${escapeHtml(pdf.id)}" ${archiving ? "disabled" : ""}>ノートで開く</button>
+                ${archiving ? `<button type="button" class="btn warn" data-unlock-material="${escapeHtml(pdf.id)}" ${isMaterialArchivingExpired(pdf) ? "" : "disabled"}>${isMaterialArchivingExpired(pdf) ? "ロック解除" : "30分後に解除可"}</button>` : ""}
+              </td>
             </tr>
           `;
         }).join("")
@@ -435,9 +440,19 @@ function renderPdfTable() {
     });
   });
 
+  [...(el.pdfEditTableBody?.querySelectorAll("[data-unlock-material]") || [])].forEach(button => {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      releaseStaleMaterialLock(button.dataset.unlockMaterial).catch(error => {
+        console.error(error);
+        alert("教材ロックを解除できませんでした。\n" + (error?.message || error));
+      });
+    });
+  });
+
   [...(el.pdfEditTableBody?.querySelectorAll("[data-edit-pdf-row]") || [])].forEach(row => {
     row.addEventListener("click", event => {
-      if (event.target.closest("[data-delete-pdf], [data-edit-pdf], [data-open-note]")) return;
+      if (event.target.closest("[data-delete-pdf], [data-edit-pdf], [data-open-note], [data-unlock-material]")) return;
       selectPdfMaterialForEdit(row.dataset.editPdfRow);
     });
   });
@@ -775,7 +790,7 @@ async function addPdfMaterial() {
     return;
   }
 
-  const pdfId = crypto.randomUUID();
+  const pdfId = randomId();
   let uploadResult = null;
   let added = false;
 
@@ -783,7 +798,7 @@ async function addPdfMaterial() {
     uploadResult = await prepareAndUploadPdfPages(pdfId, selectedFiles);
     pdfMaterials.push(normalizeImageMaterial({
       id: pdfId,
-      defaultNoteId: crypto.randomUUID(),
+      defaultNoteId: randomId(),
       ...metadata,
       ...uploadResult,
       masks: [],
@@ -874,7 +889,7 @@ async function updatePdfMaterial() {
       await archiveMaterialLinkedNotes(replacementDecision, "replacement");
     }
     Object.assign(pdf, metadata, uploadResult, { masks: [], pdfUrl: "", pdfName: "" });
-    if (replacementDecision?.reset) assignMaterialDefaultNoteId(pdf, crypto.randomUUID());
+    if (replacementDecision?.reset) assignMaterialDefaultNoteId(pdf, randomId());
     markMaterialReady(pdf);
     pdfRevealStates[pdf.id] = {};
     selectedMaskId = null;
@@ -912,13 +927,42 @@ async function ensureMaterialDefaultNoteId(materialId, preferredNoteId = "") {
   const existing = getMaterialDefaultNoteId(material);
   if (existing) return existing;
 
-  const noteId = assignMaterialDefaultNoteId(material, preferredNoteId || crypto.randomUUID());
+  const noteId = assignMaterialDefaultNoteId(material, preferredNoteId || randomId());
   const saved = await requestSave({ showAlerts: true });
   if (!saved) {
     delete material.defaultNoteId;
     throw new Error("教材の既定ノートIDをクラウド保存できませんでした。");
   }
   return noteId;
+}
+
+async function releaseStaleMaterialLock(materialId) {
+  const material = pdfMaterials.find(candidate => candidate.id === materialId);
+  if (!material || !isMaterialArchiving(material)) return;
+  if (!isMaterialArchivingExpired(material)) {
+    throw new Error("安全のため、処理開始から30分経過するまでは手動解除できません。元の操作を再実行してください。");
+  }
+  const accepted = confirm(
+    "この教材の差し替え・削除処理は完了していない可能性があります。\n" +
+    "ロックだけを解除し、教材と連携ノートの状態を確認してから必要な操作を再実行しますか？"
+  );
+  if (!accepted) return;
+  const previous = {
+    status: material.status,
+    archivingOperation: material.archivingOperation,
+    archivingStartedAt: material.archivingStartedAt
+  };
+  markMaterialReady(material);
+  renderPdfTable();
+  try {
+    const saved = await requestSave({ showAlerts: true });
+    if (!saved) throw new Error("ロック解除状態をクラウド保存できませんでした。");
+  } catch (error) {
+    Object.assign(material, previous);
+    renderPdfTable();
+    throw error;
+  }
+  setPdfEditStatus("長時間残っていた教材ロックを解除しました。教材と連携ノートの状態を確認してください。");
 }
 
 async function deleteCheckedPdfMaterials() {
@@ -1366,7 +1410,7 @@ function finishMaskDrag(pageNumber, startPoint, currentPoint) {
   }
 
   const mask = {
-    id: crypto.randomUUID(),
+    id: randomId(),
     page: pageNumber,
     x: Number(x.toFixed(2)),
     y: Number(y.toFixed(2)),

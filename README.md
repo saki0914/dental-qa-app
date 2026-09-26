@@ -36,6 +36,8 @@ Cloud Firestore を作成してください。
 
 Firebase CLIで反映する場合は、プロジェクトルートで次を実行します。
 
+ノートschemaを変更するリリースでは、先にHostingへアプリコードを反映し、その後にFirestore rulesを反映してください。開いたままの旧タブやHosting配信の短時間のずれがある状態でrulesだけを先に厳格化すると、旧クライアントの新規作成が拒否される可能性があります。現在のrulesは既存documentとの互換性のため、対象fieldが存在する場合だけ型・enum・pathを検証します。
+
 ```bash
 firebase deploy --project production --only firestore:rules,storage
 ```
@@ -138,7 +140,7 @@ npm run test:e2e:authenticated
 
 Emulatorは実在しない `demo-dental-qa` プロジェクトIDに固定されています。ローカル一式は `npm run local:start` で起動し、`http://localhost:3000/?firebaseEmulator=1` を開きます。初期データ作成、疎通確認、保存データの初期化には、それぞれ `npm run local:seed`、`npm run local:smoke`、`npm run local:reset` を使用できます。
 
-同じLAN上のiPadなどから確認する場合だけ `npm run local:start:lan` を使用します。このモードはHTTPサーバーとFirebase Emulatorを `0.0.0.0` へバインドするため、同一LAN上の他端末からテスト用Auth・Firestore・Storageへ到達できます。信頼できる私用LANでのみ起動し、公共Wi-Fi・共有ネットワークでは使用しないでください。確認後はプロセスを終了し、OSのファイアウォールでポート3000/4000/8080/9099/9199を外部へ公開しないでください。
+同じLAN上のiPadなどから確認する場合だけ、Macホスト側のターミナルで `npm run local:start:lan:host` を使用します。このモードはHTTPサーバーとFirebase Emulatorを `0.0.0.0` へバインドし、Docker/仮想インターフェースを除外して選んだMacのプライベートIPv4を案内します。Dev Container内の `npm run local:start:lan` はDocker内IPを案内せず、Macホストで実行するコマンドを表示して停止します。信頼できる私用LANでのみ起動し、公共Wi-Fi・共有ネットワークでは使用しないでください。確認後はプロセスを終了し、OSのファイアウォールでポート3000/4000/8080/9099/9199を外部へ公開しないでください。
 
 Firebase CLIのデフォルトプロジェクトも誤操作防止のため `demo-dental-qa` です。本番へルールを反映するときだけ、上記のように `--project production` を明示してください。
 

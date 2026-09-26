@@ -182,6 +182,54 @@ async function seedOpenableMaterial(uid) {
   }
 }
 
+async function seedReadyNote(uid, title, { legacyWithoutStatus = false } = {}) {
+  const environment = await initializeTestEnvironment({ projectId: "demo-dental-qa", firestore: { host: "127.0.0.1", port: 8080 } });
+  const noteId = `note-session-${crypto.randomUUID()}`;
+  const pageId = `page-session-${crypto.randomUUID()}`;
+  try {
+    const db = environment.authenticatedContext(uid).firestore();
+    await Promise.all([
+      setDoc(doc(db, "users", uid, "notes", noteId), {
+        schemaVersion: 1,
+        title,
+        type: "standalone",
+        ...(legacyWithoutStatus ? {} : { status: "ready" }),
+        pageCount: 1,
+        noteMaskCount: 0,
+        orderRevision: 1,
+        materialRefs: [],
+        deletedAt: null
+      }),
+      setDoc(doc(db, "users", uid, "notes", noteId, "pages", pageId), {
+        schemaVersion: 1,
+        noteId,
+        order: 1,
+        pageType: "blank",
+        contentRevision: 0,
+        contentPath: "",
+        contentHash: "",
+        noteMaskCount: 0,
+        deletedAt: null,
+        size: { width: 1240, height: 1754 },
+        background: { type: "blank", paperColor: "#FFFFFF" }
+      })
+    ]);
+    return { noteId, pageId };
+  } finally {
+    await environment.cleanup();
+  }
+}
+
+async function seedNoteRoot(uid, noteId, data) {
+  const environment = await initializeTestEnvironment({ projectId: "demo-dental-qa", firestore: { host: "127.0.0.1", port: 8080 } });
+  try {
+    const db = environment.authenticatedContext(uid).firestore();
+    await setDoc(doc(db, "users", uid, "notes", noteId), data);
+  } finally {
+    await environment.cleanup();
+  }
+}
+
 async function updateNoteRoot(uid, noteId, fields) {
   const environment = await initializeTestEnvironment({ projectId: "demo-dental-qa", firestore: { host: "127.0.0.1", port: 8080 } });
   try {
@@ -205,7 +253,7 @@ async function updateNotePage(uid, noteId, pageId, fields) {
 async function localNoteStoreCounts(page) {
   return page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("dentalQaNoteLocal", 1);
+      const request = indexedDB.open("dentalQaNoteLocal", 2);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -226,10 +274,20 @@ async function localNoteStoreCounts(page) {
   });
 }
 
+async function localPendingSaveCountForUser(page, uid) {
+  return page.evaluate(async userId => {
+    const { createNoteLocalStore } = await import("/js/core/note-local-store.js");
+    const store = createNoteLocalStore();
+    const values = await store.listForUser("pendingSaves", userId);
+    await store.close();
+    return values.length;
+  }, uid);
+}
+
 async function seedPendingPageDraft(page, { uid, noteId, pageId, content, expectedRevision }) {
   await page.evaluate(async value => {
     const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("dentalQaNoteLocal", 1);
+      const request = indexedDB.open("dentalQaNoteLocal", 2);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -295,6 +353,7 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
   const user = await createUser();
   await login(page, user);
+  await expect(page.locator("#localEnvironmentStatus")).toContainText("Auth: 接続済み / Firestore: 接続済み / Storage: 接続済み");
 
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("E2E 学習ノート");
@@ -310,13 +369,24 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await stage.dispatchEvent("pointerdown", { pointerId: 1, pointerType: "mouse", button: 0, clientX: box.x + box.width * .2, clientY: box.y + box.height * .08 });
   await stage.dispatchEvent("pointermove", { pointerId: 1, pointerType: "mouse", button: 0, pressure: .5, clientX: box.x + box.width * .55, clientY: box.y + box.height * .15 });
   await stage.dispatchEvent("pointerup", { pointerId: 1, pointerType: "mouse", button: 0, clientX: box.x + box.width * .55, clientY: box.y + box.height * .15 });
-  await expect(stage.locator('path[data-element-id]')).toHaveCount(1);
+  await expect(stage.locator('[data-element-id]')).toHaveCount(1);
 
   await page.locator('[data-note-tool="mask"]').click();
   await stage.dispatchEvent("pointerdown", { pointerId: 2, pointerType: "mouse", button: 0, clientX: box.x + box.width * .25, clientY: box.y + box.height * .18 });
   await stage.dispatchEvent("pointermove", { pointerId: 2, pointerType: "mouse", button: 0, clientX: box.x + box.width * .58, clientY: box.y + box.height * .25 });
   await stage.dispatchEvent("pointerup", { pointerId: 2, pointerType: "mouse", button: 0, clientX: box.x + box.width * .58, clientY: box.y + box.height * .25 });
   await expect(stage.locator(".note-mask")).toHaveCount(1);
+  await expect(stage.locator('[data-transform-handle="resize-se"]')).toBeVisible();
+  await expect(stage.locator('[data-transform-handle="rotate"]')).toHaveCount(0);
+  await expect(page.locator('#noteSelectionActions [data-selection-action="rotate-left"]')).toBeDisabled();
+  const maskBeforeResize = await stage.locator(".note-mask").boundingBox();
+  const maskResizeHandle = await stage.locator('[data-transform-handle="resize-se"]').boundingBox();
+  await page.mouse.move(maskResizeHandle.x + maskResizeHandle.width / 2, maskResizeHandle.y + maskResizeHandle.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(maskResizeHandle.x + maskResizeHandle.width / 2 + 35, maskResizeHandle.y + maskResizeHandle.height / 2 + 18, { steps: 5 });
+  await page.mouse.up();
+  const maskAfterResize = await stage.locator(".note-mask").boundingBox();
+  expect(maskAfterResize.width).toBeGreaterThan(maskBeforeResize.width);
 
   await openPageSidebar(page);
   await page.locator('[data-page-action="add-ruled"]').click();
@@ -326,6 +396,26 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
     imageCount: await stage.locator(".note-image-element").count(),
     dialogs
   }), { timeout: 20_000 }).toEqual({ imageCount: 1, dialogs: [] });
+  await page.locator('[data-note-tool="select"]').click();
+  await expect(stage.locator(".note-image-element.note-selected")).toBeVisible();
+  await expect(page.locator('#noteSelectionActions [data-selection-action="crop"]')).toBeVisible();
+  await page.locator('#noteSelectionActions [data-selection-action="crop"]').click();
+  await expect(stage.locator(".note-crop-overlay")).toBeVisible();
+  await expect(stage.locator('[data-transform-handle^="crop-"]')).toHaveCount(8);
+  const imageBeforeCrop = await stage.locator(".note-image-element").boundingBox();
+  const cropHandle = await stage.locator('[data-transform-handle="crop-w"]').boundingBox();
+  await page.mouse.move(cropHandle.x + cropHandle.width / 2, cropHandle.y + cropHandle.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(cropHandle.x + cropHandle.width / 2 + 20, cropHandle.y + cropHandle.height / 2, { steps: 5 });
+  await page.mouse.up();
+  const imageAfterCrop = await stage.locator(".note-image-element").boundingBox();
+  expect(imageAfterCrop.width).toBeLessThan(imageBeforeCrop.width);
+  await stage.locator('[data-crop-action="reset"]').click();
+  await expect(stage.locator(".note-crop-overlay"), "全体表示後もcrop編集を継続する").toBeVisible();
+  const imageAfterReset = await stage.locator(".note-image-element").boundingBox();
+  expect(imageAfterReset.width).toBeCloseTo(imageBeforeCrop.width, 0);
+  await stage.locator('[data-crop-action="apply"]').click();
+  await expect(stage.locator(".note-crop-overlay")).toHaveCount(0);
   await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
 
   await page.locator("#toggleNoteStudyBtn").click();
@@ -339,10 +429,12 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await page.locator("#createNotePdfBtn").click();
   await expect(page.locator("#noteExportStatus")).toContainText("作成したPDF", { timeout: 60_000 });
   await expect(page.locator("#noteExportFilename")).toHaveValue(/AI共有用.*\.pdf$/);
+  await page.locator("#noteExportFilename").fill(" 症例/共有.pdf.pdf. ");
   const downloadPromise = page.waitForEvent("download");
   await page.locator("#downloadNotePdfBtn").click();
+  await expect(page.locator("#noteExportFilename")).toHaveValue("症例_共有.pdf");
   const download = await downloadPromise;
-  expect(download.suggestedFilename()).toMatch(/^(download|.*AI共有用.*\.pdf)$/);
+  expect(download.suggestedFilename()).toMatch(/^(download|症例_共有\.pdf)$/);
   await download.saveAs("test-results/study-note-export.pdf");
   const stream = await download.createReadStream();
   const chunks = [];
@@ -359,15 +451,373 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await expect(page.locator("#noteList")).toContainText("E2E 学習ノート");
   await page.locator(".note-card:has-text('E2E 学習ノート') button", { hasText: "編集" }).click();
   await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
-  await expect(page.locator("#notePageStage path[data-element-id]")).toHaveCount(1);
+  await expect(page.locator("#notePageStage [data-element-id]")).toHaveCount(1);
 
   const stored = await readNotes(user.uid);
   expect(stored.notes).toHaveLength(1);
   expect(stored.notes[0].pages).toHaveLength(2);
+  expect(stored.notes[0].pendingStoragePaths || []).toEqual([]);
   expect(stored.pdfMaterials).toHaveLength(0);
   expect(blockedRequests).toEqual([]);
   expect(pdfCdnRequests, "PDF出力はjsDelivr/cdnjsへ接続しない").toEqual([]);
   expect(pageErrors).toEqual([]);
+});
+
+test("@authenticated lineは移動・保存再読込でき、後続panのpointercancelで巻き戻らない", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("line変形E2Eノート");
+  await page.locator('[data-create-note="blank"]').click();
+  await expect(page.locator("#noteEditorView")).toBeVisible();
+
+  const stage = page.locator("#notePageStage");
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  await page.locator('[data-note-tool="shape"]').click();
+  await page.locator("#noteStyleBtn").click();
+  await page.locator("#noteShapeType").selectOption("line");
+  await stage.dispatchEvent("pointerdown", {
+    pointerId: 61, pointerType: "mouse", button: 0,
+    clientX: box.x + box.width * .2, clientY: box.y + box.height * .2
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 61, pointerType: "mouse", button: 0,
+    clientX: box.x + box.width * .4, clientY: box.y + box.height * .3
+  });
+  await stage.dispatchEvent("pointerup", {
+    pointerId: 61, pointerType: "mouse", button: 0,
+    clientX: box.x + box.width * .4, clientY: box.y + box.height * .3
+  });
+  const line = stage.locator("line:not(.note-element-hit)");
+  await expect(line).toHaveCount(1);
+
+  await page.locator('[data-note-tool="select"]').click();
+  await line.dispatchEvent("pointerdown", {
+    pointerId: 62, pointerType: "mouse", button: 0,
+    clientX: box.x + box.width * .3, clientY: box.y + box.height * .25
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 62, pointerType: "mouse", button: 0,
+    clientX: box.x + box.width * .4, clientY: box.y + box.height * .35
+  });
+  await stage.dispatchEvent("pointerup", {
+    pointerId: 62, pointerType: "mouse", button: 0,
+    clientX: box.x + box.width * .4, clientY: box.y + box.height * .35
+  });
+  await expect.poll(async () => Number(await line.getAttribute("x1"))).toBeGreaterThan(250);
+  const movedX = Number(await line.getAttribute("x1"));
+
+  await page.locator('[data-note-tool="pan"]').click();
+  await stage.dispatchEvent("pointerdown", {
+    pointerId: 63, pointerType: "mouse", button: 0,
+    clientX: box.x + box.width * .5, clientY: box.y + box.height * .5
+  });
+  await stage.dispatchEvent("pointercancel", {
+    pointerId: 63, pointerType: "mouse", button: 0,
+    clientX: box.x + box.width * .5, clientY: box.y + box.height * .5
+  });
+  await expect(line).toHaveCount(1);
+  expect(Number(await line.getAttribute("x1"))).toBeCloseTo(movedX, 6);
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+
+  await page.locator("#closeNoteBtn").click();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
+  await page.locator("#tabBtnPdf").click();
+  await page.locator("#noteModeBtn").click();
+  await page.locator(".note-card:has-text('line変形E2Eノート') button", { hasText: "編集" }).click();
+  const reloadedLine = page.locator("#notePageStage line:not(.note-element-hit)");
+  await expect(reloadedLine).toHaveCount(1);
+  expect(Number(await reloadedLine.getAttribute("x1"))).toBeCloseTo(movedX, 6);
+});
+
+test("@authenticated ハンドルで図形変形・回転・arrow端点移動し自由形投げ縄で複数選択する", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("直接変形E2Eノート");
+  await page.locator('[data-create-note="blank"]').click();
+  const stage = page.locator("#notePageStage");
+  await stage.scrollIntoViewIfNeeded();
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  const point = (x, y) => ({ x: box.x + box.width * x, y: box.y + box.height * y });
+  const drag = async (from, to) => {
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps: 7 });
+    await page.mouse.up();
+  };
+
+  await page.locator('[data-note-tool="shape"]').click();
+  await page.locator("#noteStyleBtn").click();
+  await page.locator("#noteShapeType").selectOption("rectangle");
+  await drag(point(.16, .12), point(.36, .25));
+  await expect(stage.locator("g.note-element:has(rect:not(.note-element-hit))")).toHaveCount(1);
+  await page.locator("#noteStyleBtn").click();
+
+  await page.locator('[data-note-tool="select"]').click();
+  const rectangle = stage.locator("g.note-element:has(rect:not(.note-element-hit))");
+  await rectangle.locator(".note-element-hit").click({ position: { x: 4, y: 4 } });
+  await expect(stage.locator('[data-selection-overlay="true"]')).toBeVisible();
+  await expect(stage.locator('[data-transform-handle^="resize-"]')).toHaveCount(8);
+  await expect(stage.locator('[data-transform-handle="rotate"]')).toBeVisible();
+  const widthBefore = Number(await rectangle.locator("rect:not(.note-element-hit)").getAttribute("width"));
+  const resizeHandle = await stage.locator('[data-transform-handle="resize-se"]').boundingBox();
+  await drag(
+    { x: resizeHandle.x + resizeHandle.width / 2, y: resizeHandle.y + resizeHandle.height / 2 },
+    { x: resizeHandle.x + resizeHandle.width / 2 + 45, y: resizeHandle.y + resizeHandle.height / 2 + 25 }
+  );
+  expect(Number(await stage.locator("g.note-element:has(rect:not(.note-element-hit)) rect:not(.note-element-hit)").getAttribute("width"))).toBeGreaterThan(widthBefore);
+
+  const overlayBox = await stage.locator('[data-selection-overlay="true"]').boundingBox();
+  const rotateHandle = await stage.locator('[data-transform-handle="rotate"]').boundingBox();
+  await drag(
+    { x: rotateHandle.x + rotateHandle.width / 2, y: rotateHandle.y + rotateHandle.height / 2 },
+    { x: overlayBox.x + overlayBox.width + 28, y: overlayBox.y + overlayBox.height / 2 }
+  );
+  const rotatedTransform = await stage.locator("g.note-element:has(rect:not(.note-element-hit))").getAttribute("transform");
+  expect(rotatedTransform).toMatch(/rotate\((?!0(?:\.0+)?\b)-?\d/);
+
+  await page.locator('[data-note-tool="shape"]').click();
+  await page.locator("#noteStyleBtn").click();
+  await page.locator("#noteShapeType").selectOption("arrow");
+  await page.locator("#noteStyleBtn").click();
+  await drag(point(.22, .36), point(.58, .46));
+  await expect(stage.locator("line[marker-end]")).toHaveCount(1);
+  await page.locator('[data-note-tool="select"]').click();
+  const arrow = stage.locator("line[marker-end]");
+  await arrow.click({ force: true });
+  await expect(stage.locator('[data-transform-handle="line-start"]')).toBeVisible();
+  await expect(stage.locator('[data-transform-handle="line-end"]')).toBeVisible();
+  const arrowEndBefore = Number(await arrow.getAttribute("x2"));
+  const arrowEndHandle = await stage.locator('[data-transform-handle="line-end"]').boundingBox();
+  await drag(
+    { x: arrowEndHandle.x + arrowEndHandle.width / 2, y: arrowEndHandle.y + arrowEndHandle.height / 2 },
+    { x: arrowEndHandle.x + arrowEndHandle.width / 2 + 35, y: arrowEndHandle.y + arrowEndHandle.height / 2 + 20 }
+  );
+  expect(Number(await stage.locator("line[marker-end]").getAttribute("x2"))).toBeGreaterThan(arrowEndBefore);
+
+  // A lasso is one continuous pointer gesture around both shapes.
+  await page.mouse.move(point(.06, .06).x, point(.06, .06).y);
+  await page.mouse.down();
+  for (const vertex of [point(.72, .06), point(.72, .58), point(.06, .58), point(.06, .06)]) {
+    await page.mouse.move(vertex.x, vertex.y, { steps: 5 });
+  }
+  await page.mouse.up();
+  await expect(stage.locator(".note-element.note-selected")).toHaveCount(2);
+  await expect(stage.locator('[data-selection-overlay="true"]')).toBeVisible();
+
+  const selectionBeforeCancel = await stage.locator('[data-selection-overlay="true"]').boundingBox();
+  const multiResizeHandle = stage.locator('[data-transform-handle="resize-se"]');
+  const multiResizeBox = await multiResizeHandle.boundingBox();
+  await multiResizeHandle.dispatchEvent("pointerdown", {
+    pointerId: 71, pointerType: "mouse", button: 0,
+    clientX: multiResizeBox.x + multiResizeBox.width / 2,
+    clientY: multiResizeBox.y + multiResizeBox.height / 2
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 71, pointerType: "mouse", button: 0,
+    clientX: multiResizeBox.x + multiResizeBox.width / 2 + 45,
+    clientY: multiResizeBox.y + multiResizeBox.height / 2 + 25
+  });
+  await expect.poll(async () => (await stage.locator('[data-selection-overlay="true"]').boundingBox()).width)
+    .toBeGreaterThan(selectionBeforeCancel.width);
+  await stage.dispatchEvent("pointercancel", {
+    pointerId: 71, pointerType: "mouse", button: 0,
+    clientX: multiResizeBox.x + multiResizeBox.width / 2 + 45,
+    clientY: multiResizeBox.y + multiResizeBox.height / 2 + 25
+  });
+  await expect.poll(async () => (await stage.locator('[data-selection-overlay="true"]').boundingBox()).width)
+    .toBeCloseTo(selectionBeforeCancel.width, 0);
+
+  const rectangleTransformBeforeCancel = await stage.locator("g.note-element:has(rect:not(.note-element-hit))").getAttribute("transform");
+  const multiRotateHandle = stage.locator('[data-transform-handle="rotate"]');
+  const multiRotateBox = await multiRotateHandle.boundingBox();
+  await multiRotateHandle.dispatchEvent("pointerdown", {
+    pointerId: 72, pointerType: "mouse", button: 0,
+    clientX: multiRotateBox.x + multiRotateBox.width / 2,
+    clientY: multiRotateBox.y + multiRotateBox.height / 2
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 72, pointerType: "mouse", button: 0,
+    clientX: selectionBeforeCancel.x + selectionBeforeCancel.width,
+    clientY: selectionBeforeCancel.y + selectionBeforeCancel.height / 2
+  });
+  await expect.poll(() => stage.locator("g.note-element:has(rect:not(.note-element-hit))").getAttribute("transform"))
+    .not.toBe(rectangleTransformBeforeCancel);
+  await stage.dispatchEvent("pointercancel", {
+    pointerId: 72, pointerType: "mouse", button: 0,
+    clientX: selectionBeforeCancel.x + selectionBeforeCancel.width,
+    clientY: selectionBeforeCancel.y + selectionBeforeCancel.height / 2
+  });
+  await expect(stage.locator("g.note-element:has(rect:not(.note-element-hit))"))
+    .toHaveAttribute("transform", rectangleTransformBeforeCancel);
+});
+
+test("@authenticated 日本語複数行テキストを再編集し書式・配置・ボックス幅を直接変更する", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("日本語テキストE2Eノート");
+  await page.locator('[data-create-note="blank"]').click();
+  const stage = page.locator("#notePageStage");
+  await stage.scrollIntoViewIfNeeded();
+  const box = await stage.boundingBox();
+  const from = { x: box.x + box.width * .15, y: box.y + box.height * .16 };
+  const to = { x: box.x + box.width * .48, y: box.y + box.height * .32 };
+  await page.locator('[data-note-tool="text"]').click();
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(to.x, to.y, { steps: 6 });
+  await page.mouse.up();
+  const editor = stage.locator(".note-text-editor");
+  await expect(editor).toBeVisible();
+  await editor.fill("日本語の長い文章を折り返します\n二行目も表示します");
+  await editor.press("Tab");
+  const text = stage.locator("text.note-element");
+  await expect(text).toHaveCount(1);
+  await expect(text.locator("tspan")).toHaveCount(3);
+
+  await page.locator('[data-note-tool="select"]').click();
+  await text.click({ force: true });
+  await page.locator("#noteStyleBtn").click();
+  await page.locator("#noteFontFamily").selectOption("system-serif");
+  await page.locator("#noteFontSize").fill("34");
+  await page.locator("#noteFontBold").check();
+  await page.locator("#noteFontItalic").check();
+  await page.locator("#noteTextAlign").selectOption("center");
+  await expect(stage.locator("text.note-element")).toHaveAttribute("text-anchor", "middle");
+  await expect(stage.locator("text.note-element")).toHaveAttribute("font-family", "serif");
+  await expect(stage.locator("text.note-element")).toHaveAttribute("font-weight", "bold");
+
+  await page.locator("#noteStyleBtn").click();
+  const overlayBefore = await stage.locator('[data-selection-overlay="true"]').boundingBox();
+  const eastHandle = await stage.locator('[data-transform-handle="resize-e"]').boundingBox();
+  await page.mouse.move(eastHandle.x + eastHandle.width / 2, eastHandle.y + eastHandle.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(eastHandle.x + eastHandle.width / 2 + 50, eastHandle.y + eastHandle.height / 2, { steps: 6 });
+  await page.mouse.up();
+  const overlayAfter = await stage.locator('[data-selection-overlay="true"]').boundingBox();
+  expect(overlayAfter.width).toBeGreaterThan(overlayBefore.width);
+
+  await page.locator("#noteStyleBtn").click();
+  await page.locator("#noteTextAlign").selectOption("right");
+  await expect(stage.locator("text.note-element")).toHaveAttribute("text-anchor", "end");
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+});
+
+test("@authenticated ハイライト・オブジェクト消しゴム・ピクセル消しゴムを実操作してUndoできる", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("消しゴムE2Eノート");
+  await page.locator('[data-create-note="blank"]').click();
+  const stage = page.locator("#notePageStage");
+  await stage.scrollIntoViewIfNeeded();
+  const box = await stage.boundingBox();
+  const point = (x, y) => ({ x: box.x + box.width * x, y: box.y + box.height * y });
+  const drag = async (from, to, steps = 10) => {
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps });
+    await page.mouse.up();
+  };
+  const elementCount = () => stage.locator("[data-element-id]").evaluateAll(nodes =>
+    new Set(nodes.map(node => node.dataset.elementId)).size
+  );
+
+  await drag(point(.16, .14), point(.62, .14));
+  await page.locator('[data-note-tool="highlighter"]').click();
+  await drag(point(.16, .28), point(.62, .28));
+  await expect.poll(elementCount).toBe(2);
+
+  await page.locator('[data-note-tool="eraser-object"]').click();
+  await page.mouse.click(point(.35, .14).x, point(.35, .14).y);
+  await expect.poll(elementCount).toBe(1);
+  await page.locator("#noteUndoBtn").click();
+  await expect.poll(elementCount).toBe(2);
+
+  await page.locator("#noteStyleBtn").click();
+  await page.locator("#noteEraserMode").selectOption("pixel");
+  await page.locator("#noteStyleBtn").click();
+  await drag(point(.39, .23), point(.39, .33), 7);
+  await expect.poll(elementCount).toBeGreaterThan(2);
+  await page.locator("#noteUndoBtn").click();
+  await expect.poll(elementCount).toBe(2);
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+});
+
+test("@authenticated 全NoteStore APIはexpectedUidなしでSDKへ到達しない", async ({ page }) => {
+  await page.goto("/?firebaseEmulator=1", { waitUntil: "domcontentloaded" });
+  const result = await page.evaluate(async () => {
+    const { createNoteStore } = await import("/js/services/note-store.js");
+    let contextCalls = 0;
+    const store = createNoteStore({
+      getDb: () => { contextCalls += 1; return null; },
+      getStorage: () => { contextCalls += 1; return null; },
+      getUser: () => { contextCalls += 1; return null; }
+    });
+    const blob = new Blob(["x"], { type: "image/png" });
+    const calls = {
+      listNotes: () => store.listNotes(),
+      getNote: () => store.getNote("note"),
+      listNotesByMaterial: () => store.listNotesByMaterial("material"),
+      listPages: () => store.listPages("note"),
+      createNote: () => store.createNote({ pages: [] }),
+      createCreatingNote: () => store.createCreatingNote("note", {}),
+      finalizeCreatingNote: () => store.finalizeCreatingNote("note", []),
+      finalizeNoteCreation: () => store.finalizeNoteCreation("note", 0),
+      abortCreatingNote: () => store.abortCreatingNote("note"),
+      cleanupStuckCreatingNotes: () => store.cleanupStuckCreatingNotes(),
+      markCreationFailed: () => store.markCreationFailed("note"),
+      uploadSourcePage: () => store.uploadSourcePage("note", "page", blob),
+      deleteStoragePaths: () => store.deleteStoragePaths([]),
+      loadPageContent: () => store.loadPageContent("note", { pageId: "page", contentPath: "" }),
+      savePageContent: () => store.savePageContent({ noteId: "note", pageId: "page", expectedRevision: 0 }, {}),
+      uploadAsset: () => store.uploadAsset("note", blob),
+      getAsset: () => store.getAsset("note", "asset"),
+      getStorageBlob: () => store.getStorageBlob("users/u/notes/n/file.json"),
+      cleanupStoragePath: () => store.cleanupStoragePath("users/u/notes/n/file.json"),
+      updatePageOrder: () => store.updatePageOrder("note", [], 0),
+      createPage: () => store.createPage("note", { pageId: "page" }, 1, 0),
+      deletePage: () => store.deletePage("note", "page", [{ pageId: "remaining" }], 0),
+      updatePage: () => store.updatePage("note", "page", {}),
+      updateNote: () => store.updateNote("note", {}),
+      deleteMaterialLinkedNotes: () => store.deleteMaterialLinkedNotes([], "material-deleted"),
+      restoreNote: () => store.restoreNote("note"),
+      deleteNote: () => store.deleteNote("note")
+    };
+    const errors = [];
+    for (const [name, call] of Object.entries(calls)) {
+      try {
+        await call();
+        errors.push({ name, message: "" });
+      } catch (error) {
+        errors.push({ name, message: error?.message || String(error) });
+      }
+    }
+    return { contextCalls, errors };
+  });
+
+  expect(result.errors).toHaveLength(27);
+  expect(result.errors.filter(({ message }) => !message.includes("expectedUid"))).toEqual([]);
+  expect(result.contextCalls, "Firebaseコンテキスト取得前に拒否する").toBe(0);
+});
+
+test("@authenticated status欠落の旧ノートも一覧に表示する", async ({ page }) => {
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  await seedReadyNote(user.uid, "statusなし旧ノート", { legacyWithoutStatus: true });
+  await login(page, user);
+
+  await expect(page.locator(".note-card h4", { hasText: "statusなし旧ノート" })).toBeVisible();
+  expect(blockedRequests).toEqual([]);
 });
 
 test("@authenticated 寸法上限を超える画像はStorageへ保存する前に拒否する", async ({ page }) => {
@@ -384,14 +834,21 @@ test("@authenticated 寸法上限を超える画像はStorageへ保存する前�
       getStorage: () => { contextCalled = true; return null; },
       getUser: () => { contextCalled = true; return null; }
     });
+    let missingUidError = "";
     try {
       await store.uploadAsset("note-oversized", blob);
-      return { error: "", contextCalled };
     } catch (error) {
-      return { error: error?.message || String(error), contextCalled };
+      missingUidError = error?.message || String(error);
+    }
+    try {
+      await store.uploadAsset("note-oversized", blob, { expectedUid: "test-user" });
+      return { error: "", missingUidError, contextCalled };
+    } catch (error) {
+      return { error: error?.message || String(error), missingUidError, contextCalled };
     }
   }, oversizedPng.toString("base64"));
 
+  expect(result.missingUidError).toContain("expectedUid");
   expect(result.error).toContain("縦横サイズまたは総画素数が上限");
   expect(result.contextCalled, "Storage/Firestoreの処理前に拒否する").toBe(false);
   expect(blockedRequests).toEqual([]);
@@ -407,6 +864,7 @@ test("@authenticated 画像Storage失敗時はIndexedDBへ保持し再読込後�
   });
   const user = await createUser();
   await login(page, user);
+  let journalSeenBeforeUpload = false;
 
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("画像復旧E2Eノート");
@@ -417,6 +875,10 @@ test("@authenticated 画像Storage失敗時はIndexedDBへ保持し再読込後�
     const request = route.request();
     const objectName = new URL(request.url()).searchParams.get("name") || "";
     if (["POST", "PUT"].includes(request.method()) && objectName.includes("/notes/") && objectName.includes("/assets/")) {
+      const stored = await readNotes(user.uid);
+      journalSeenBeforeUpload = stored.notes.some(note =>
+        (note.pendingStoragePaths || []).some(path => path.includes("/assets/"))
+      );
       await route.fulfill({
         status: 403,
         contentType: "application/json",
@@ -430,15 +892,45 @@ test("@authenticated 画像Storage失敗時はIndexedDBへ保持し再読込後�
   await expect(page.locator("#noteSaveStatus")).toContainText("端末内に保持", { timeout: 20_000 });
   await expect.poll(() => localNoteStoreCounts(page)).toMatchObject({ pendingAssets: 1, pageDrafts: 1, pendingSaves: 1 });
   await expect.poll(() => dialogs.length).toBeGreaterThan(0);
+  expect(journalSeenBeforeUpload, "Storage開始前にFirestore journalへ記録する").toBe(true);
+  const failedUploadState = await readNotes(user.uid);
+  expect(failedUploadState.notes[0].pendingStoragePaths || []).toEqual([]);
+
+  await page.addInitScript(() => {
+    window.__noteOfflineForExport = true;
+    Object.defineProperty(navigator, "onLine", {
+      configurable: true,
+      get: () => !window.__noteOfflineForExport
+    });
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
+  await page.locator("#tabBtnPdf").click();
+  await page.locator("#noteModeBtn").click();
+  await page.locator(".note-card:has-text('画像復旧E2Eノート') button", { hasText: "編集" }).click();
+  await expect(page.locator("#notePageStage .note-image-element img")).toHaveAttribute("src", /blob:/, { timeout: 20_000 });
+  await page.locator(".note-more-menu summary").click();
+  await page.locator('[data-note-action="export"]').click();
+  await page.locator("#createNotePdfBtn").click();
+  await expect(page.locator("#noteExportStatus")).toContainText("作成したPDF", { timeout: 60_000 });
+  await page.locator('#noteExportDialog button[value="close"]').click();
 
   await page.unroute("**/v0/b/demo-dental-qa.firebasestorage.app/o**");
+  await page.evaluate(() => {
+    window.__noteOfflineForExport = false;
+    window.dispatchEvent(new Event("online"));
+  });
+  await expect(page.locator("#noteRetrySaveBtn")).toBeVisible();
+  await page.locator("#noteRetrySaveBtn").click();
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+  await expect.poll(() => localNoteStoreCounts(page)).toEqual({ pendingAssets: 0, pageDrafts: 0, pendingSaves: 0, conflicts: 0 });
+
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
   await page.locator("#tabBtnPdf").click();
   await page.locator("#noteModeBtn").click();
   await page.locator(".note-card:has-text('画像復旧E2Eノート') button", { hasText: "編集" }).click();
   await expect(page.locator("#notePageStage .note-image-element")).toHaveCount(1, { timeout: 20_000 });
-  await expect.poll(() => localNoteStoreCounts(page)).toEqual({ pendingAssets: 0, pageDrafts: 0, pendingSaves: 0, conflicts: 0 });
   const stored = await readNotes(user.uid);
   expect(stored.notes[0].pages[0].contentRevision).toBeGreaterThan(0);
   expect(blockedRequests).toEqual([]);
@@ -583,6 +1075,84 @@ test("@authenticated オンライン状態が反復しても未送信下書き�
   });
   await page.waitForTimeout(250);
   expect(uploadCount).toBe(1);
+  await page.unroute("**/v0/b/demo-dental-qa.firebasestorage.app/o**");
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 復旧中にユーザーを切り替えても新ユーザーの復旧を独立実行する", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const alice = await createUser();
+  const bob = await createUser();
+  const aliceNote = await seedReadyNote(alice.uid, "Alice復旧ノート");
+  const bobNote = await seedReadyNote(bob.uid, "Bob復旧ノート");
+  await login(page, alice);
+  const contentFor = (noteId, pageId, id) => ({
+    schemaVersion: 1,
+    noteId,
+    pageId,
+    revision: 0,
+    elements: [{
+      id,
+      type: "stroke",
+      points: [{ x: .1, y: .1, pressure: .5 }, { x: .4, y: .4, pressure: .5 }],
+      style: { color: "#111111", widthRatio: .0025, opacity: 1 },
+      zIndex: 10
+    }],
+    noteMasks: [],
+    savedAt: ""
+  });
+  await seedPendingPageDraft(page, {
+    uid: alice.uid,
+    noteId: aliceNote.noteId,
+    pageId: aliceNote.pageId,
+    content: contentFor(aliceNote.noteId, aliceNote.pageId, "alice-stroke"),
+    expectedRevision: 0
+  });
+  await seedPendingPageDraft(page, {
+    uid: bob.uid,
+    noteId: bobNote.noteId,
+    pageId: bobNote.pageId,
+    content: contentFor(bobNote.noteId, bobNote.pageId, "bob-stroke"),
+    expectedRevision: 0
+  });
+
+  let releaseAliceUpload;
+  let notifyAliceUpload;
+  const aliceUploadStarted = new Promise(resolve => { notifyAliceUpload = resolve; });
+  const aliceUploadGate = new Promise(resolve => { releaseAliceUpload = resolve; });
+  await page.route("**/v0/b/demo-dental-qa.firebasestorage.app/o**", async route => {
+    const request = route.request();
+    const objectName = new URL(request.url()).searchParams.get("name") || "";
+    if (["POST", "PUT"].includes(request.method()) && objectName.includes(`users/${alice.uid}/notes/`)) {
+      notifyAliceUpload();
+      await aliceUploadGate;
+    }
+    await route.continue();
+  });
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await aliceUploadStarted;
+
+  await page.locator("#tabBtnAuth").click();
+  await page.locator("#signOutBtn").click();
+  await expect(page.locator("#authStatus")).toContainText("未ログイン", { timeout: 20_000 });
+  await page.locator("#emailInput").fill(bob.email);
+  await page.locator("#passwordInput").fill(bob.password);
+  await page.locator("#signInBtn").click();
+  await expect(page.locator("#authStatus")).toContainText(bob.email, { timeout: 20_000 });
+  await page.locator("#tabBtnPdf").click();
+  await page.locator("#noteModeBtn").click();
+
+  await expect.poll(async () => {
+    const stored = await readNotes(bob.uid);
+    return stored.notes.find(note => note.id === bobNote.noteId)?.pages[0]?.contentRevision || 0;
+  }, { timeout: 30_000 }).toBe(1);
+  await expect.poll(() => localPendingSaveCountForUser(page, bob.uid)).toBe(0);
+  expect(await localPendingSaveCountForUser(page, alice.uid)).toBe(1);
+  releaseAliceUpload();
+  await expect.poll(() => localPendingSaveCountForUser(page, alice.uid)).toBe(1);
+  const aliceStored = await readNotes(alice.uid);
+  expect(aliceStored.notes.find(note => note.id === aliceNote.noteId)?.pages[0]?.contentRevision).toBe(0);
   await page.unroute("**/v0/b/demo-dental-qa.firebasestorage.app/o**");
   expect(blockedRequests).toEqual([]);
 });
@@ -783,7 +1353,68 @@ test("@authenticated 再送前にクラウドが更新済みなら下書きを�
 
   await page.locator(".note-card:has-text('下書き競合E2Eノート') button", { hasText: "編集" }).click();
   await expect(page.locator("#noteSaveStatus")).toContainText("競合あり");
+  await expect(page.locator("#notePageStage [data-element-id]")).toHaveCount(1);
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 削除済みノートの端末下書きを一覧から新規ノートへ復元する", async ({ page }) => {
+  test.setTimeout(90_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  page.on("dialog", dialog => dialog.accept());
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("孤立下書きE2Eノート");
+  await page.locator('[data-create-note="blank"]').click();
+  await expect(page.locator("#noteEditorView")).toBeVisible();
+
+  const before = await readNotes(user.uid);
+  const sourceNote = before.notes.find(item => item.title === "孤立下書きE2Eノート");
+  const sourcePage = sourceNote.pages[0];
+  const content = {
+    schemaVersion: 1,
+    noteId: sourceNote.id,
+    pageId: sourcePage.pageId,
+    revision: 0,
+    elements: [{
+      id: crypto.randomUUID(),
+      type: "stroke",
+      points: [{ x: .1, y: .2, pressure: .5 }, { x: .8, y: .7, pressure: .5 }],
+      style: { color: "#123456", widthRatio: .003, opacity: 1 },
+      zIndex: 10
+    }],
+    noteMasks: [],
+    savedAt: ""
+  };
+  await seedPendingPageDraft(page, {
+    uid: user.uid,
+    noteId: sourceNote.id,
+    pageId: sourcePage.pageId,
+    content,
+    expectedRevision: 0
+  });
+  await updateNoteRoot(user.uid, sourceNote.id, {
+    deletedAt: new Date().toISOString(),
+    deletedReason: "user"
+  });
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
+  await page.locator("#tabBtnPdf").click();
+  await page.locator("#noteModeBtn").click();
+  const recoveryCard = page.locator(".note-recovery-card");
+  await expect(recoveryCard).toContainText("一覧にないノートの未保存下書き", { timeout: 20_000 });
+  await recoveryCard.getByRole("button", { name: "新規ノートとして復元" }).click();
+  await expect(page.locator("#noteEditorView")).toBeVisible({ timeout: 20_000 });
   await expect(page.locator("#notePageStage path[data-element-id]")).toHaveCount(1);
+  await expect.poll(() => localNoteStoreCounts(page)).toEqual({
+    pendingAssets: 0,
+    pageDrafts: 0,
+    pendingSaves: 0,
+    conflicts: 0
+  });
+  const after = await readNotes(user.uid);
+  expect(after.notes.some(note => note.status === "ready" && note.title === "孤立下書きE2Eノート（復元コピー）")).toBe(true);
   expect(blockedRequests).toEqual([]);
 });
 
@@ -836,6 +1467,83 @@ test("@authenticated 画像アップロード中にページを切り替えて�
   await page.locator("#notePageList li").first().locator("button").first().click();
   await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
   await expect(page.locator("#notePageStage .note-image-element")).toHaveCount(1);
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 同じ教材を2画面で同時に開いても既定ノートは1件だけ作る", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const secondPage = await page.context().newPage();
+  const secondBlockedRequests = await guardProductionFirebase(secondPage);
+  const user = await createUser();
+  const material = await seedOpenableMaterial(user.uid);
+
+  try {
+    await Promise.all([login(page, user), login(secondPage, user)]);
+    await Promise.all([
+      page.locator("#newNoteBtn").click(),
+      secondPage.locator("#newNoteBtn").click()
+    ]);
+    await Promise.all([
+      page.locator('[data-create-note="material"]').click(),
+      secondPage.locator('[data-create-note="material"]').click()
+    ]);
+
+    const firstMaterialButton = page.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" });
+    const secondMaterialButton = secondPage.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" });
+    await Promise.all([firstMaterialButton.click(), secondMaterialButton.click()]);
+    await Promise.all([
+      expect(page.locator("#noteEditorView")).toBeVisible(),
+      expect(secondPage.locator("#noteEditorView")).toBeVisible()
+    ]);
+
+    const stored = await readNotes(user.uid);
+    const linkedNotes = stored.notes.filter(note => note.sourceMaterialId === material.materialId);
+    expect(linkedNotes).toHaveLength(1);
+    expect(linkedNotes[0]).toMatchObject({
+      id: material.defaultNoteId,
+      status: "ready",
+      createdPageCount: 1,
+      pageCount: 1
+    });
+    expect(linkedNotes[0].pages).toHaveLength(1);
+    expect(blockedRequests).toEqual([]);
+    expect(secondBlockedRequests).toEqual([]);
+  } finally {
+    await secondPage.close();
+  }
+});
+
+test("@authenticated 既定ノートの作成失敗記録がある場合は同じSagaで再作成する", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  const material = await seedOpenableMaterial(user.uid);
+  await seedNoteRoot(user.uid, material.defaultNoteId, {
+    schemaVersion: 1,
+    title: "作成失敗した既定ノート",
+    type: "material-linked",
+    sourceMaterialId: material.materialId,
+    materialRefs: [material.materialId],
+    status: "failed",
+    pageCount: 0,
+    createdPageCount: 0,
+    pendingStoragePaths: [],
+    orderRevision: 0,
+    deletedAt: null
+  });
+  await login(page, user);
+
+  await page.locator("#newNoteBtn").click();
+  await page.locator('[data-create-note="material"]').click();
+  await page.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" }).click();
+  await expect(page.locator("#noteEditorView")).toBeVisible();
+  await expect(page.locator("#notePageCounter")).toHaveText("1 / 1");
+
+  const stored = await readNotes(user.uid);
+  const recreated = stored.notes.find(note => note.id === material.defaultNoteId);
+  expect(recreated).toMatchObject({ status: "ready", createdPageCount: 1, pageCount: 1 });
+  expect(recreated.pages).toHaveLength(1);
   expect(blockedRequests).toEqual([]);
 });
 
@@ -899,6 +1607,7 @@ test("@authenticated クラウド版採用後は古い競合キューを再送�
   const blockedRequests = await guardProductionFirebase(page);
   page.on("dialog", async dialog => {
     if (dialog.message().includes("ローカル版を競合コピー")) await dialog.dismiss();
+    else if (dialog.type() === "prompt" && dialog.message().includes("ノートを閉じる操作")) await dialog.accept("continue");
     else await dialog.accept();
   });
   const user = await createUser();
@@ -917,7 +1626,7 @@ test("@authenticated クラウド版採用後は古い競合キューを再送�
     await stage.dispatchEvent("pointerup", { pointerId, pointerType: "mouse", button: 0, clientX: box.x + box.width * .5, clientY: box.y + box.height * (yOffset + .05) });
   };
   await drawStroke(31, .1);
-  await expect(page.locator("#notePageStage path[data-element-id]")).toHaveCount(1);
+  await expect(page.locator("#notePageStage [data-element-id]")).toHaveCount(1);
   await expect.poll(async () => {
     const stored = await readNotes(user.uid);
     return stored.notes.find(item => item.title === "競合破棄E2Eノート")?.pages[0]?.contentRevision || 0;
@@ -932,6 +1641,7 @@ test("@authenticated クラウド版採用後は古い競合キューを再送�
   await expect(page.locator("#noteSaveStatus")).toContainText("競合あり", { timeout: 20_000 });
   await expect.poll(() => localNoteStoreCounts(page)).toMatchObject({ pageDrafts: 1, pendingSaves: 1, conflicts: 1 });
   await page.locator("#closeNoteBtn").click();
+  await expect(page.locator("#noteListView")).toBeVisible();
   await expect(page.locator(".note-card:has-text('競合破棄E2Eノート')")).toContainText("競合あり");
   await page.locator(".note-card:has-text('競合破棄E2Eノート') button", { hasText: "競合を解決" }).click();
   await expect.poll(() => localNoteStoreCounts(page)).toEqual({ pendingAssets: 0, pageDrafts: 0, pendingSaves: 0, conflicts: 0 });
@@ -1027,6 +1737,7 @@ test("@authenticated PDFを教材へ追加せずノート専用Storage背景と�
   const stored = await readNotes(user.uid);
   expect(stored.notes).toHaveLength(1);
   expect(stored.notes[0]).toMatchObject({ type: "pdf-imported", status: "ready", pageCount: 2 });
+  expect(stored.notes[0].pendingStoragePaths || []).toEqual([]);
   expect(stored.notes[0].pages.sort((a, b) => a.order - b.order).map(item => item.background.sourcePageNumber)).toEqual([1, 2]);
   for (const storedPage of stored.notes[0].pages) {
     expect(storedPage.background.imagePath).toContain(`users/${user.uid}/notes/${stored.notes[0].id}/sourcePages/`);

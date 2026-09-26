@@ -6,6 +6,7 @@ import { renderNotePageToCanvas } from "../../js/core/note-renderer.js";
 function createCanvasHarness() {
   const strokes = [];
   const fills = [];
+  const texts = [];
   const context = {
     strokeStyle: "#000000",
     fillStyle: "#000000",
@@ -24,14 +25,17 @@ function createCanvasHarness() {
     setLineDash() {},
     fill() {},
     stroke() { strokes.push(this.strokeStyle); },
-    fillText() {}
+    rect() {},
+    clip() {},
+    measureText(value) { return { width: [...String(value)].length * 10 }; },
+    fillText(value, x, y) { texts.push({ value, x, y, align: this.textAlign }); }
   };
   const canvas = {
     width: 0,
     height: 0,
     getContext: () => context
   };
-  return { canvas, strokes, fills };
+  return { canvas, strokes, fills, texts };
 }
 
 test("異なる要素種別もzIndex順に描画する", async t => {
@@ -113,4 +117,42 @@ test("AI共有用ではマスクを除外し学習用では教材・ノートマ
   harness.fills.length = 0;
   await renderNotePageToCanvas({ ...base, maskMode: "all" });
   assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#ef4444", "#111827"]);
+  harness.fills.length = 0;
+  await renderNotePageToCanvas({ ...base, maskMode: "screen", revealedMaskIds: new Set(["material"]) });
+  assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#111827"], "画面どおりは表示中マスクだけ除外する");
+});
+
+test("日本語の明示改行・折り返しと中央・右寄せをCanvas PDF描画へ反映する", async t => {
+  const previousDocument = globalThis.document;
+  const harness = createCanvasHarness();
+  globalThis.document = { createElement: () => harness.canvas };
+  t.after(() => { globalThis.document = previousDocument; });
+  const base = {
+    page: { background: { type: "blank" } },
+    materialMasks: [],
+    resolveBackgroundBlob: async () => { throw new Error("不要"); },
+    resolveAssetBlob: async () => { throw new Error("不要"); },
+    width: 200,
+    height: 200
+  };
+  await renderNotePageToCanvas({
+    ...base,
+    content: { elements: [{
+      id: "jp-center", type: "text", text: "日本語の長い文章\n二行目", zIndex: 1,
+      bounds: { x: .1, y: .1, width: .3, height: .5 }, rotation: 0,
+      style: { fontSizeRatio: .05, lineHeight: 1.25, textAlign: "center", color: "#111111" }
+    }], noteMasks: [] }
+  });
+  assert.ok(harness.texts.length >= 3, "日本語をボックス幅で折り返し、明示改行を維持する");
+  assert.ok(harness.texts.every(item => item.align === "center" && item.x === 30));
+  harness.texts.length = 0;
+  await renderNotePageToCanvas({
+    ...base,
+    content: { elements: [{
+      id: "jp-right", type: "text", text: "右寄せ", zIndex: 1,
+      bounds: { x: .1, y: .1, width: .3, height: .2 }, rotation: 0,
+      style: { fontSizeRatio: .05, lineHeight: 1.25, textAlign: "right", color: "#111111" }
+    }], noteMasks: [] }
+  });
+  assert.ok(harness.texts.every(item => item.align === "right" && item.x === 60));
 });

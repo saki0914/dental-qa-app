@@ -1,4 +1,5 @@
 import {
+  arrayRemove,
   collection,
   doc,
   getDoc,
@@ -11,13 +12,13 @@ import {
   updateDoc,
   where,
   writeBatch
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 import {
   deleteObject,
   getBlob,
   ref as storageRef,
   uploadBytes
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-storage.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-storage.js";
 import {
   assertNonEmptyBlob,
   decodeImageDimensions,
@@ -32,6 +33,8 @@ import {
   shouldArchiveLinkedNote,
   splitLinkedNoteWrites
 } from "../core/note-material-mutation.js";
+import { randomId } from "../core/id.js";
+import { normalizeNoteLineElements } from "../core/note-geometry.js";
 
 export class NoteConflictError extends Error {
   constructor(message, cloudRevision) {
@@ -48,6 +51,13 @@ export class NoteRestoreBlockedError extends Error {
   }
 }
 
+export class NoteSessionChangedError extends Error {
+  constructor() {
+    super("ログインユーザーが切り替わったため、ノート処理を中断しました。");
+    this.name = "NoteSessionChangedError";
+  }
+}
+
 const nowIso = () => new Date().toISOString();
 const hashText = async text => {
   const bytes = new TextEncoder().encode(text);
@@ -61,81 +71,237 @@ const hashBlob = async blob => {
   return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, "0")).join("");
 };
 
-export function createNoteStore({ getDb, getStorage, getUser }) {
-  function context() {
+const CREATION_BATCH_SIZE = 400;
+const MAX_PENDING_STORAGE_PATHS = 1000;
+const NOTE_CREATION_WAIT_TIMEOUT_MS = 15_000;
+const NOTE_CREATION_POLL_INTERVAL_MS = 250;
+const isReadyNote = note => !note?.status || note.status === "ready";
+const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = async () => {} }) {
+  function requireExpectedUid(expectedUid) {
+    if (typeof expectedUid !== "string" || !expectedUid.trim()) {
+      throw new TypeError("ノート操作にはexpectedUidが必要です。");
+    }
+    return expectedUid;
+  }
+
+  function context(expectedUid) {
+    const requiredUid = requireExpectedUid(expectedUid);
     const user = getUser();
+    if (user?.uid !== requiredUid) throw new NoteSessionChangedError();
     const db = getDb();
     const storage = getStorage();
     if (!user || !db || !storage) throw new Error("ノートを保存するにはログインが必要です。");
     return { uid: user.uid, db, storage };
   }
+
+  function writeContext(expectedUid) {
+    return context(requireExpectedUid(expectedUid));
+  }
+
+  function readContext(expectedUid) {
+    return context(requireExpectedUid(expectedUid));
+  }
+  // Guard immediately before work that can still be cancelled. Once the final
+  // write has committed, return that success without reclassifying it as a
+  // session error; UI state is protected separately by the session generation.
   const noteRef = (db, uid, noteId) => doc(db, "users", uid, "notes", noteId);
   const pageRef = (db, uid, noteId, pageId) => doc(db, "users", uid, "notes", noteId, "pages", pageId);
   const assetRef = (db, uid, noteId, assetId) => doc(db, "users", uid, "notes", noteId, "assets", assetId);
   const materialsRef = (db, uid) => doc(db, "users", uid, "app", "pdfMaterials");
 
-  async function listNotes({ includeDeleted = false } = {}) {
-    const { uid, db } = context();
+  async function journalStoragePath(noteId, path, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    await runTransaction(db, async transaction => {
+      const reference = noteRef(db, uid, noteId);
+      const snapshot = await transaction.get(reference);
+      context(expectedUid);
+      if (!snapshot.exists() || snapshot.data()?.deletedAt || snapshot.data()?.status === "failed") {
+        throw new Error("Storage書込み先のノートを確認できません。");
+      }
+      const currentPaths = Array.isArray(snapshot.data()?.pendingStoragePaths)
+        ? snapshot.data().pendingStoragePaths
+        : [];
+      const prunedPaths = [...new Set(currentPaths.filter(item => typeof item === "string" && item))];
+      if (prunedPaths.length > MAX_PENDING_STORAGE_PATHS) {
+        throw new Error("未確認のStorageパスが上限を超えているため、クリーンアップ完了までアップロードできません。");
+      }
+      if (!prunedPaths.includes(path)) {
+        if (prunedPaths.length >= MAX_PENDING_STORAGE_PATHS) {
+          throw new Error("未確認のStorageパスが上限に達したため、新しいアップロードを開始できません。");
+        }
+        prunedPaths.push(path);
+      }
+      context(expectedUid);
+      transaction.update(reference, {
+        pendingStoragePaths: prunedPaths,
+        updatedAt: serverTimestamp()
+      });
+    });
+  }
+
+  async function clearStorageJournalPaths(noteId, paths, expectedUid) {
+    const normalized = [...new Set(paths.filter(path => typeof path === "string" && path))];
+    if (!normalized.length) return;
+    const { uid, db } = writeContext(expectedUid);
+    context(expectedUid);
+    await updateDoc(noteRef(db, uid, noteId), {
+      pendingStoragePaths: arrayRemove(...normalized),
+      updatedAt: serverTimestamp()
+    });
+  }
+
+  async function clearJournalAfterFailedUpload(noteId, path, expectedUid, uploadError) {
+    try {
+      await clearStorageJournalPaths(noteId, [path], expectedUid);
+    } catch (journalError) {
+      uploadError.journalCleanupError = journalError;
+    }
+  }
+
+  async function queueOrphanedStoragePath({ uid, noteId, path, kind, cleanupError, primaryError }) {
+    try {
+      await queueCleanup({ uid, noteId, path, kind, error: cleanupError });
+    } catch (queueError) {
+      primaryError.cleanupQueueError = queueError;
+    }
+  }
+
+  async function listNotes({ includeDeleted = false, expectedUid } = {}) {
+    const { uid, db } = readContext(expectedUid);
     const snapshots = await getDocs(collection(db, "users", uid, "notes"));
+    context(expectedUid);
     return snapshots.docs
       .map(snapshot => ({ id: snapshot.id, ...snapshot.data() }))
       .filter(note => includeDeleted || !note.deletedAt)
-      .filter(note => note.status === "ready")
+      .filter(isReadyNote)
       .sort((a, b) => String(b.updatedAt?.toDate?.() || b.updatedAt || "").localeCompare(String(a.updatedAt?.toDate?.() || a.updatedAt || "")));
   }
 
-  async function getNote(noteId) {
-    const { uid, db } = context();
+  async function getNote(noteId, { expectedUid } = {}) {
+    const { uid, db } = readContext(expectedUid);
     const snapshot = await getDoc(noteRef(db, uid, noteId));
+    context(expectedUid);
     return snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null;
   }
 
-  async function listNotesByMaterial(materialId, { includeDeleted = false } = {}) {
+  async function listNotesByMaterial(materialId, { includeDeleted = false, expectedUid } = {}) {
+    const { uid, db } = readContext(expectedUid);
     const [normalizedMaterialId] = normalizeMaterialIds([materialId]);
     if (!normalizedMaterialId) return [];
-    const { uid, db } = context();
     const snapshots = await getDocs(query(
       collection(db, "users", uid, "notes"),
       where("materialRefs", "array-contains", normalizedMaterialId)
     ));
+    context(expectedUid);
     return snapshots.docs
       .map(snapshot => ({ id: snapshot.id, ...snapshot.data() }))
       .filter(note => includeDeleted || !note.deletedAt);
   }
 
-  async function listPages(noteId) {
-    const { uid, db } = context();
+  async function listPages(noteId, { expectedUid } = {}) {
+    const { uid, db } = context(expectedUid);
     const snapshots = await getDocs(collection(db, "users", uid, "notes", noteId, "pages"));
+    context(expectedUid);
     return snapshots.docs.map(snapshot => ({ pageId: snapshot.id, ...snapshot.data() }))
       .filter(page => !page.deletedAt)
       .sort((a, b) => Number(a.order) - Number(b.order));
   }
 
-  async function createNote({ noteId = crypto.randomUUID(), pages, ...metadata }) {
-    const { uid, db } = context();
-    const materialRefs = normalizeMaterialIds(
-      Array.isArray(metadata.materialRefs)
-        ? metadata.materialRefs
-        : metadata.sourceMaterialId ? [metadata.sourceMaterialId] : []
-    );
-    const timestamps = { createdAt: serverTimestamp(), updatedAt: serverTimestamp() };
-    const noteDocument = {
+  function pageDocument(noteId, page, index) {
+    return {
       schemaVersion: 1,
-      status: metadata.status || "ready",
-      pageCount: pages.length,
+      ...page,
+      noteId,
+      order: index + 1,
+      contentRevision: 0,
+      contentPath: "",
+      contentHash: "",
       noteMaskCount: 0,
-      orderRevision: 1,
       deletedAt: null,
-      deletedReason: null,
-      deletedMaterialRefs: [],
-      ...metadata,
-      materialRefs,
-      ...timestamps
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
     };
-    if (materialRefs.length) {
-      await runTransaction(db, async transaction => {
-        const snapshot = await transaction.get(materialsRef(db, uid));
-        const materials = snapshot.data()?.pdfMaterials;
+  }
+
+  async function createPageChunks(noteId, pages, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    for (let offset = 0; offset < pages.length; offset += CREATION_BATCH_SIZE) {
+      const chunk = pages.slice(offset, offset + CREATION_BATCH_SIZE);
+      const batch = writeBatch(db);
+      chunk.forEach((page, chunkIndex) => {
+        const index = offset + chunkIndex;
+        batch.set(pageRef(db, uid, noteId, page.pageId), pageDocument(noteId, page, index));
+      });
+      batch.update(noteRef(db, uid, noteId), {
+        createdPageCount: increment(chunk.length),
+        updatedAt: serverTimestamp()
+      });
+      context(expectedUid);
+      await batch.commit();
+    }
+  }
+
+  async function rollbackCreatedPages(noteId, pageIds, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    const failedPageIds = [];
+    for (let offset = 0; offset < pageIds.length; offset += CREATION_BATCH_SIZE) {
+      const chunk = pageIds.slice(offset, offset + CREATION_BATCH_SIZE);
+      const batch = writeBatch(db);
+      chunk.forEach(pageId => batch.delete(pageRef(db, uid, noteId, pageId)));
+      try {
+        context(expectedUid);
+        await batch.commit();
+      } catch (error) {
+        console.warn("作成失敗ページの補償削除に失敗しました。", error);
+        failedPageIds.push(...chunk);
+      }
+    }
+    return failedPageIds;
+  }
+
+  async function finalizeNoteCreation(noteId, expectedPageCount, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    await runTransaction(db, async transaction => {
+      const reference = noteRef(db, uid, noteId);
+      const snapshot = await transaction.get(reference);
+      context(expectedUid);
+      const createdPageCount = Number(snapshot.data()?.createdPageCount || 0);
+      if (!snapshot.exists() || snapshot.data()?.status !== "creating" || createdPageCount !== expectedPageCount) {
+        throw new Error(`ノートページの作成件数が一致しません（${createdPageCount}/${expectedPageCount}）。`);
+      }
+      context(expectedUid);
+      transaction.update(reference, {
+        status: "ready",
+        pageCount: expectedPageCount,
+        createdPageCount,
+        orderRevision: 1,
+        failedAt: null,
+        errorPhase: null,
+        errorMessage: null,
+        pendingStoragePaths: [],
+        updatedAt: serverTimestamp()
+      });
+    });
+  }
+
+  async function reserveNoteRoot(noteId, noteDocument, materialRefs, expectedUid, reuseExisting) {
+    const { uid, db } = writeContext(expectedUid);
+    return runTransaction(db, async transaction => {
+      const reference = noteRef(db, uid, noteId);
+      const noteSnapshotPromise = transaction.get(reference);
+      const materialsSnapshotPromise = materialRefs.length
+        ? transaction.get(materialsRef(db, uid))
+        : Promise.resolve(null);
+      const [noteSnapshot, materialsSnapshot] = await Promise.all([
+        noteSnapshotPromise,
+        materialsSnapshotPromise
+      ]);
+      context(expectedUid);
+
+      if (materialsSnapshot) {
+        const materials = materialsSnapshot.data()?.pdfMaterials;
         const unavailable = materialRefs.find(materialId => {
           const material = Array.isArray(materials)
             ? materials.find(candidate => candidate?.id === materialId)
@@ -145,33 +311,119 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
         if (unavailable) {
           throw new Error("教材の差し替え・削除処理中のため、連携ノートを作成できません。");
         }
-        transaction.set(noteRef(db, uid, noteId), noteDocument);
-      });
-    } else {
-      await setDoc(noteRef(db, uid, noteId), noteDocument);
-    }
-    await Promise.all(pages.map((page, index) => setDoc(pageRef(db, uid, noteId, page.pageId), {
-      schemaVersion: 1,
-      noteId,
-      order: index + 1,
-      contentRevision: 0,
-      contentPath: "",
-      contentHash: "",
-      noteMaskCount: 0,
-      deletedAt: null,
-      ...page,
-      ...timestamps
-    })));
-    return noteId;
+      }
+
+      if (noteSnapshot.exists()) {
+        const existing = noteSnapshot.data();
+        if (reuseExisting && !existing.deletedAt && isReadyNote(existing)) return "ready";
+        if (reuseExisting && !existing.deletedAt && existing.status === "creating") return "creating";
+        if (!(reuseExisting && existing.status === "failed")) {
+          throw new Error("同じIDのノートが既に存在するため、新しいノートで上書きできません。");
+        }
+      }
+
+      context(expectedUid);
+      transaction.set(reference, noteDocument);
+      return "created";
+    });
   }
 
-  async function createCreatingNote(noteId, metadata) {
-    const { uid, db } = context();
+  async function waitForReusableNote(noteId, noteDocument, materialRefs, expectedUid) {
+    const { uid, db } = readContext(expectedUid);
+    const deadline = Date.now() + NOTE_CREATION_WAIT_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await wait(NOTE_CREATION_POLL_INTERVAL_MS);
+      context(expectedUid);
+      const snapshot = await getDoc(noteRef(db, uid, noteId));
+      context(expectedUid);
+      if (!snapshot.exists() || snapshot.data()?.status === "failed") {
+        const reservation = await reserveNoteRoot(noteId, noteDocument, materialRefs, expectedUid, true);
+        if (reservation !== "creating") return reservation;
+        continue;
+      }
+      if (!snapshot.data()?.deletedAt && isReadyNote(snapshot.data())) return "ready";
+      if (snapshot.data()?.deletedAt || snapshot.data()?.status !== "creating") {
+        throw new Error("既定ノートの作成状態を確認できません。もう一度お試しください。");
+      }
+    }
+    throw new Error("別の画面で既定ノートを作成中です。完了後にもう一度お試しください。");
+  }
+
+  async function createNote({
+    noteId = randomId(),
+    pages,
+    deferReady = false,
+    reuseExisting = false,
+    expectedUid,
+    ...metadata
+  } = {}) {
+    writeContext(expectedUid);
+    const materialRefs = normalizeMaterialIds(
+      Array.isArray(metadata.materialRefs)
+        ? metadata.materialRefs
+        : metadata.sourceMaterialId ? [metadata.sourceMaterialId] : []
+    );
+    const timestamps = { createdAt: serverTimestamp(), updatedAt: serverTimestamp() };
+    const noteDocument = {
+      schemaVersion: 1,
+      ...metadata,
+      status: "creating",
+      pageCount: pages.length,
+      createdPageCount: 0,
+      pendingStoragePaths: [],
+      noteMaskCount: 0,
+      orderRevision: 1,
+      deletedAt: null,
+      deletedReason: null,
+      deletedMaterialRefs: [],
+      materialRefs,
+      ...timestamps
+    };
+    let rootCreated = false;
+    try {
+      let reservation = await reserveNoteRoot(
+        noteId,
+        noteDocument,
+        materialRefs,
+        expectedUid,
+        reuseExisting
+      );
+      if (reservation === "creating") {
+        reservation = await waitForReusableNote(noteId, noteDocument, materialRefs, expectedUid);
+      }
+      if (reservation === "ready") {
+        context(expectedUid);
+        return noteId;
+      }
+      context(expectedUid);
+      rootCreated = true;
+      await createPageChunks(noteId, pages, expectedUid);
+      if (!deferReady) await finalizeNoteCreation(noteId, pages.length, expectedUid);
+      return noteId;
+    } catch (error) {
+      if (rootCreated) {
+        const compensation = await abortCreatingNote(noteId, {
+          pageIds: pages.map(page => page.pageId),
+          phase: "page-create",
+          error,
+          expectedUid
+        });
+        if (compensation.errors.length) error.creationCleanupErrors = compensation.errors;
+      }
+      throw error;
+    }
+  }
+
+  async function createCreatingNote(noteId, metadata, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    context(expectedUid);
     await setDoc(noteRef(db, uid, noteId), {
       schemaVersion: 1,
       ...metadata,
       status: "creating",
       pageCount: 0,
+      createdPageCount: 0,
+      pendingStoragePaths: [],
       noteMaskCount: 0,
       orderRevision: 0,
       deletedAt: null,
@@ -183,70 +435,184 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
     });
   }
 
-  async function finalizeCreatingNote(noteId, pages) {
-    const { uid, db } = context();
-    await Promise.all(pages.map((page, index) => setDoc(pageRef(db, uid, noteId, page.pageId), {
-      schemaVersion: 1,
-      noteId,
-      order: index + 1,
-      contentRevision: 0,
-      contentPath: "",
-      contentHash: "",
-      noteMaskCount: 0,
-      deletedAt: null,
-      ...page,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
-    })));
+  async function finalizeCreatingNote(noteId, pages, expectedUid) {
+    await createPageChunks(noteId, pages, expectedUid);
+    context(expectedUid);
+    await finalizeNoteCreation(noteId, pages.length, expectedUid);
+  }
+
+  async function markCreationFailed(noteId, details = {}, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    const normalized = Array.isArray(details) ? { orphanedPaths: details } : details;
+    context(expectedUid);
     await updateDoc(noteRef(db, uid, noteId), {
-      status: "ready",
-      pageCount: pages.length,
-      orderRevision: 1,
+      status: "failed",
+      failedAt: serverTimestamp(),
+      errorPhase: normalized.phase || "unknown",
+      errorMessage: String(normalized.error?.message || normalized.error || "ノート作成に失敗しました。").slice(0, 500),
+      orphanedPaths: normalized.orphanedPaths || [],
+      pendingStoragePaths: normalized.orphanedPaths || [],
+      failedPageIds: normalized.failedPageIds || [],
       updatedAt: serverTimestamp()
     });
   }
 
-  async function markCreationFailed(noteId, orphanedPaths = []) {
-    const { uid, db } = context();
-    await updateDoc(noteRef(db, uid, noteId), {
-      status: "failed",
-      orphanedPaths,
-      updatedAt: serverTimestamp()
-    }).catch(() => {});
+  async function abortCreatingNote(noteId, { pageIds = [], storagePaths = [], phase = "content-create", error, expectedUid } = {}) {
+    writeContext(expectedUid);
+    const errors = [];
+    let failedPageIds = [...pageIds];
+    let orphanedPaths = [...storagePaths];
+    try {
+      failedPageIds = await rollbackCreatedPages(noteId, pageIds, expectedUid);
+    } catch (cleanupError) {
+      errors.push(cleanupError);
+      console.error("作成失敗ページの補償削除を開始できませんでした。", cleanupError);
+    }
+    try {
+      orphanedPaths = await deleteStoragePaths(storagePaths, expectedUid);
+    } catch (cleanupError) {
+      errors.push(cleanupError);
+      console.error("作成失敗ファイルの補償削除を開始できませんでした。", cleanupError);
+    }
+    for (const path of orphanedPaths) {
+      try {
+        const { uid } = context(expectedUid);
+        await queueCleanup({
+          uid,
+          noteId,
+          path,
+          kind: "note-creation",
+          error: new Error("ノート作成失敗時のStorage補償削除に失敗しました。")
+        });
+      } catch (cleanupError) {
+        errors.push(cleanupError);
+        console.error("作成失敗ファイルを再試行キューへ記録できませんでした。", cleanupError);
+      }
+    }
+    try {
+      context(expectedUid);
+      await markCreationFailed(noteId, { phase, error, failedPageIds, orphanedPaths }, expectedUid);
+    } catch (cleanupError) {
+      errors.push(cleanupError);
+      console.error("作成失敗ノートの状態記録に失敗しました。", cleanupError);
+    }
+    return { failedPageIds, orphanedPaths, errors };
   }
 
-  async function uploadSourcePage(noteId, pageId, blob) {
+  async function cleanupStuckCreatingNotes({ olderThanMs = 24 * 60 * 60 * 1000, now = Date.now(), expectedUid } = {}) {
+    const { uid, db } = writeContext(expectedUid);
+    const snapshots = await getDocs(collection(db, "users", uid, "notes"));
+    context(expectedUid);
+    const stale = snapshots.docs.filter(snapshot => {
+      const data = snapshot.data();
+      const pendingPaths = Array.isArray(data?.pendingStoragePaths) ? data.pendingStoragePaths : [];
+      if (data?.status !== "creating" && !pendingPaths.length) return false;
+      const timestamp = data?.status === "creating" ? data.createdAt : (data.updatedAt || data.createdAt);
+      const timestampMs = typeof timestamp?.toMillis === "function"
+        ? timestamp.toMillis()
+        : new Date(timestamp || 0).getTime();
+      return Number.isFinite(timestampMs) && timestampMs > 0 && now - timestampMs >= olderThanMs;
+    });
+    const results = [];
+    for (const snapshot of stale) {
+      const data = snapshot.data();
+      const storagePaths = Array.isArray(data?.pendingStoragePaths)
+        ? [...new Set(data.pendingStoragePaths.filter(path => typeof path === "string" && path))]
+        : [];
+      if (data?.status !== "creating") {
+        const failedPaths = await deleteStoragePaths(storagePaths, expectedUid);
+        const failedSet = new Set(failedPaths);
+        const cleanedPaths = storagePaths.filter(path => !failedSet.has(path));
+        await clearStorageJournalPaths(snapshot.id, cleanedPaths, expectedUid);
+        const errors = [];
+        for (const path of failedPaths) {
+          try {
+            await queueCleanup({
+              uid,
+              noteId: snapshot.id,
+              path,
+              kind: "stale-storage-journal",
+              error: new Error("放置されたStorage journalの削除に失敗しました。")
+            });
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        results.push({ noteId: snapshot.id, failedPageIds: [], orphanedPaths: failedPaths, errors });
+        continue;
+      }
+      context(expectedUid);
+      const pageSnapshots = await getDocs(collection(db, "users", uid, "notes", snapshot.id, "pages"));
+      context(expectedUid);
+      const result = await abortCreatingNote(snapshot.id, {
+        pageIds: pageSnapshots.docs.map(pageSnapshot => pageSnapshot.id),
+        storagePaths,
+        phase: "stuck-creating",
+        error: new Error("作成開始から24時間以上完了しなかったため補償処理を行いました。"),
+        expectedUid
+      });
+      results.push({ noteId: snapshot.id, ...result });
+    }
+    return results;
+  }
+
+  async function uploadSourcePage(noteId, pageId, blob, expectedUid) {
+    requireExpectedUid(expectedUid);
     validateImageBlob(blob, { label: "PDFページ画像", allowedTypes: ["image/jpeg"] });
-    const { uid, storage } = context();
+    const { uid, storage } = context(expectedUid);
     const path = `users/${uid}/notes/${noteId}/sourcePages/${pageId}/background.jpg`;
-    await uploadBytes(storageRef(storage, path), blob, { contentType: "image/jpeg" });
+    context(expectedUid);
+    await journalStoragePath(noteId, path, expectedUid);
+    try {
+      context(expectedUid);
+      await uploadBytes(storageRef(storage, path), blob, { contentType: "image/jpeg" });
+    } catch (error) {
+      await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
+      throw error;
+    }
     return path;
   }
 
-  async function deleteStoragePaths(paths) {
-    const { storage } = context();
+  async function deleteStoragePaths(paths, expectedUid) {
+    const { storage } = writeContext(expectedUid);
     const failed = [];
     for (const path of paths) {
-      try { await deleteObject(storageRef(storage, path)); } catch (error) {
+      try {
+        context(expectedUid);
+        await deleteObject(storageRef(storage, path));
+      } catch (error) {
+        if (error?.name === "NoteSessionChangedError") throw error;
         if (error?.code !== "storage/object-not-found") failed.push(path);
       }
     }
     return failed;
   }
 
-  async function loadPageContent(noteId, page) {
-    if (!page?.contentPath) return { schemaVersion: 1, noteId, pageId: page.pageId, revision: 0, elements: [], noteMasks: [], savedAt: "" };
-    const { storage } = context();
-    const blob = await getBlob(storageRef(storage, page.contentPath));
-    assertNonEmptyBlob(blob, "ページ内容JSON");
-    const parsed = JSON.parse(await blob.text());
-    serializeValidatedJson(parsed, { noteId, pageId: page.pageId });
-    return parsed;
+  async function cleanupStoragePath(path, { noteId = "", expectedUid } = {}) {
+    const { storage } = writeContext(expectedUid);
+    try {
+      context(expectedUid);
+      await deleteObject(storageRef(storage, path));
+    } catch (error) {
+      if (error?.code !== "storage/object-not-found") throw error;
+    }
+    if (noteId) await clearStorageJournalPaths(noteId, [path], expectedUid);
   }
 
-  async function savePageContent({ noteId, pageId, expectedRevision }, content) {
-    const { uid, db, storage } = context();
-    const saveId = crypto.randomUUID();
+  async function loadPageContent(noteId, page, { expectedUid } = {}) {
+    const { storage } = readContext(expectedUid);
+    if (!page?.contentPath) return { schemaVersion: 1, noteId, pageId: page.pageId, revision: 0, elements: [], noteMasks: [], savedAt: "" };
+    const blob = await getBlob(storageRef(storage, page.contentPath));
+    context(expectedUid);
+    assertNonEmptyBlob(blob, "ページ内容JSON");
+    const parsed = JSON.parse(await blob.text());
+    serializeValidatedJson(parsed, { noteId, pageId: page.pageId }, { strict: false });
+    return normalizeNoteLineElements(parsed, page.size);
+  }
+
+  async function savePageContent({ noteId, pageId, expectedRevision, expectedUid }, content) {
+    const { uid, db, storage } = writeContext(expectedUid);
+    const saveId = randomId();
     const currentRevision = Number(expectedRevision);
     if (!Number.isInteger(currentRevision) || currentRevision < 0) {
       throw new TypeError("ページ内容の保存前リビジョンが不正です。");
@@ -255,17 +621,32 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
     const payload = { ...content, schemaVersion: 1, noteId, pageId, revision: nextRevision, savedAt: nowIso() };
     const { json, blob } = serializeValidatedJson(payload, { noteId, pageId });
     const path = `users/${uid}/notes/${noteId}/pages/${pageId}/revisions/${saveId}.json`;
-    await uploadBytes(storageRef(storage, path), blob, { contentType: "application/json" });
     const contentHash = await hashText(json);
+    context(expectedUid);
+    await journalStoragePath(noteId, path, expectedUid);
+    let uploaded = false;
 
     try {
+      context(expectedUid);
+      await uploadBytes(storageRef(storage, path), blob, { contentType: "application/json" });
+      uploaded = true;
+      context(expectedUid);
       await runTransaction(db, async transaction => {
         const reference = pageRef(db, uid, noteId, pageId);
-        const snapshot = await transaction.get(reference);
+        const noteReference = noteRef(db, uid, noteId);
+        const [snapshot, noteSnapshot] = await Promise.all([
+          transaction.get(reference),
+          transaction.get(noteReference)
+        ]);
+        context(expectedUid);
         const cloudRevision = Number(snapshot.data()?.contentRevision || 0);
         if (!snapshot.exists() || snapshot.data()?.deletedAt || cloudRevision !== currentRevision) {
           throw new NoteConflictError("別の端末でこのページが更新されています。", cloudRevision);
         }
+        if (!noteSnapshot.exists() || noteSnapshot.data()?.deletedAt || noteSnapshot.data()?.status === "failed") {
+          throw new NoteConflictError("このノートは削除済みか、作成に失敗しているため保存できません。", cloudRevision);
+        }
+        context(expectedUid);
         transaction.update(reference, {
           contentRevision: nextRevision,
           contentPath: path,
@@ -274,63 +655,118 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
           updatedAt: serverTimestamp()
         });
         const maskDelta = payload.noteMasks.length - Number(snapshot.data()?.noteMaskCount || 0);
-        transaction.update(noteRef(db, uid, noteId), { noteMaskCount: increment(maskDelta), updatedAt: serverTimestamp() });
+        transaction.update(noteReference, {
+          noteMaskCount: increment(maskDelta),
+          ...(noteSnapshot.data()?.status === "creating" ? {} : { pendingStoragePaths: arrayRemove(path) }),
+          updatedAt: serverTimestamp()
+        });
       });
       return { revision: nextRevision, contentPath: path, contentHash };
     } catch (error) {
-      await deleteObject(storageRef(storage, path)).catch(() => {});
+      if (!uploaded) {
+        await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
+        throw error;
+      }
+      let deleted = false;
+      try {
+        await deleteObject(storageRef(storage, path));
+        deleted = true;
+      } catch (cleanupError) {
+        if (cleanupError?.code !== "storage/object-not-found") {
+          await queueOrphanedStoragePath({
+            uid, noteId, path, kind: "page-revision", cleanupError, primaryError: error
+          });
+        } else {
+          deleted = true;
+        }
+      }
+      if (deleted) await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
       throw error;
     }
   }
 
-  async function uploadAsset(noteId, blob, { assetId = crypto.randomUUID(), filename = "original.png" } = {}) {
+  async function uploadAsset(noteId, blob, { assetId = randomId(), filename = "original.png", expectedUid } = {}) {
+    requireExpectedUid(expectedUid);
     validateImageBlob(blob, { label: "貼り付け画像" });
     const { naturalWidth, naturalHeight, oversized } = await decodeImageDimensions(blob);
     if (oversized) {
       throw new Error("貼り付け画像の縦横サイズまたは総画素数が上限を超えています。");
     }
-    const { uid, db, storage } = context();
+    const { uid, db, storage } = context(expectedUid);
     const extension = blob.type === "image/jpeg" ? "jpg" : blob.type === "image/webp" ? "webp" : "png";
     const safeStem = filename.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9._-]/g, "_") || "original";
     const path = `users/${uid}/notes/${noteId}/assets/${assetId}/${safeStem}.${extension}`;
     const hash = await hashBlob(blob);
-    await uploadBytes(storageRef(storage, path), blob, { contentType: blob.type });
+    context(expectedUid);
+    await journalStoragePath(noteId, path, expectedUid);
+    let uploaded = false;
     try {
-      await setDoc(assetRef(db, uid, noteId, assetId), {
-        schemaVersion: 1,
-        storagePath: path,
-        mimeType: blob.type,
-        naturalWidth,
-        naturalHeight,
-        byteSize: blob.size,
-        hash,
-        createdAt: serverTimestamp(),
-        deletedAt: null
+      context(expectedUid);
+      await uploadBytes(storageRef(storage, path), blob, { contentType: blob.type });
+      uploaded = true;
+      context(expectedUid);
+      await runTransaction(db, async transaction => {
+        const noteReference = noteRef(db, uid, noteId);
+        const noteSnapshot = await transaction.get(noteReference);
+        context(expectedUid);
+        if (!noteSnapshot.exists() || noteSnapshot.data()?.deletedAt || noteSnapshot.data()?.status === "failed") {
+          throw new Error("貼り付け画像の保存先ノートを確認できません。");
+        }
+        transaction.set(assetRef(db, uid, noteId, assetId), {
+          schemaVersion: 1,
+          storagePath: path,
+          mimeType: blob.type,
+          naturalWidth,
+          naturalHeight,
+          byteSize: blob.size,
+          hash,
+          createdAt: serverTimestamp(),
+          deletedAt: null
+        });
+        transaction.update(noteReference, {
+          ...(noteSnapshot.data()?.status === "creating" ? {} : { pendingStoragePaths: arrayRemove(path) }),
+          updatedAt: serverTimestamp()
+        });
       });
     } catch (error) {
+      if (!uploaded) {
+        await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
+        throw error;
+      }
+      let deleted = false;
       try {
         await deleteObject(storageRef(storage, path));
-      } catch {
-        error.orphanedStoragePath = path;
+        deleted = true;
+      } catch (cleanupError) {
+        if (cleanupError?.code === "storage/object-not-found") {
+          deleted = true;
+        } else {
+          error.orphanedStoragePath = path;
+          await queueOrphanedStoragePath({ uid, noteId, path, kind: "asset", cleanupError, primaryError: error });
+        }
       }
+      if (deleted) await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
       throw error;
     }
     return { assetId, storagePath: path, mimeType: blob.type, naturalWidth, naturalHeight, byteSize: blob.size, hash };
   }
 
-  async function getAsset(noteId, assetId) {
-    const { uid, db } = context();
+  async function getAsset(noteId, assetId, { expectedUid } = {}) {
+    const { uid, db } = readContext(expectedUid);
     const snapshot = await getDoc(assetRef(db, uid, noteId, assetId));
+    context(expectedUid);
     return snapshot.exists() ? { assetId, ...snapshot.data() } : null;
   }
 
-  async function getStorageBlob(path) {
-    const { storage } = context();
-    return getBlob(storageRef(storage, path));
+  async function getStorageBlob(path, { expectedUid } = {}) {
+    const { storage } = readContext(expectedUid);
+    const blob = await getBlob(storageRef(storage, path));
+    context(expectedUid);
+    return blob;
   }
 
-  async function updatePageOrder(noteId, pages, expectedOrderRevision) {
-    const { uid, db } = context();
+  async function updatePageOrder(noteId, pages, expectedOrderRevision, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
     const expectedRevision = Number(expectedOrderRevision);
     if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
       throw new TypeError("ページ並び替え前のリビジョンが不正です。");
@@ -338,18 +774,20 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
     await runTransaction(db, async transaction => {
       const reference = noteRef(db, uid, noteId);
       const snapshot = await transaction.get(reference);
+      context(expectedUid);
       const cloudRevision = Number(snapshot.data()?.orderRevision || 0);
       if (!snapshot.exists() || cloudRevision !== expectedRevision) {
         throw new NoteConflictError("別の端末でページ順が変更されています。", cloudRevision);
       }
+      context(expectedUid);
       pages.forEach((page, index) => transaction.update(pageRef(db, uid, noteId, page.pageId), { order: index + 1, updatedAt: serverTimestamp() }));
       transaction.update(reference, { orderRevision: cloudRevision + 1, pageCount: pages.length, updatedAt: serverTimestamp() });
     });
     return expectedRevision + 1;
   }
 
-  async function createPage(noteId, page, pageCount, expectedOrderRevision) {
-    const { uid, db } = context();
+  async function createPage(noteId, page, pageCount, expectedOrderRevision, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
     const expectedRevision = Number(expectedOrderRevision);
     if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
       throw new TypeError("ページ追加前の並び順リビジョンが不正です。");
@@ -357,10 +795,12 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
     const nextRevision = await runTransaction(db, async transaction => {
       const noteReference = noteRef(db, uid, noteId);
       const snapshot = await transaction.get(noteReference);
+      context(expectedUid);
       const cloudRevision = Number(snapshot.data()?.orderRevision || 0);
       if (!snapshot.exists() || cloudRevision !== expectedRevision) {
         throw new NoteConflictError("別の端末でページ順が変更されています。", cloudRevision);
       }
+      context(expectedUid);
       transaction.set(pageRef(db, uid, noteId, page.pageId), {
         schemaVersion: 1, noteId, contentRevision: 0, contentPath: "", contentHash: "", noteMaskCount: 0, deletedAt: null,
         ...page, createdAt: serverTimestamp(), updatedAt: serverTimestamp()
@@ -375,8 +815,8 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
     return nextRevision;
   }
 
-  async function deletePage(noteId, pageId, remainingPages, expectedOrderRevision) {
-    const { uid, db } = context();
+  async function deletePage(noteId, pageId, remainingPages, expectedOrderRevision, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
     const expectedRevision = Number(expectedOrderRevision);
     if (!Array.isArray(remainingPages) || !remainingPages.length) {
       throw new TypeError("ノートには1ページ以上必要です。");
@@ -384,13 +824,14 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
     if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
       throw new TypeError("ページ削除前の並び順リビジョンが不正です。");
     }
-    return runTransaction(db, async transaction => {
+    const nextRevision = await runTransaction(db, async transaction => {
       const noteReference = noteRef(db, uid, noteId);
       const pageReference = pageRef(db, uid, noteId, pageId);
       const [noteSnapshot, pageSnapshot] = await Promise.all([
         transaction.get(noteReference),
         transaction.get(pageReference)
       ]);
+      context(expectedUid);
       const cloudRevision = Number(noteSnapshot.data()?.orderRevision || 0);
       if (!noteSnapshot.exists() || cloudRevision !== expectedRevision) {
         throw new NoteConflictError("別の端末でページ順が変更されています。", cloudRevision);
@@ -398,6 +839,7 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
       if (!pageSnapshot.exists() || pageSnapshot.data()?.deletedAt) {
         throw new NoteConflictError("別の端末でこのページが削除されています。", cloudRevision);
       }
+      context(expectedUid);
       remainingPages.forEach((page, index) => {
         transaction.update(pageRef(db, uid, noteId, page.pageId), {
           order: index + 1,
@@ -408,37 +850,44 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
         deletedAt: serverTimestamp(),
         updatedAt: serverTimestamp()
       });
-      transaction.update(noteReference, {
+      const noteUpdate = {
         pageCount: remainingPages.length,
-        noteMaskCount: increment(-Number(pageSnapshot.data()?.noteMaskCount || 0)),
         orderRevision: cloudRevision + 1,
         updatedAt: serverTimestamp()
-      });
+      };
+      const removedMaskCount = Number(pageSnapshot.data()?.noteMaskCount || 0);
+      if (removedMaskCount > 0) noteUpdate.noteMaskCount = increment(-removedMaskCount);
+      transaction.update(noteReference, noteUpdate);
       return cloudRevision + 1;
     });
+    return nextRevision;
   }
 
-  async function updatePage(noteId, pageId, fields) {
-    const { uid, db } = context();
+  async function updatePage(noteId, pageId, fields, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    context(expectedUid);
     await updateDoc(pageRef(db, uid, noteId, pageId), { ...fields, updatedAt: serverTimestamp() });
   }
 
-  async function updateNote(noteId, fields) {
-    const { uid, db } = context();
+  async function updateNote(noteId, fields, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    context(expectedUid);
     await updateDoc(noteRef(db, uid, noteId), { ...fields, updatedAt: serverTimestamp() });
   }
 
-  async function deleteMaterialLinkedNotes(materialIds, operation) {
+  async function deleteMaterialLinkedNotes(materialIds, operation, expectedUid) {
+    requireExpectedUid(expectedUid);
     const normalizedMaterialIds = normalizeMaterialIds(materialIds);
     const deletedReason = MATERIAL_NOTE_DELETE_REASONS[operation];
     if (!deletedReason) throw new TypeError("連携ノートの削除理由が不正です。");
-    const { uid, db } = context();
+    const { uid, db } = context(expectedUid);
     const snapshotsByPath = new Map();
     for (const materialId of normalizedMaterialIds) {
       const snapshots = await getDocs(query(
         collection(db, "users", uid, "notes"),
         where("materialRefs", "array-contains", materialId)
       ));
+      context(expectedUid);
       snapshots.docs.forEach(snapshot => snapshotsByPath.set(snapshot.ref.path, snapshot));
     }
     const targetSnapshots = [...snapshotsByPath.values()].filter(snapshot =>
@@ -459,6 +908,7 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
         });
       });
       try {
+        context(expectedUid);
         await batch.commit();
         committedNoteIds.push(...snapshots.map(snapshot => snapshot.id));
       } catch (error) {
@@ -474,15 +924,17 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
     };
   }
 
-  async function restoreNote(noteId) {
-    const { uid, db } = context();
+  async function restoreNote(noteId, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
     await runTransaction(db, async transaction => {
       const reference = noteRef(db, uid, noteId);
       const snapshot = await transaction.get(reference);
+      context(expectedUid);
       if (!snapshot.exists()) throw new Error("ノートが見つかりません。");
       if (isMaterialDeletedReason(snapshot.data()?.deletedReason)) {
         throw new NoteRestoreBlockedError();
       }
+      context(expectedUid);
       transaction.update(reference, {
         deletedAt: null,
         deletedReason: null,
@@ -492,18 +944,19 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
     });
   }
 
-  async function deleteNote(noteId) {
+  async function deleteNote(noteId, expectedUid) {
     return updateNote(noteId, {
       deletedAt: serverTimestamp(),
       deletedReason: "user",
       deletedMaterialRefs: []
-    });
+    }, expectedUid);
   }
 
   return {
-    listNotes, getNote, listNotesByMaterial, listPages, createNote, createCreatingNote, finalizeCreatingNote, markCreationFailed,
+    listNotes, getNote, listNotesByMaterial, listPages, createNote, createCreatingNote, finalizeCreatingNote,
+    finalizeNoteCreation, abortCreatingNote, cleanupStuckCreatingNotes, markCreationFailed,
     uploadSourcePage, deleteStoragePaths, loadPageContent, savePageContent, uploadAsset, getAsset,
-    getStorageBlob, updatePageOrder, createPage, deletePage, updatePage, updateNote,
+    getStorageBlob, cleanupStoragePath, updatePageOrder, createPage, deletePage, updatePage, updateNote,
     deleteMaterialLinkedNotes, restoreNote, deleteNote
   };
 }

@@ -2,8 +2,8 @@ import {
   signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-auth.js";
-import { initializeFirebaseServices } from "./config/firebase.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
+import { initializeFirebaseServices, verifyFirebaseEmulatorConnectivity } from "./config/firebase.js";
 import { restoreLegacyQuestionStatuses } from "./core/cloud-sync-state.js";
 import { createSaveCoordinator } from "./core/save-coordinator.js";
 import {
@@ -1313,8 +1313,26 @@ function clearLocalState() {
 async function initFirebase() {
   try {
     el.cloudStatus.textContent = "Firebase初期化中です...";
-    ({ app, auth, db, storage, useEmulators: useFirebaseEmulators } = initializeFirebaseServices());
+    let emulatorHost = "";
+    ({ app, auth, db, storage, useEmulators: useFirebaseEmulators, emulatorHost } = initializeFirebaseServices());
     el.localEnvironmentBanner?.classList.toggle("hidden", !useFirebaseEmulators);
+    if (useFirebaseEmulators) {
+      const status = document.getElementById("localEnvironmentStatus");
+      const states = { Auth: "確認中", Firestore: "確認中", Storage: "確認中" };
+      const renderStatus = () => {
+        if (status) status.textContent = Object.entries(states).map(([name, value]) => `${name}: ${value}`).join(" / ");
+      };
+      renderStatus();
+      el.cloudStatus.textContent = "Firebase Emulator 3サービスへ実疎通を確認中です...";
+      await verifyFirebaseEmulatorConnectivity(emulatorHost, {
+        onStatus: (name, state) => {
+          states[name] = state === "connected" ? "接続済み" : "接続エラー";
+          renderStatus();
+        }
+      });
+      const secureNotice = document.getElementById("localSecureContextNotice");
+      if (secureNotice) secureNotice.classList.toggle("hidden", globalThis.isSecureContext === true);
+    }
     el.cloudStatus.textContent = "Firebase初期化完了です。ログイン状態を確認しています...";
 
     onAuthStateChanged(auth, async user => {
@@ -1382,6 +1400,11 @@ async function initFirebase() {
     });
   } catch (error) {
     console.error(error);
+    auth = null;
+    db = null;
+    storage = null;
+    syncPhase = "error";
+    updateLoginLockedUI();
     el.cloudStatus.textContent = "Firebase接続エラーです。\n" + (error.message || error);
     alert("Firebase接続エラーです。\n\n" + (error.message || error));
   }

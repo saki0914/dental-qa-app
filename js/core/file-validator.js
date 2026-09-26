@@ -61,7 +61,7 @@ export function canvasToVerifiedBlob(canvas, type = "image/jpeg", quality = 0.92
   });
 }
 
-export function serializeValidatedJson(value, expected = {}) {
+export function serializeValidatedJson(value, expected = {}, { strict = true } = {}) {
   const json = JSON.stringify(value);
   if (!json) throw new Error("保存用JSONを作成できませんでした。");
   const blob = assertNonEmptyBlob(
@@ -78,7 +78,7 @@ export function serializeValidatedJson(value, expected = {}) {
   if (!Array.isArray(parsed.elements)) throw new Error("ページ内容JSONのelementsが配列ではありません。");
   if (!Array.isArray(parsed.noteMasks)) throw new Error("ページ内容JSONのnoteMasksが配列ではありません。");
   assertFiniteJson(parsed);
-  validateNormalizedNoteContent(parsed);
+  validateNormalizedNoteContent(parsed, { strict });
   return { json, blob, parsed };
 }
 
@@ -88,18 +88,18 @@ function assertNormalized(value, path, { positive = false } = {}) {
   }
 }
 
-function validateBounds(bounds, path) {
+function validateBounds(bounds, path, { allowZeroSize = false } = {}) {
   if (!bounds || typeof bounds !== "object") throw new Error(`${path}がありません。`);
   assertNormalized(bounds.x, `${path}.x`);
   assertNormalized(bounds.y, `${path}.y`);
-  assertNormalized(bounds.width, `${path}.width`, { positive: true });
-  assertNormalized(bounds.height, `${path}.height`, { positive: true });
+  assertNormalized(bounds.width, `${path}.width`, { positive: !allowZeroSize });
+  assertNormalized(bounds.height, `${path}.height`, { positive: !allowZeroSize });
   if (bounds.x + bounds.width > 1.000001 || bounds.y + bounds.height > 1.000001) {
     throw new Error(`${path}がページ範囲を超えています。`);
   }
 }
 
-export function validateNormalizedNoteContent(content) {
+export function validateNormalizedNoteContent(content, { strict = false } = {}) {
   content.elements.forEach((element, elementIndex) => {
     const path = `elements[${elementIndex}]`;
     if (!["stroke", "highlighter", "shape", "text", "image"].includes(element?.type)) {
@@ -113,6 +113,23 @@ export function validateNormalizedNoteContent(content) {
         if (point.pressure != null) assertNormalized(point.pressure, `${path}.points[${pointIndex}].pressure`);
       });
       if (element.style?.widthRatio != null) assertNormalized(element.style.widthRatio, `${path}.style.widthRatio`, { positive: true });
+    } else if (element.type === "shape" && ["line", "arrow"].includes(element.shapeType)) {
+      if (strict && (!element.start || !element.end)) {
+        throw new Error(`${path}に保存形式のstart/endがありません。`);
+      }
+      const canonicalPoints = element.start && element.end
+        ? [element.start, element.end]
+        : Array.isArray(element.points) && element.points.length >= 2
+          ? element.points.slice(0, 2)
+          : null;
+      if (!canonicalPoints && !element.bounds) {
+        throw new Error(`${path}に直線のstart/endまたは互換boundsがありません。`);
+      }
+      canonicalPoints?.forEach((point, pointIndex) => {
+        assertNormalized(point.x, `${path}.${pointIndex ? "end" : "start"}.x`);
+        assertNormalized(point.y, `${path}.${pointIndex ? "end" : "start"}.y`);
+      });
+      if (element.bounds) validateBounds(element.bounds, `${path}.bounds`, { allowZeroSize: true });
     } else {
       validateBounds(element.bounds, `${path}.bounds`);
     }
@@ -165,6 +182,12 @@ export async function decodeImageDimensions(blob) {
 }
 
 export function sanitizeDownloadFilename(value, fallback = "note") {
-  const normalized = String(value || "").trim().replace(/[\\/:*?"<>|]/g, "_");
+  const normalized = String(value || "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/[. ]+$/g, "")
+    .slice(0, 180)
+    .replace(/[. ]+$/g, "");
   return normalized || fallback;
 }

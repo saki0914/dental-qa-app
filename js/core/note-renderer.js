@@ -1,4 +1,7 @@
 import { assertNonEmptyBlob, canvasToVerifiedBlob } from "./file-validator.js";
+import { lineEndpoints } from "./note-geometry.js";
+import { drawStrokeSegments } from "./note-stroke.js";
+import { visibleTextLines } from "./note-text-layout.js";
 
 function loadImage(blob) {
   assertNonEmptyBlob(blob, "描画画像");
@@ -36,9 +39,11 @@ function drawPaper(context, page, width, height) {
   context.globalAlpha = 1;
 }
 
-async function drawBlobCover(context, blob, x, y, width, height, crop = null, rotation = 0, opacity = 1) {
+async function drawBlobCover(context, blob, x, y, width, height, crop = null, rotation = 0, opacity = 1, signal) {
+  if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
   const loaded = await loadImage(blob);
   try {
+    if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
     const source = crop || { x: 0, y: 0, width: 1, height: 1 };
     const sx = source.x * loaded.image.naturalWidth;
     const sy = source.y * loaded.image.naturalHeight;
@@ -57,11 +62,37 @@ async function drawBlobCover(context, blob, x, y, width, height, crop = null, ro
 
 function drawShape(context, element, width, height) {
   const bounds = element.bounds;
+  const style = element.style || {};
+  if (["line", "arrow"].includes(element.shapeType)) {
+    const [start, end] = lineEndpoints(element, { width, height });
+    const x1 = start.x * width;
+    const y1 = start.y * height;
+    const x2 = end.x * width;
+    const y2 = end.y * height;
+    context.save();
+    context.globalAlpha = Number(style.strokeOpacity ?? 1);
+    context.strokeStyle = style.strokeColor || "#111111";
+    context.lineWidth = Math.max(1, Number(style.strokeWidthRatio || 0.002) * width);
+    context.lineCap = "round";
+    context.setLineDash(style.lineStyle === "dashed" ? [12, 8] : style.lineStyle === "dotted" ? [2, 7] : []);
+    context.beginPath(); context.moveTo(x1, y1); context.lineTo(x2, y2); context.stroke();
+    if (element.shapeType === "arrow") {
+      const angle = Math.atan2(y2 - y1, x2 - x1);
+      const arrowSize = Math.max(10, context.lineWidth * 4);
+      context.beginPath();
+      context.moveTo(x2, y2);
+      context.lineTo(x2 - arrowSize * Math.cos(angle - 0.55), y2 - arrowSize * Math.sin(angle - 0.55));
+      context.moveTo(x2, y2);
+      context.lineTo(x2 - arrowSize * Math.cos(angle + 0.55), y2 - arrowSize * Math.sin(angle + 0.55));
+      context.stroke();
+    }
+    context.restore();
+    return;
+  }
   const x = bounds.x * width;
   const y = bounds.y * height;
   const w = bounds.width * width;
   const h = bounds.height * height;
-  const style = element.style || {};
   context.save();
   context.translate(x + w / 2, y + h / 2);
   context.rotate(Number(element.rotation || 0) * Math.PI / 180);
@@ -73,9 +104,7 @@ function drawShape(context, element, width, height) {
   context.fillStyle = style.fillColor || "transparent";
 
   const path = new Path2D();
-  if (element.shapeType === "line" || element.shapeType === "arrow") {
-    path.moveTo(0, h); path.lineTo(w, 0);
-  } else if (element.shapeType === "ellipse") {
+  if (element.shapeType === "ellipse") {
     path.ellipse(w / 2, h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
   } else if (element.shapeType === "triangle") {
     path.moveTo(w / 2, 0); path.lineTo(w, h); path.lineTo(0, h); path.closePath();
@@ -99,15 +128,6 @@ function drawShape(context, element, width, height) {
   }
   context.globalAlpha = Number(style.strokeOpacity ?? 1);
   context.stroke(path);
-  if (element.shapeType === "arrow") {
-    const angle = Math.atan2(-h, w);
-    context.beginPath();
-    context.moveTo(w, 0);
-    context.lineTo(w - 18 * Math.cos(angle - 0.55), -18 * Math.sin(angle - 0.55));
-    context.moveTo(w, 0);
-    context.lineTo(w - 18 * Math.cos(angle + 0.55), -18 * Math.sin(angle + 0.55));
-    context.stroke();
-  }
   context.restore();
 }
 
@@ -129,7 +149,16 @@ function drawText(context, element, width, height) {
   context.textBaseline = "top";
   context.textAlign = style.textAlign || "left";
   const anchorX = style.textAlign === "center" ? boxWidth / 2 : style.textAlign === "right" ? boxWidth : 0;
-  String(element.text || "").split("\n").forEach((line, index) => context.fillText(line, anchorX, index * fontSize * 1.25, boxWidth));
+  const lineHeight = fontSize * Number(style.lineHeight || 1.25);
+  context.beginPath();
+  context.rect(0, 0, boxWidth, bounds.height * height);
+  context.clip();
+  visibleTextLines(element.text, {
+    maxWidth: boxWidth,
+    maxHeight: bounds.height * height,
+    lineHeight,
+    measureText: value => context.measureText(value).width
+  }).forEach((line, index) => context.fillText(line, anchorX, index * lineHeight, boxWidth));
   context.restore();
 }
 
@@ -161,16 +190,19 @@ export async function renderNotePageToCanvas({
 
   if (["pdf-source-page", "material-page"].includes(page.background?.type)) {
     const blob = await resolveBackgroundBlob(page);
-    await drawBlobCover(context, blob, 0, 0, canvas.width, canvas.height);
+    if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
+    await drawBlobCover(context, blob, 0, 0, canvas.width, canvas.height, null, 0, 1, signal);
   }
 
   const elements = [...(content.elements || [])].sort((a, b) => Number(a.zIndex || 0) - Number(b.zIndex || 0));
   for (const element of elements) {
+    if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
     if (element.type === "image") {
       const blob = await resolveAssetBlob(element.assetId, element.assetNoteId);
+      if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
       const bounds = element.bounds;
       await drawBlobCover(context, blob, bounds.x * canvas.width, bounds.y * canvas.height,
-        bounds.width * canvas.width, bounds.height * canvas.height, element.crop, element.rotation, element.opacity);
+        bounds.width * canvas.width, bounds.height * canvas.height, element.crop, element.rotation, element.opacity, signal);
     } else if (element.type === "highlighter") {
       context.save();
       context.globalAlpha = Number(element.style?.opacity ?? 0.3);
@@ -184,7 +216,10 @@ export async function renderNotePageToCanvas({
       context.strokeStyle = element.style?.color || "#111111";
       context.lineWidth = Number(element.style?.widthRatio || 0.0025) * canvas.width;
       context.lineCap = "round"; context.lineJoin = "round";
-      canvasPath(context, element.points, canvas.width, canvas.height); context.stroke(); context.restore();
+      drawStrokeSegments(context, element.points, Number(element.style?.widthRatio || 0.0025), canvas.width, canvas.height, {
+        pressureEnabled: element.pressureEnabled === true
+      });
+      context.restore();
     } else if (element.type === "shape") {
       drawShape(context, element, canvas.width, canvas.height);
     } else if (element.type === "text") {
@@ -208,6 +243,9 @@ export async function renderNotePageToCanvas({
   return canvas;
 }
 
-export async function noteCanvasToJpeg(canvas, quality) {
-  return canvasToVerifiedBlob(canvas, "image/jpeg", quality, "PDF書き出しページ");
+export async function noteCanvasToJpeg(canvas, quality, signal) {
+  if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
+  const blob = await canvasToVerifiedBlob(canvas, "image/jpeg", quality, "PDF書き出しページ");
+  if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
+  return blob;
 }

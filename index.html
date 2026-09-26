@@ -20,7 +20,8 @@
     <div class="banner" id="cloudStatus">Firebase接続を確認中です...</div>
     <div class="local-environment-banner hidden" id="localEnvironmentBanner" role="status">
       <strong>LOCAL / FIREBASE EMULATOR</strong>
-      <span>Auth: 接続済み / Firestore: 接続済み / Storage: 接続済み</span>
+      <span id="localEnvironmentStatus">Auth: 確認中 / Firestore: 確認中 / Storage: 確認中</span>
+      <span id="localSecureContextNotice" class="hidden">このローカルHTTP接続ではブラウザの安全制限により、クリップボード直接読取／共有機能を利用できない場合があります。長押しペースト、Cmd + V、写真・ファイル選択、PDFをダウンロードして共有する方法を使用してください。</span>
     </div>
   </div>
 
@@ -313,6 +314,7 @@
             <button class="note-icon-button" id="noteRedoBtn" type="button" aria-label="やり直す" title="やり直す">↷</button>
             <button class="btn soft" id="toggleNoteStudyBtn" type="button">暗記モード</button>
             <span id="noteSaveStatus" class="note-save-status" role="status">保存済み</span>
+            <button class="btn soft hidden" id="noteRetrySaveBtn" type="button">保存を再試行</button>
             <details class="note-more-menu"><summary aria-label="その他メニュー">•••</summary><div>
               <button type="button" data-note-action="export">PDFを書き出す</button>
               <button type="button" data-note-action="rename">ノート名を変更</button>
@@ -381,6 +383,7 @@
             <label><input id="noteFontBold" type="checkbox"> 太字</label>
             <label><input id="noteFontItalic" type="checkbox"> 斜体</label>
             <label>揃え <select id="noteTextAlign"><option value="left">左</option><option value="center">中央</option><option value="right">右</option></select></label>
+            <label>行間 <select id="noteLineHeight"><option value="1">狭い</option><option value="1.25" selected>標準</option><option value="1.5">広い</option><option value="2">2行</option></select></label>
             <label><input id="noteFingerDraw" type="checkbox" checked> 指で描画する</label>
           </div>
           <input id="noteImagePhotoInput" class="hidden" type="file" accept="image/*">

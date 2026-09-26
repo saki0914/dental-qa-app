@@ -2,7 +2,7 @@ import {
   doc,
   runTransaction,
   serverTimestamp
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 import {
   createQuestionChunkStorage,
   QUESTION_CHUNK_STORAGE_MODE,

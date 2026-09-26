@@ -106,19 +106,31 @@ npm run test:e2e:authenticated
 
 ## iPadを同じLANから接続する
 
-信頼できる私用LANでだけ実行してください。
+この操作だけはDev Container内ではなく、Macホストのターミナルで実行します。
 
 ```bash
-npm run local:start:lan
+npm run local:start:lan:host
 ```
 
-ターミナルへiPad用URLが表示されます。例:
+このコマンドはDocker/仮想インターフェースを候補から除外し、MacホストのプライベートIPv4だけを案内します。Macホスト自体が`172.16/12`のLANを利用している場合は、仮想インターフェースを除外したうえで候補にできます。アプリとEmulatorの5ポート（3000/4000/8080/9099/9199）がそのアドレスで応答した後にだけURLを表示します。自動検出できない場合は、MacのプライベートIPv4を明示します。
+
+```bash
+DENTAL_LAN_HOST=192.168.1.20 npm run local:start:lan:host
+```
+
+信頼できる私用LANでだけ実行してください。
+
+Dev Container内で`npm run local:start:lan`を実行した場合は、検出される`172.16/12`のDocker内IPをiPad用URLとして表示せず、上記のMacホスト用コマンドを案内して停止します。
+
+Macホスト側の`local:start:lan:host`で到達性確認が完了すると、ターミナルへiPad用URLが表示されます。例:
 
 ```text
 http://192.168.x.x:3000/?firebaseEmulator=1
 ```
 
 PCのファイアウォールで、同一LANから次のポートへの接続を許可します。
+
+SafariからのLAN接続はHTTPのためsecure contextではありません。Clipboard APIの直接読取が拒否される場合は、画面の案内に従って長押しペースト、写真選択、またはファイル選択を使用してください。
 
 | 用途 | ポート |
 |---|---:|

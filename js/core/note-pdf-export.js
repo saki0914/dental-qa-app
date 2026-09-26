@@ -33,12 +33,36 @@ export function parsePdfPageRange(value, pageCount) {
 export function createPdfFilename(title, purpose = "ai", date = new Date()) {
   const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}${String(date.getDate()).padStart(2, "0")}_${String(date.getHours()).padStart(2, "0")}${String(date.getMinutes()).padStart(2, "0")}`;
   const suffix = purpose === "ai" ? "_AI共有用" : "";
-  return sanitizeDownloadFilename(`${title || "学習ノート"}${suffix}_${stamp}.pdf`);
+  return sanitizePdfFilename(`${title || "学習ノート"}${suffix}_${stamp}.pdf`);
+}
+
+export function sanitizePdfFilename(value, fallback = "学習ノート.pdf") {
+  const fallbackValue = String(fallback).trim().replace(/[. ]+$/g, "");
+  const fallbackStem = sanitizeDownloadFilename(fallbackValue.replace(/(?:\.pdf)+$/i, ""), "学習ノート");
+  const normalizedValue = String(value || "").trim().replace(/[. ]+$/g, "");
+  const stem = sanitizeDownloadFilename(normalizedValue.replace(/(?:\s*\.pdf)+$/i, ""), fallbackStem)
+    .slice(0, 116)
+    .replace(/[. ]+$/g, "") || fallbackStem;
+  return `${stem}.pdf`;
 }
 
 async function getPdfLib() {
   if (globalThis.PDFLib?.PDFDocument) return globalThis.PDFLib;
   throw new Error("PDF出力ライブラリを読み込めませんでした。ページを再読み込みしてください。");
+}
+
+export function getPdfPageLayout(width, height, pageNumbers = false) {
+  const pointsPerPixel = 72 / 150;
+  const bodyWidth = Math.max(1, Number(width)) * pointsPerPixel;
+  const bodyHeight = Math.max(1, Number(height)) * pointsPerPixel;
+  const footerHeight = pageNumbers ? 22 : 0;
+  return {
+    bodyWidth,
+    bodyHeight,
+    footerHeight,
+    pageWidth: bodyWidth,
+    pageHeight: bodyHeight + footerHeight
+  };
 }
 
 export async function exportNotePdf({
@@ -54,16 +78,21 @@ export async function exportNotePdf({
   pageIndexes = pages.map((_, index) => index),
   revealedMaskIds = new Set(),
   onProgress = () => {},
+  onStage = () => {},
   signal
 }) {
   const preset = PDF_EXPORT_PRESETS[quality] || PDF_EXPORT_PRESETS.standard;
   const { PDFDocument } = await getPdfLib();
   const pdf = await PDFDocument.create();
+  const footerFont = pageNumbers && globalThis.PDFLib.StandardFonts
+    ? await pdf.embedFont(globalThis.PDFLib.StandardFonts.Helvetica)
+    : null;
   for (let outputIndex = 0; outputIndex < pageIndexes.length; outputIndex += 1) {
     if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
     const pageIndex = pageIndexes[outputIndex];
     const page = pages[pageIndex];
     const content = await getPageContent(page);
+    if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
     const sourceWidth = Number(page.size?.width || 1240);
     const sourceHeight = Number(page.size?.height || 1754);
     const ratio = Math.min(1, preset.maxLongEdge / Math.max(sourceWidth, sourceHeight));
@@ -79,17 +108,30 @@ export async function exportNotePdf({
       height,
       maskMode: purpose === "ai" ? "none" : purpose === "study" ? "all" : "screen",
       revealedMaskIds,
-      pageNumber: pageNumbers ? pageIndex + 1 : null,
       signal
     });
-    const jpegBlob = await noteCanvasToJpeg(canvas, preset.quality);
+    const jpegBlob = await noteCanvasToJpeg(canvas, preset.quality, signal);
+    if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
     const image = await pdf.embedJpg(await jpegBlob.arrayBuffer());
-    const pointsPerPixel = 72 / 150;
-    const pdfPage = pdf.addPage([width * pointsPerPixel, height * pointsPerPixel]);
-    pdfPage.drawImage(image, { x: 0, y: 0, width: pdfPage.getWidth(), height: pdfPage.getHeight() });
+    const { bodyWidth, bodyHeight, footerHeight, pageWidth, pageHeight } = getPdfPageLayout(width, height, pageNumbers);
+    const pdfPage = pdf.addPage([pageWidth, pageHeight]);
+    pdfPage.drawImage(image, { x: 0, y: footerHeight, width: bodyWidth, height: bodyHeight });
+    if (pageNumbers) {
+      const label = String(pageIndex + 1);
+      const fontSize = 9;
+      const textWidth = footerFont?.widthOfTextAtSize(label, fontSize) || label.length * fontSize * 0.6;
+      pdfPage.drawText(label, {
+        x: bodyWidth - textWidth - 12,
+        y: 7,
+        size: fontSize,
+        ...(footerFont ? { font: footerFont } : {})
+      });
+    }
     canvas.width = 1; canvas.height = 1;
     onProgress({ current: outputIndex + 1, total: pageIndexes.length, percent: Math.round((outputIndex + 1) / pageIndexes.length * 100) });
   }
+  if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
+  onStage("finalizing");
   const bytes = await pdf.save({ useObjectStreams: true });
   const blob = new Blob([bytes], { type: "application/pdf" });
   assertNonEmptyBlob(blob, "生成PDF");
@@ -98,7 +140,7 @@ export async function exportNotePdf({
 
 export function downloadPdfBlob(blob, filename) {
   assertNonEmptyBlob(blob, "生成PDF");
-  const safeName = String(filename || "note.pdf");
+  const safeName = sanitizePdfFilename(filename, "note.pdf");
   const file = new File([blob], safeName, { type: "application/pdf" });
   const url = URL.createObjectURL(file);
   const anchor = document.createElement("a");
@@ -114,7 +156,8 @@ export function downloadPdfBlob(blob, filename) {
 }
 
 export async function sharePdfBlob(blob, filename, title, navigatorObject = navigator) {
-  const file = new File([blob], filename, { type: "application/pdf" });
+  assertNonEmptyBlob(blob, "生成PDF");
+  const file = new File([blob], sanitizePdfFilename(filename, "note.pdf"), { type: "application/pdf" });
   if (!navigatorObject.share || !navigatorObject.canShare?.({ files: [file] })) {
     throw new Error("この端末ではPDFファイル共有を利用できません。ダウンロードを使用してください。");
   }

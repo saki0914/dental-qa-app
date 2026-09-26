@@ -1,6 +1,7 @@
 export const LINKED_NOTE_BATCH_SIZE = 500;
 export const MATERIAL_ARCHIVING_STATUS = "archiving";
 export const MATERIAL_READY_STATUS = "ready";
+export const MATERIAL_ARCHIVING_TIMEOUT_MS = 30 * 60 * 1000;
 export const MATERIAL_NOTE_DELETE_REASONS = Object.freeze({
   replacement: "material-replaced",
   deletion: "material-deleted"
@@ -31,6 +32,12 @@ export function normalizeMaterialIds(materialIds = []) {
 
 export function isMaterialArchiving(material) {
   return material?.status === MATERIAL_ARCHIVING_STATUS;
+}
+
+export function isMaterialArchivingExpired(material, now = Date.now(), timeoutMs = MATERIAL_ARCHIVING_TIMEOUT_MS) {
+  if (!isMaterialArchiving(material)) return false;
+  const startedAt = new Date(material.archivingStartedAt || 0).getTime();
+  return !Number.isFinite(startedAt) || startedAt <= 0 || now - startedAt >= timeoutMs;
 }
 
 export function markMaterialArchiving(material, operation, startedAt = new Date().toISOString()) {

@@ -1,15 +1,86 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    function optionalNonNegativeInt(data, field) {
+      return !data.keys().hasAny([field]) || (data[field] is int && data[field] >= 0);
+    }
+
+    function validSchemaVersion(data) {
+      return !data.keys().hasAny(['schemaVersion']) || (data.schemaVersion is int && data.schemaVersion == 1);
+    }
+
+    function optionalBoundedList(data, field, maxSize) {
+      return !data.keys().hasAny([field]) || (data[field] is list && data[field].size() <= maxSize);
+    }
+
+    function validNote(data) {
+      return validSchemaVersion(data)
+        && (!data.keys().hasAny(['title']) || (data.title is string && data.title.size() <= 200))
+        && (!data.keys().hasAny(['status']) || (data.status is string && data.status in ['creating', 'ready', 'failed', 'deleting']))
+        && (!data.keys().hasAny(['type']) || (data.type is string && data.type in ['standalone', 'material-linked', 'pdf-imported']))
+        && (!data.keys().hasAny(['materialRefs']) || data.materialRefs is list)
+        && optionalBoundedList(data, 'pendingStoragePaths', 1000)
+        && optionalBoundedList(data, 'orphanedPaths', 1000)
+        && optionalBoundedList(data, 'failedPageIds', 1000)
+        && (!data.keys().hasAny(['deletedAt']) || data.deletedAt == null || data.deletedAt is timestamp || data.deletedAt is string)
+        && optionalNonNegativeInt(data, 'pageCount')
+        && optionalNonNegativeInt(data, 'createdPageCount')
+        && optionalNonNegativeInt(data, 'noteMaskCount')
+        && optionalNonNegativeInt(data, 'orderRevision');
+    }
+
+    function validPage(data, userId, noteId, pageId) {
+      return validSchemaVersion(data)
+        && (!data.keys().hasAny(['noteId']) || (data.noteId is string && data.noteId == noteId))
+        && optionalNonNegativeInt(data, 'order')
+        && optionalNonNegativeInt(data, 'contentRevision')
+        && optionalNonNegativeInt(data, 'noteMaskCount')
+        && (!data.keys().hasAny(['deletedAt']) || data.deletedAt == null || data.deletedAt is timestamp || data.deletedAt is string)
+        && (!data.keys().hasAny(['contentPath']) || (
+          data.contentPath is string
+          && (
+            data.contentPath == ''
+            || data.contentPath.matches('users/' + userId + '/notes/' + noteId + '/pages/' + pageId + '/revisions/[^/]+[.]json')
+          )
+        ))
+        && (!data.keys().hasAny(['contentHash']) || data.contentHash is string);
+    }
+
+    function validAsset(data, userId, noteId, assetId) {
+      return validSchemaVersion(data)
+        && (!data.keys().hasAny(['storagePath']) || (
+          data.storagePath is string
+          && data.storagePath.matches('users/' + userId + '/notes/' + noteId + '/assets/' + assetId + '/[^/]+')
+        ))
+        && (!data.keys().hasAny(['mimeType']) || (
+          data.mimeType is string
+          && data.mimeType in ['image/png', 'image/jpeg', 'image/webp']
+        ))
+        && optionalNonNegativeInt(data, 'byteSize')
+        && optionalNonNegativeInt(data, 'naturalWidth')
+        && optionalNonNegativeInt(data, 'naturalHeight');
+    }
+
     match /users/{userId}/app/{docId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read, write: if isOwner(userId);
     }
 
     match /users/{userId}/notes/{noteId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && validNote(request.resource.data);
 
-      match /{noteDocument=**} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
+      match /pages/{pageId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validPage(request.resource.data, userId, noteId, pageId);
+      }
+
+      match /assets/{assetId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validAsset(request.resource.data, userId, noteId, assetId);
       }
     }
   }

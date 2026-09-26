@@ -66,3 +66,16 @@ test("invalid Emulator host fails closed without production Firebase fallback", 
     publicHost: false
   });
 });
+
+test("停止中のEmulatorは接続エラーとなり本番へフォールバックしない", async ({ page }) => {
+  test.setTimeout(30_000);
+  const productionFirebaseAttempts = await guardProductionFirebase(page);
+  page.on("dialog", dialog => dialog.accept());
+  await page.goto("/?firebaseEmulator=1", { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#localEnvironmentStatus")).toContainText("接続エラー", { timeout: 20_000 });
+  await expect(page.locator("#cloudStatus")).toContainText("Emulatorへ接続できません", { timeout: 20_000 });
+  await expect(page.locator("#tabBtnStudy")).toBeHidden();
+  await expect(page.locator("#tabBtnManage")).toBeHidden();
+  await expect(page.locator("#tabBtnPdf")).toBeHidden();
+  expect(productionFirebaseAttempts).toEqual([]);
+});

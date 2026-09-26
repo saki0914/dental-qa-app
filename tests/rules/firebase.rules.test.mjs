@@ -101,6 +101,54 @@ test("Firestoreは本人のノート階層だけを許可する", async () => {
   await assertFails(setDoc(doc(guestDb, "users/alice/notes/note-1"), { denied: true }));
 });
 
+test("Firestoreノートrulesは疎な旧documentを許容し、存在するschema fieldだけを検証する", async () => {
+  const aliceDb = testEnv.authenticatedContext("alice").firestore();
+  const noteRef = doc(aliceDb, "users/alice/notes/note-schema");
+  const pageRef = doc(aliceDb, "users/alice/notes/note-schema/pages/page-1");
+  const assetRef = doc(aliceDb, "users/alice/notes/note-schema/assets/asset-1");
+
+  await assertSucceeds(setDoc(noteRef, { title: "旧形式の疎なノート" }));
+  await assertSucceeds(updateDoc(noteRef, { status: "creating", pageCount: 0 }));
+  await assertSucceeds(setDoc(pageRef, { title: "旧形式ページ" }));
+  await assertSucceeds(updateDoc(pageRef, { noteId: "note-schema", contentRevision: 0 }));
+  await assertSucceeds(setDoc(assetRef, { label: "旧形式asset" }));
+
+  await assertFails(updateDoc(noteRef, { status: "unexpected" }));
+  await assertFails(updateDoc(noteRef, { title: "x".repeat(201) }));
+  await assertFails(updateDoc(noteRef, { schemaVersion: 2 }));
+  await assertFails(updateDoc(noteRef, { pageCount: -1 }));
+  await assertFails(updateDoc(noteRef, { deletedAt: 123 }));
+  await assertSucceeds(updateDoc(noteRef, { status: "deleting", deletedAt: "legacy-logical-delete" }));
+  await assertFails(updateDoc(pageRef, { noteId: "other-note" }));
+  await assertFails(updateDoc(pageRef, { contentRevision: 1.5 }));
+  await assertFails(updateDoc(pageRef, { deletedAt: 123 }));
+  await assertSucceeds(updateDoc(pageRef, { deletedAt: serverTimestamp() }));
+  await assertSucceeds(updateDoc(pageRef, {
+    contentPath: "users/alice/notes/note-schema/pages/page-1/revisions/save-1.json"
+  }));
+  await assertFails(updateDoc(pageRef, {
+    contentPath: "users/alice/notes/other-note/pages/page-1/revisions/save-1.json"
+  }));
+  await assertFails(updateDoc(pageRef, {
+    contentPath: "users/alice/notes/note-schema/pages/other-page/revisions/save-1.json"
+  }));
+  await assertFails(updateDoc(pageRef, {
+    contentPath: "users/bob/notes/note-schema/pages/page-1/revisions/save-1.json"
+  }));
+  await assertFails(updateDoc(assetRef, {
+    storagePath: "users/bob/notes/note-schema/assets/asset-1/original.png"
+  }));
+  await assertFails(updateDoc(assetRef, { mimeType: "image/svg+xml" }));
+  await assertFails(updateDoc(assetRef, { mimeType: 123 }));
+  await assertSucceeds(updateDoc(noteRef, {
+    pendingStoragePaths: ["users/alice/notes/note-schema/pages/page-1/revisions/pending.json"],
+    orphanedPaths: [],
+    failedPageIds: []
+  }));
+  await assertFails(updateDoc(noteRef, { pendingStoragePaths: "not-a-list" }));
+  await assertFails(updateDoc(noteRef, { orphanedPaths: Array.from({ length: 1001 }, (_, index) => `path-${index}`) }));
+});
+
 test("materialRefsで連携ノートを検索し、教材ロック後にbatchで論理削除できる", async () => {
   const aliceDb = testEnv.authenticatedContext("alice").firestore();
   const materialRef = doc(aliceDb, "users/alice/app/pdfMaterials");

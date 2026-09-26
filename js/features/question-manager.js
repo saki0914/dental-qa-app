@@ -3,7 +3,7 @@ import {
   uploadBytes,
   getDownloadURL,
   deleteObject
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-storage.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-storage.js";
 import {
   escapeHtml,
   normalizeAnswerList,
@@ -23,6 +23,7 @@ import {
   restoreFailedQuestionDeletes
 } from "../core/question-image-delete.js";
 import { assertNonEmptyBlob } from "../core/file-validator.js";
+import { randomId } from "../core/id.js";
 
 export function createQuestionManager(dependencies) {
   const {
@@ -145,7 +146,7 @@ function validateBulkImportItems(rawItems) {
     }
 
     const preparedItem = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       subject,
       subcategories,
       question,
@@ -890,7 +891,7 @@ async function addQuestion() {
   const payload = readEditorForm();
   if (!payload) return;
 
-  const questionId = crypto.randomUUID();
+  const questionId = randomId();
   let imageMeta = {
     imageUrl: currentEditingImageUrl || "",
     imagePath: currentEditingImagePath || "",

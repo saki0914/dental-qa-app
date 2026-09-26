@@ -6,6 +6,7 @@ import {
   MATERIAL_NOTE_DELETE_REASONS,
   assignMaterialDefaultNoteId,
   getMaterialDefaultNoteId,
+  isMaterialArchivingExpired,
   isMaterialArchiving,
   isMaterialDeletedReason,
   markMaterialArchiving,
@@ -34,6 +35,16 @@ test("教材をarchivingでロックし、完了時にreadyへ戻す", () => {
   markMaterialReady(material);
   assert.deepEqual(material, { id: "material-a", status: "ready" });
   assert.throws(() => markMaterialArchiving(material, "unknown"), /不正/);
+});
+
+test("archiving開始から30分後だけ手動解除を許可する", () => {
+  const material = {
+    status: "archiving",
+    archivingStartedAt: "2026-09-27T00:00:00.000Z"
+  };
+  assert.equal(isMaterialArchivingExpired(material, Date.parse("2026-09-27T00:29:59.999Z")), false);
+  assert.equal(isMaterialArchivingExpired(material, Date.parse("2026-09-27T00:30:00.000Z")), true);
+  assert.equal(isMaterialArchivingExpired({ status: "ready" }, Date.now()), false);
 });
 
 test("連携ノート書込をFirestore上限500件ごとに分割する", () => {

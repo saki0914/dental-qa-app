@@ -8,6 +8,7 @@
     "dev": "http-server . -a 0.0.0.0 -p 3000 -c-1",
     "local:start": "node scripts/local-dev.mjs",
     "local:start:lan": "node scripts/local-dev.mjs --lan",
+    "local:start:lan:host": "node scripts/local-dev.mjs --lan-host",
     "local:seed": "node scripts/local-seed.mjs",
     "local:reset": "node scripts/local-reset.mjs",
     "local:smoke": "node scripts/local-smoke.mjs",

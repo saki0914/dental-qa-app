@@ -1,19 +1,21 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/11.7.3/firebase-app.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js";
 import {
   browserLocalPersistence,
   connectAuthEmulator,
   indexedDBLocalPersistence,
   initializeAuth
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-auth.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
 import {
   connectFirestoreEmulator,
   getFirestore,
   initializeFirestore
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-firestore.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 import {
   connectStorageEmulator,
   getStorage
-} from "https://www.gstatic.com/firebasejs/11.7.3/firebase-storage.js";
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-storage.js";
+
+export { verifyFirebaseEmulatorConnectivity } from "../core/firebase-emulator-connectivity.js";
 
 const PRODUCTION_FIREBASE_CONFIG = {
   apiKey: "AIzaSyBdYSfjIWOT4JeNEG4ZB3j5c9I1FLoVlhM",
