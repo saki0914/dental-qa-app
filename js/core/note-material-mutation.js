@@ -6,6 +6,20 @@ export const MATERIAL_NOTE_DELETE_REASONS = Object.freeze({
   deletion: "material-deleted"
 });
 
+export function getMaterialDefaultNoteId(material) {
+  const noteId = String(material?.defaultNoteId || "").trim();
+  if (noteId.includes("/")) throw new TypeError("既定ノートIDに使用できない文字が含まれています。");
+  return noteId;
+}
+
+export function assignMaterialDefaultNoteId(material, noteId) {
+  if (!material || typeof material !== "object") throw new TypeError("教材が見つかりません。");
+  const normalized = String(noteId || "").trim();
+  if (!normalized || normalized.includes("/")) throw new TypeError("既定ノートIDが不正です。");
+  material.defaultNoteId = normalized;
+  return normalized;
+}
+
 export function normalizeMaterialIds(materialIds = []) {
   if (!Array.isArray(materialIds)) throw new TypeError("教材IDは配列で指定してください。");
   const normalized = [...new Set(materialIds.map(value => String(value || "").trim()).filter(Boolean))];
@@ -52,4 +66,11 @@ export function splitLinkedNoteWrites(items, batchSize = LINKED_NOTE_BATCH_SIZE)
 
 export function isMaterialDeletedReason(reason) {
   return Object.values(MATERIAL_NOTE_DELETE_REASONS).includes(reason);
+}
+
+export function shouldArchiveLinkedNote(note, deletedReason) {
+  if (!isMaterialDeletedReason(deletedReason)) {
+    throw new TypeError("連携ノートの削除理由が不正です。");
+  }
+  return note?.deletedReason !== deletedReason;
 }

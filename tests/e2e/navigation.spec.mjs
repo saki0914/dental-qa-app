@@ -3,6 +3,7 @@ import {
   createDiagnostics,
   expectNoRuntimeErrors,
   expectNoUnsafeFirebaseWrites,
+  guardProductionFirebase,
   openApp
 } from "../helpers/readOnlyApp.mjs";
 
@@ -26,4 +27,42 @@ test("unauthenticated navigation remains on the login surface", async ({ page })
   expect(diagnostics.mutatingRequests, "safe unauthenticated navigation should not trigger mutating requests").toEqual([]);
   await expectNoRuntimeErrors(diagnostics);
   await expectNoUnsafeFirebaseWrites(diagnostics);
+});
+
+test("invalid Emulator host fails closed without production Firebase fallback", async ({ page }) => {
+  const productionFirebaseAttempts = await guardProductionFirebase(page);
+  const dialogs = [];
+  page.on("dialog", async dialog => {
+    dialogs.push(dialog.message());
+    await dialog.accept();
+  });
+
+  const response = await page.goto("/?firebaseEmulator=1&emulatorHost=8.8.8.8", {
+    waitUntil: "domcontentloaded"
+  });
+  expect(response?.ok()).toBe(true);
+  await expect(page.locator("#cloudStatus")).toContainText("本番Firebaseには接続していません", {
+    timeout: 20_000
+  });
+  await expect(page.locator("#localEnvironmentBanner")).toBeHidden();
+  expect(dialogs.some(message => message.includes("本番Firebaseには接続していません"))).toBe(true);
+  expect(productionFirebaseAttempts).toEqual([]);
+
+  const hostChecks = await page.evaluate(async () => {
+    const { isFirebaseEmulatorEnabled } = await import("/js/config/firebase.js");
+    return {
+      localDefault: isFirebaseEmulatorEnabled({ hostname: "127.0.0.1", search: "?firebaseEmulator=1" }),
+      lanDefault: isFirebaseEmulatorEnabled({ hostname: "192.168.1.126", search: "?firebaseEmulator=1" }),
+      lanExplicit: isFirebaseEmulatorEnabled({ hostname: "192.168.1.126", search: "?firebaseEmulator=1&emulatorHost=192.168.1.126" }),
+      lanMismatch: isFirebaseEmulatorEnabled({ hostname: "192.168.1.126", search: "?firebaseEmulator=1&emulatorHost=192.168.1.127" }),
+      publicHost: isFirebaseEmulatorEnabled({ hostname: "example.com", search: "?firebaseEmulator=1" })
+    };
+  });
+  expect(hostChecks).toEqual({
+    localDefault: true,
+    lanDefault: true,
+    lanExplicit: true,
+    lanMismatch: false,
+    publicHost: false
+  });
 });

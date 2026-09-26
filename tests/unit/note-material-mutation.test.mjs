@@ -4,11 +4,14 @@ import test from "node:test";
 import {
   LINKED_NOTE_BATCH_SIZE,
   MATERIAL_NOTE_DELETE_REASONS,
+  assignMaterialDefaultNoteId,
+  getMaterialDefaultNoteId,
   isMaterialArchiving,
   isMaterialDeletedReason,
   markMaterialArchiving,
   markMaterialReady,
   normalizeMaterialIds,
+  shouldArchiveLinkedNote,
   splitLinkedNoteWrites
 } from "../../js/core/note-material-mutation.js";
 
@@ -46,4 +49,21 @@ test("教材由来の論理削除理由だけを復元禁止として識別す�
   assert.equal(isMaterialDeletedReason(MATERIAL_NOTE_DELETE_REASONS.deletion), true);
   assert.equal(isMaterialDeletedReason("user"), false);
   assert.equal(isMaterialDeletedReason(null), false);
+});
+
+test("既定ノートIDを教材レコードへ保存し、差し替え時に更新できる", () => {
+  const material = { id: "material-a" };
+  assert.equal(getMaterialDefaultNoteId(material), "");
+  assert.equal(assignMaterialDefaultNoteId(material, "note-a"), "note-a");
+  assert.equal(getMaterialDefaultNoteId(material), "note-a");
+  assert.equal(assignMaterialDefaultNoteId(material, "note-b"), "note-b");
+  assert.equal(getMaterialDefaultNoteId(material), "note-b");
+  assert.throws(() => assignMaterialDefaultNoteId(material, "invalid/note"), /不正/);
+});
+
+test("教材差し替えではユーザー削除済みノートも復元不能へ更新する", () => {
+  const replacementReason = MATERIAL_NOTE_DELETE_REASONS.replacement;
+  assert.equal(shouldArchiveLinkedNote({ deletedAt: "earlier", deletedReason: "user" }, replacementReason), true);
+  assert.equal(shouldArchiveLinkedNote({ deletedAt: "earlier", deletedReason: replacementReason }, replacementReason), false);
+  assert.throws(() => shouldArchiveLinkedNote({}, "unknown"), /削除理由/);
 });

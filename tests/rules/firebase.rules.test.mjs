@@ -112,6 +112,10 @@ test("materialRefsで連携ノートを検索し、教材ロック後にbatchで
     setDoc(doc(aliceDb, "users/alice/notes/note-linked-2"), {
       title: "連携ノート2", materialRefs: ["material-1", "material-2"], deletedAt: null
     }),
+    setDoc(doc(aliceDb, "users/alice/notes/note-linked-user-deleted"), {
+      title: "ユーザー削除済み連携ノート", materialRefs: ["material-1"],
+      deletedAt: "earlier", deletedReason: "user"
+    }),
     setDoc(doc(aliceDb, "users/alice/notes/note-other"), {
       title: "非連携ノート", materialRefs: ["material-2"], deletedAt: null
     })
@@ -124,7 +128,7 @@ test("materialRefsで連携ノートを検索し、教材ロック後にbatchで
     collection(aliceDb, "users/alice/notes"),
     where("materialRefs", "array-contains", "material-1")
   )));
-  assert.equal(linked.size, 2);
+  assert.equal(linked.size, 3);
 
   const batch = writeBatch(aliceDb);
   linked.docs.forEach(snapshot => batch.update(snapshot.ref, {
@@ -137,6 +141,7 @@ test("materialRefsで連携ノートを検索し、教材ロック後にbatchで
   assert.deepEqual((await getDoc(materialRef)).data()?.pdfMaterials, []);
   assert.equal((await getDoc(doc(aliceDb, "users/alice/notes/note-linked-1"))).data()?.deletedReason, "material-deleted");
   assert.equal((await getDoc(doc(aliceDb, "users/alice/notes/note-linked-2"))).data()?.deletedReason, "material-deleted");
+  assert.equal((await getDoc(doc(aliceDb, "users/alice/notes/note-linked-user-deleted"))).data()?.deletedReason, "material-deleted");
   assert.equal((await getDoc(doc(aliceDb, "users/alice/notes/note-other"))).data()?.deletedAt, null);
 });
 

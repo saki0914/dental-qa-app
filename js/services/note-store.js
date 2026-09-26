@@ -29,6 +29,7 @@ import {
   isMaterialArchiving,
   isMaterialDeletedReason,
   normalizeMaterialIds,
+  shouldArchiveLinkedNote,
   splitLinkedNoteWrites
 } from "../core/note-material-mutation.js";
 
@@ -440,8 +441,10 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
       ));
       snapshots.docs.forEach(snapshot => snapshotsByPath.set(snapshot.ref.path, snapshot));
     }
-    const activeSnapshots = [...snapshotsByPath.values()].filter(snapshot => !snapshot.data()?.deletedAt);
-    const batches = splitLinkedNoteWrites(activeSnapshots);
+    const targetSnapshots = [...snapshotsByPath.values()].filter(snapshot =>
+      shouldArchiveLinkedNote(snapshot.data(), deletedReason)
+    );
+    const batches = splitLinkedNoteWrites(targetSnapshots);
     const committedNoteIds = [];
     for (const snapshots of batches) {
       const batch = writeBatch(db);
@@ -465,7 +468,7 @@ export function createNoteStore({ getDb, getStorage, getUser }) {
       }
     }
     return {
-      deletedCount: activeSnapshots.length,
+      deletedCount: targetSnapshots.length,
       batchCount: batches.length,
       noteIds: committedNoteIds
     };

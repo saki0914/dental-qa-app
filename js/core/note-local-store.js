@@ -71,6 +71,24 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB) {
       return restoreFromStore(store, await run(store, "readonly", objectStore => objectStore.get(key)));
     },
     delete: (store, key) => run(store, "readwrite", objectStore => objectStore.delete(key)),
+    async deleteIfUnchanged(storeName, key, updatedAt) {
+      if (!STORES.includes(storeName)) throw new Error(`不明なIndexedDBストアです: ${storeName}`);
+      const db = await open();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction(storeName, "readwrite");
+        const store = transaction.objectStore(storeName);
+        let deleted = false;
+        const request = store.get(key);
+        request.onsuccess = () => {
+          if ((request.result?.updatedAt || request.result?.createdAt) !== updatedAt) return;
+          deleted = true;
+          store.delete(key);
+        };
+        transaction.oncomplete = () => resolve(deleted);
+        transaction.onerror = () => reject(transaction.error || request.error);
+        transaction.onabort = () => reject(transaction.error || new Error("IndexedDB処理が中断されました。"));
+      });
+    },
     async listForUser(store, uid) {
       const values = await run(store, "readonly", objectStore => objectStore.getAll()) || [];
       return values

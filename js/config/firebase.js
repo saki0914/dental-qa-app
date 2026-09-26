@@ -48,21 +48,36 @@ function isPrivateIpv4(hostname) {
 
 function getRequestedEmulatorHost(location) {
   const requested = new URLSearchParams(location?.search || "").get("emulatorHost") || "";
-  if (!requested) return LOCAL_HOSTS.has(location?.hostname) ? "127.0.0.1" : "";
+  if (!requested) {
+    if (LOCAL_HOSTS.has(location?.hostname)) return "127.0.0.1";
+    if (isPrivateIpv4(location?.hostname)) return location.hostname;
+    return "";
+  }
   if (LOCAL_HOSTS.has(requested) || isPrivateIpv4(requested)) return requested;
   return "";
 }
 
+function isFirebaseEmulatorRequested(location) {
+  return new URLSearchParams(location?.search || "").get("firebaseEmulator") === "1";
+}
+
 export function isFirebaseEmulatorEnabled(location = globalThis.location) {
   if (!location) return false;
-  const requested = new URLSearchParams(location.search).get("firebaseEmulator") === "1";
-  if (!requested) return false;
-  return LOCAL_HOSTS.has(location.hostname) ||
-    (isPrivateIpv4(location.hostname) && getRequestedEmulatorHost(location) === location.hostname);
+  if (!isFirebaseEmulatorRequested(location)) return false;
+  const emulatorHost = getRequestedEmulatorHost(location);
+  if (LOCAL_HOSTS.has(location.hostname)) return LOCAL_HOSTS.has(emulatorHost);
+  return isPrivateIpv4(location.hostname) && emulatorHost === location.hostname;
 }
 
 export function initializeFirebaseServices(location = globalThis.location) {
+  const emulatorRequested = isFirebaseEmulatorRequested(location);
   const useEmulators = isFirebaseEmulatorEnabled(location);
+  if (emulatorRequested && !useEmulators) {
+    throw new Error(
+      "ローカルFirebase Emulatorの接続先が安全ではないため、初期化を停止しました。\n" +
+      "本番Firebaseには接続していません。URLのemulatorHostを確認してください。"
+    );
+  }
   const config = useEmulators ? EMULATOR_FIREBASE_CONFIG : PRODUCTION_FIREBASE_CONFIG;
 
   const app = initializeApp(config);

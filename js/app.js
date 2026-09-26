@@ -329,6 +329,8 @@ studyNotes = createStudyNotes({
   getDb: () => db,
   getStorage: () => storage,
   getMaterials: () => imageMemory.getMaterials(),
+  ensureMaterialDefaultNoteId: (materialId, preferredNoteId) =>
+    imageMemory.ensureMaterialDefaultNoteId(materialId, preferredNoteId),
   activateSection: mode => {
     setCombinedImageNoteMode(mode);
     if (mode === "note") void studyNotes.refresh();

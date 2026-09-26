@@ -115,7 +115,7 @@ npm run local:start:lan
 ターミナルへiPad用URLが表示されます。例:
 
 ```text
-http://192.168.x.x:3000/?firebaseEmulator=1&emulatorHost=192.168.x.x
+http://192.168.x.x:3000/?firebaseEmulator=1
 ```
 
 PCのファイアウォールで、同一LANから次のポートへの接続を許可します。
@@ -138,7 +138,7 @@ LANモードはHTTPです。SafariのClipboard APIは安全なコンテキスト
 
 ### Emulatorへ接続できない
 
-URLに `?firebaseEmulator=1` があるか確認します。LAN接続では `emulatorHost` がPCのプライベートIPv4アドレスと一致する必要があります。不正なホスト指定はEmulatorモードとして受け付けません。
+URLに `?firebaseEmulator=1` があるか確認します。LAN接続では、ブラウザで開いたPCのプライベートIPv4アドレスをEmulator接続先として使用します。不正な `emulatorHost` が指定された場合は初期化を停止し、本番Firebaseへフォールバックしません。
 
 ### ログインできない
 

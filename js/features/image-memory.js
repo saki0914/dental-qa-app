@@ -23,6 +23,8 @@ import {
 import { moveImageMemoryFile } from "../core/image-memory-file-order.js";
 import { assertNonEmptyBlob } from "../core/file-validator.js";
 import {
+  assignMaterialDefaultNoteId,
+  getMaterialDefaultNoteId,
   isMaterialArchiving,
   markMaterialArchiving,
   markMaterialReady
@@ -781,6 +783,7 @@ async function addPdfMaterial() {
     uploadResult = await prepareAndUploadPdfPages(pdfId, selectedFiles);
     pdfMaterials.push(normalizeImageMaterial({
       id: pdfId,
+      defaultNoteId: crypto.randomUUID(),
       ...metadata,
       ...uploadResult,
       masks: [],
@@ -871,6 +874,7 @@ async function updatePdfMaterial() {
       await archiveMaterialLinkedNotes(replacementDecision, "replacement");
     }
     Object.assign(pdf, metadata, uploadResult, { masks: [], pdfUrl: "", pdfName: "" });
+    if (replacementDecision?.reset) assignMaterialDefaultNoteId(pdf, crypto.randomUUID());
     markMaterialReady(pdf);
     pdfRevealStates[pdf.id] = {};
     selectedMaskId = null;
@@ -900,6 +904,21 @@ async function updatePdfMaterial() {
     setPdfEditStatus("教材更新に失敗しました。\n" + (error.message || error) + lockMessage);
     alert("教材更新に失敗しました。\n\n" + (error.message || error));
   }
+}
+
+async function ensureMaterialDefaultNoteId(materialId, preferredNoteId = "") {
+  const material = pdfMaterials.find(candidate => candidate.id === materialId);
+  if (!material) throw new Error("教材が見つかりません。");
+  const existing = getMaterialDefaultNoteId(material);
+  if (existing) return existing;
+
+  const noteId = assignMaterialDefaultNoteId(material, preferredNoteId || crypto.randomUUID());
+  const saved = await requestSave({ showAlerts: true });
+  if (!saved) {
+    delete material.defaultNoteId;
+    throw new Error("教材の既定ノートIDをクラウド保存できませんでした。");
+  }
+  return noteId;
 }
 
 async function deleteCheckedPdfMaterials() {
@@ -1978,6 +1997,7 @@ function renderPdfViewer(preserveScroll = false) {
     renderViewer: renderPdfViewer,
     serialize,
     getMaterials: () => pdfMaterials.map(pdf => normalizeImageMaterial(pdf)),
+    ensureMaterialDefaultNoteId,
     setViewMode: setPdfViewMode
   };
 }

@@ -94,9 +94,7 @@ try {
   await new Promise((resolve, reject) => {
     seed.on("exit", code => code === 0 ? resolve() : reject(new Error("ローカル初期データ作成に失敗しました。")));
   });
-  const query = lan
-    ? `?firebaseEmulator=1&emulatorHost=${encodeURIComponent(publicHost)}`
-    : "?firebaseEmulator=1";
+  const query = "?firebaseEmulator=1";
   console.log("\nDental QA App ローカル確認環境");
   console.log(`アプリ: http://${publicHost}:3000/${query}`);
   console.log(`Firebase Emulator UI: http://${publicHost}:4000`);
