@@ -79,3 +79,42 @@ test("停止中のEmulatorは接続エラーとなり本番へフォールバッ
   await expect(page.locator("#tabBtnPdf")).toBeHidden();
   expect(productionFirebaseAttempts).toEqual([]);
 });
+
+test("Storage Emulatorだけが停止していても接続エラーとなり本番へフォールバックしない", async ({ page }) => {
+  test.setTimeout(30_000);
+  const productionFirebaseAttempts = await guardProductionFirebase(page);
+  const storageRequests = [];
+
+  for (const port of [9099, 8080]) {
+    await page.route(`http://127.0.0.1:${port}/**`, route => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, OPTIONS",
+        "access-control-allow-headers": "*"
+      },
+      body: "{}"
+    }));
+  }
+  await page.route("http://127.0.0.1:9199/**", async route => {
+    storageRequests.push(route.request().url());
+    await route.abort("connectionrefused");
+  });
+  page.on("dialog", dialog => dialog.accept());
+
+  await page.goto("/?firebaseEmulator=1", { waitUntil: "domcontentloaded" });
+
+  await expect(page.locator("#localEnvironmentStatus")).toHaveText(
+    "Auth: 接続済み / Firestore: 接続済み / Storage: 接続エラー",
+    { timeout: 20_000 }
+  );
+  await expect(page.locator("#cloudStatus")).toContainText("Storage Emulatorへ接続できません", {
+    timeout: 20_000
+  });
+  await expect(page.locator("#tabBtnStudy")).toBeHidden();
+  await expect(page.locator("#tabBtnManage")).toBeHidden();
+  await expect(page.locator("#tabBtnPdf")).toBeHidden();
+  expect(storageRequests).toHaveLength(3);
+  expect(productionFirebaseAttempts).toEqual([]);
+});

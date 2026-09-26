@@ -36,6 +36,10 @@ import {
   isMaterialArchiving
 } from "../core/note-material-mutation.js";
 import { createNoteSaveCoordinator } from "../core/note-save-coordinator.js";
+import {
+  loadSessionBoundBackgroundBlob,
+  loadSessionBoundMaterialDimensions
+} from "../core/note-session-loading.js";
 import { strokeSvgNodes } from "../core/note-stroke.js";
 import { visibleTextLines } from "../core/note-text-layout.js";
 import { createNoteThumbnailSignature } from "../core/note-thumbnail.js";
@@ -638,17 +642,16 @@ export function createStudyNotes(dependencies) {
         let width = Number(source.width || 0);
         let height = Number(source.height || 0);
         if (!(width > 0 && height > 0)) {
-          try {
-            let blob;
-            if (source.imagePath || source.path || source.storagePath) {
-              blob = await noteStore.getStorageBlob(source.imagePath || source.path || source.storagePath, { expectedUid: session.uid });
-            } else if (source.imageUrl || source.url) {
-              const response = await fetch(source.imageUrl || source.url);
-              if (response.ok) blob = await response.blob();
-            }
-            if (blob) ({ naturalWidth: width, naturalHeight: height } = await decodeImageDimensions(blob));
-          } catch (error) {
-            console.warn("教材画像の寸法を取得できないため既定比率を使用します。", error);
+          const dimensions = await loadSessionBoundMaterialDimensions({
+            source,
+            session,
+            assertUserSession,
+            getStorageBlob: (path, options) => noteStore.getStorageBlob(path, options),
+            decodeImageDimensions
+          });
+          assertUserSession(session);
+          if (dimensions) {
+            ({ naturalWidth: width, naturalHeight: height } = dimensions);
           }
         }
         notePages.push({
@@ -940,23 +943,15 @@ export function createStudyNotes(dependencies) {
 
   async function resolveBackgroundBlob(page) {
     const session = captureUserSession();
+    const blob = await loadSessionBoundBackgroundBlob({
+      page,
+      session,
+      assertUserSession,
+      getStorageBlob: (path, options) => noteStore.getStorageBlob(path, options),
+      getMaterialSourcePage: materialSourcePage
+    });
     assertUserSession(session);
-    if (page.background?.type === "pdf-source-page") {
-      return noteStore.getStorageBlob(page.background.imagePath, { expectedUid: session.uid });
-    }
-    if (page.background?.type === "material-page") {
-      const source = materialSourcePage(page);
-      if (source?.imagePath || source?.path || source?.storagePath) {
-        return noteStore.getStorageBlob(source.imagePath || source.path || source.storagePath, { expectedUid: session.uid });
-      }
-      if (source?.imageUrl || source?.url) {
-        const response = await fetch(source.imageUrl || source.url);
-        assertUserSession(session);
-        if (!response.ok) throw new Error("教材背景画像を取得できませんでした。");
-        return response.blob();
-      }
-    }
-    throw new Error("背景画像の参照先がありません。");
+    return blob;
   }
 
   async function resolveAssetBlob(assetId, sourceNoteId = currentNote.id) {
