@@ -18,7 +18,10 @@ async function fetchWithTimeout(url, fetchImpl, timeoutMs, options = {}) {
 
 export async function verifyFirebaseEmulatorConnectivity(emulatorHost, {
   fetchImpl = globalThis.fetch,
-  timeoutMs = 2500,
+  // Firestore rule coverage can take several seconds after a long acceptance
+  // session because the Emulator aggregates accumulated rule evaluations.
+  // Keep the probe bounded, but do not report a healthy local service as down.
+  timeoutMs = 8000,
   retries = 3,
   onStatus = () => {},
   projectId = DEFAULT_EMULATOR_PROJECT_ID

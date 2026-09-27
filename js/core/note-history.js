@@ -10,6 +10,14 @@ export function createNoteHistory({ limit = 100, clone = structuredClone } = {})
     return true;
   }
 
+  function pushImmutable(before, after, label = "編集") {
+    if (before === after) return false;
+    undoStack.push({ before, after, label });
+    if (undoStack.length > limit) undoStack.splice(0, undoStack.length - limit);
+    redoStack.length = 0;
+    return true;
+  }
+
   function undo(current) {
     const entry = undoStack.pop();
     if (!entry) return null;
@@ -31,6 +39,7 @@ export function createNoteHistory({ limit = 100, clone = structuredClone } = {})
 
   return {
     push,
+    pushImmutable,
     undo,
     redo,
     clear,

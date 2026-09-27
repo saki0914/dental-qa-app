@@ -4,6 +4,8 @@ import {
   PDF_EXPORT_PRESETS,
   createPdfFilename,
   getPdfPageLayout,
+  pdfMaskMode,
+  pdfScreenHiddenMaskIds,
   parsePdfPageRange,
   sanitizePdfFilename,
   sharePdfBlob
@@ -53,4 +55,16 @@ test("ページ番号は本文を縮小せず独立フッターへ配置し横�
   assert.equal(withFooter.pageWidth / withFooter.bodyHeight, 1600 / 900);
   assert.equal(withFooter.pageHeight, withoutFooter.pageHeight + 22);
   assert.equal(withoutFooter.footerHeight, 0);
+});
+
+test("PDFのマスク描画は用途と画面どおりの現在表示状態を分離する", () => {
+  assert.equal(pdfMaskMode("ai"), "none");
+  assert.equal(pdfMaskMode("study"), "all");
+  assert.equal(pdfMaskMode("screen"), "screen");
+  const revealed = new Set(["note:study-hidden"]);
+  const editingHidden = new Set(["note:edit-hidden"]);
+  assert.deepEqual([...pdfScreenHiddenMaskIds("ai", { revealedMaskIds: revealed, editingHiddenMaskIds: editingHidden })], []);
+  assert.deepEqual([...pdfScreenHiddenMaskIds("study", { revealedMaskIds: revealed, editingHiddenMaskIds: editingHidden })], []);
+  assert.deepEqual([...pdfScreenHiddenMaskIds("screen", { studyMode: false, revealedMaskIds: revealed, editingHiddenMaskIds: editingHidden })], ["note:edit-hidden"]);
+  assert.deepEqual([...pdfScreenHiddenMaskIds("screen", { studyMode: true, revealedMaskIds: revealed, editingHiddenMaskIds: editingHidden })], ["note:study-hidden"]);
 });

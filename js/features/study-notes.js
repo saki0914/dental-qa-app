@@ -31,18 +31,20 @@ import { chooseClipboardImage, imageFileFromPasteEvent, isTextEditingTarget, rea
 import { createNoteBackgroundSignature } from "../core/note-background.js";
 import { resolveNoteConflicts } from "../core/note-conflict-resolution.js";
 import { createNoteHistory } from "../core/note-history.js";
+import { appendPointerSamples, copyStrokePointsForCommit, createStrokeSession, flushStrokePoints } from "../core/note-stroke-session.js";
 import { createNoteEditorLease, getOrCreateNoteClientInstanceId } from "../core/note-editor-lock.js";
 import {
   createNoteEditorDiagnosticSnapshot,
   rebaseRecoveredNoteContent,
   resolveNoteEditorTabId,
+  reorderNoteMasks,
   sanitizeDiagnosticUrlParameters,
   saveStatePresentation,
   shouldRecoverLocalNoteState
 } from "../core/note-editor-state.js";
 import { createNoteInputGuard } from "../core/note-input-guard.js";
 import { createNoteLocalStore, noteLocalKey } from "../core/note-local-store.js";
-import { getMaterialPageMasks } from "../core/note-mask-adapter.js";
+import { getMaterialPageMasks, maskVisibilityKey } from "../core/note-mask-adapter.js";
 import {
   getMaterialDefaultNoteId,
   isMaterialArchiving
@@ -55,8 +57,20 @@ import {
   loadSessionBoundMaterialDimensions
 } from "../core/note-session-loading.js";
 import { strokeSvgNodes } from "../core/note-stroke.js";
-import { visibleTextLines } from "../core/note-text-layout.js";
+import { ensureTextElementHeight, layoutTextBox } from "../core/note-text-layout.js";
+import { resolvePageSwipe } from "../core/note-page-swipe.js";
 import { createNoteThumbnailSignature } from "../core/note-thumbnail.js";
+import {
+  cancelledStrokeCanBeCommitted,
+  createClosedTransientUi,
+  openTransientUi as createTransientUi,
+  reconcileCropSession,
+  settingsTransientType,
+  toolKeepsSelection,
+  transientPanelMaxHeight,
+  transientUiCanTransition,
+  transientUiIsSettings
+} from "../core/note-transient-ui.js";
 import { noteCanvasToJpeg, renderNotePageToCanvas } from "../core/note-renderer.js";
 import { createPageZoomController } from "../core/page-zoom-controller.js";
 import {
@@ -65,6 +79,7 @@ import {
   downloadPdfBlob,
   exportNotePdf,
   parsePdfPageRange,
+  pdfScreenHiddenMaskIds,
   sanitizePdfFilename,
   sharePdfBlob
 } from "../core/note-pdf-export.js";
@@ -142,9 +157,18 @@ export function createStudyNotes(dependencies) {
   } = dependencies;
   const byId = id => document.getElementById(id);
   const routeParams = new URLSearchParams(globalThis.location?.search || "");
-  const dedicatedEditorNoteId = routeParams.get("noteEditor") === "1" ? routeParams.get("noteId") || "" : "";
-  const dedicatedEditor = Boolean(dedicatedEditorNoteId);
-  if (dedicatedEditor) document.body.classList.add("note-editor-dedicated");
+  const dedicatedEditorRoute = routeParams.get("noteEditor") === "1";
+  const dedicatedEditorCreateMode = dedicatedEditorRoute ? routeParams.get("create") || "" : "";
+  const dedicatedEditorNoteId = dedicatedEditorRoute ? routeParams.get("noteId") || "" : "";
+  const dedicatedEditor = Boolean(dedicatedEditorRoute && (dedicatedEditorNoteId || dedicatedEditorCreateMode));
+  if (dedicatedEditor) {
+    document.documentElement.classList.add("note-editor-dedicated");
+    document.body.classList.add("note-editor-dedicated");
+    if (dedicatedEditorCreateMode) {
+      document.documentElement.classList.add("note-editor-create");
+      document.body.classList.add("note-editor-create");
+    }
+  }
   const ui = {
     noteModeBtn: byId("noteModeBtn"), noteView: byId("noteView"), listView: byId("noteListView"),
     createView: byId("noteCreateView"), editorView: byId("noteEditorView"), list: byId("noteList"),
@@ -153,11 +177,14 @@ export function createStudyNotes(dependencies) {
     createProgress: byId("noteCreateProgress"), createProgressLabel: byId("noteCreateProgressLabel"),
     createProgressBar: byId("noteCreateProgressBar"), cancelCreateProgress: byId("cancelNoteProgressBtn"),
     closeNote: byId("closeNoteBtn"), title: byId("noteTitleInput"), pageCounter: byId("notePageCounter"), pagesButton: byId("notePagesBtn"),
+    editorHeader: byId("noteEditorView")?.querySelector(".note-editor-header"), localSlot: byId("noteEditorLocalSlot"),
     undo: byId("noteUndoBtn"), redo: byId("noteRedoBtn"), studyToggle: byId("toggleNoteStudyBtn"),
     saveStatus: byId("noteSaveStatus"), pageSidebar: byId("notePageSidebar"), pageList: byId("notePageList"),
     saveStatusIcon: byId("noteSaveStatusIcon"), saveStatusButtonText: byId("noteSaveStatusButtonText"), saveStatusLive: byId("noteSaveStatusLive"),
     saveStatusText: byId("noteSaveStatusText"), saveStatusDetail: byId("noteSaveStatusDetail"),
     savePopover: byId("noteSavePopover"), continueEditing: byId("noteContinueEditingBtn"),
+    editorNotice: byId("noteEditorNotice"),
+    moreMenu: byId("noteMoreMenu"),
     restoreLocalDraft: byId("noteRestoreLocalDraftBtn"),
     saveDiagnostics: byId("noteSaveDiagnosticsBtn"), saveList: byId("noteSaveListBtn"), markupDone: byId("noteMarkupDoneBtn"),
     retrySave: byId("noteRetrySaveBtn"),
@@ -168,28 +195,48 @@ export function createStudyNotes(dependencies) {
     lockBanner: byId("noteEditorLockBanner"), lockMessage: byId("noteEditorLockMessage"),
     lockReadOnly: byId("noteEditorReadOnlyBtn"), lockTakeover: byId("noteEditorTakeoverBtn"), lockReturn: byId("noteEditorReturnBtn"),
     conflictBanner: byId("notePageConflictBanner"),
-    viewport: byId("noteViewport"), stage: byId("notePageStage"), studyControls: byId("noteStudyControls"),
-    maskCounts: byId("noteMaskCounts"), selectionActions: byId("noteSelectionActions"),
+    viewport: byId("noteViewport"), stage: byId("notePageStage"),
+    drawingInput: byId("notePageStage")?.querySelector('[data-layer="drawing-input"]'), studyControls: byId("noteStudyControls"),
+    eraserCursor: byId("notePixelEraserCursor"), maskSelectMode: byId("noteMaskSelectModeBtn"),
+    maskCounts: byId("noteMaskCounts"), selectionActions: byId("noteSelectionActions"), selectionActionsTitle: byId("noteSelectionActionsTitle"),
     toolbar: byId("noteEditorView")?.querySelector(".note-toolbar"), settings: byId("noteToolSettings"),
+    settingSections: [...document.querySelectorAll("#noteToolSettings [data-setting-tools]")],
     color: byId("noteColorInput"), width: byId("noteWidthInput"), opacity: byId("noteOpacityInput"),
     eraserMode: byId("noteEraserMode"), shapeType: byId("noteShapeType"), fingerDraw: byId("noteFingerDraw"),
     eraserSize: byId("noteEraserSize"), pencilMode: byId("notePencilMode"), straightenEnabled: byId("noteStraightenEnabled"),
     toolbarDock: byId("noteToolbarDock"), quickSwitchAction: byId("noteQuickSwitchAction"),
+    pageNavigation: byId("notePageNavigation"),
     quickSwitch: byId("noteQuickSwitchBtn"), toolbarDrag: byId("noteToolbarDragHandle"), toolbarCollapse: byId("noteToolbarCollapseBtn"),
     eraserBadge: byId("noteEraserBadge"), settingsTitle: byId("noteToolSettingsTitle"),
     settingsDone: byId("noteToolSettingsDoneBtn"), toolbarAutoHide: byId("noteToolbarAutoHide"),
+    inputSettings: byId("noteInputSettingsBtn"), maskVisibility: byId("noteMaskVisibilityBtn"),
     colorPresets: byId("noteColorPresets"), widthPresets: byId("noteWidthPresets"),
-    lineStyle: byId("noteLineStyle"), fillColor: byId("noteFillColor"), fillOpacity: byId("noteFillOpacity"),
+    widthValue: byId("noteWidthValue"), opacityValue: byId("noteOpacityValue"),
+    eraserPresets: byId("noteEraserPresets"), eraserSizeValue: byId("noteEraserSizeValue"),
+    lineStyle: byId("noteLineStyle"), fillColor: byId("noteFillColor"), fillOpacity: byId("noteFillOpacity"), fillOpacityValue: byId("noteFillOpacityValue"),
+    shapeStrokeColor: byId("noteShapeStrokeColor"), shapeStrokeWidth: byId("noteShapeStrokeWidth"),
+    shapeStrokeWidthValue: byId("noteShapeStrokeWidthValue"), shapeStrokeOpacity: byId("noteShapeStrokeOpacity"),
+    shapeStrokeOpacityValue: byId("noteShapeStrokeOpacityValue"),
     fontFamily: byId("noteFontFamily"), fontSize: byId("noteFontSize"), fontBold: byId("noteFontBold"),
-    fontItalic: byId("noteFontItalic"), textAlign: byId("noteTextAlign"), lineHeight: byId("noteLineHeight"),
+    fontSizeValue: byId("noteFontSizeValue"), fontItalic: byId("noteFontItalic"), textAlign: byId("noteTextAlign"), lineHeight: byId("noteLineHeight"),
+    textColor: byId("noteTextColor"), textOpacity: byId("noteTextOpacity"), textOpacityValue: byId("noteTextOpacityValue"),
     currentColor: byId("noteCurrentColor"), styleBtn: byId("noteStyleBtn"), backgroundBtn: byId("noteBackgroundBtn"),
+    imageSourceMenu: byId("noteImageSourceMenu"), imageSourceDone: byId("noteImageSourceDone"),
+    imageClipboard: document.querySelector('#noteImageSourceMenu [data-image-source="clipboard"]'),
+    imagePhoto: document.querySelector('#noteImageSourceMenu [data-image-source="photo"]'),
+    imageFile: document.querySelector('#noteImageSourceMenu [data-image-source="file"]'),
     photoInput: byId("noteImagePhotoInput"), fileInput: byId("noteImageFileInput"), pasteFallback: byId("notePasteFallback"),
+    localEnvironmentBanner: byId("localEnvironmentBanner"), localEnvironmentToggle: byId("localEnvironmentToggle"),
+    localEnvironmentDetails: byId("localEnvironmentDetails"), localEnvironmentDone: byId("localEnvironmentDone"),
     exportDialog: byId("noteExportDialog"), exportPurpose: byId("noteExportPurpose"), exportRangeMode: byId("noteExportRangeMode"),
     exportRange: byId("noteExportRange"), exportQuality: byId("noteExportQuality"), exportFilename: byId("noteExportFilename"),
     exportPageNumbers: byId("noteExportPageNumbers"), exportProgress: byId("noteExportProgress"), exportStatus: byId("noteExportStatus"),
     createPdf: byId("createNotePdfBtn"), downloadPdf: byId("downloadNotePdfBtn"), sharePdf: byId("shareNotePdfBtn"),
     cancelPdf: byId("cancelNotePdfBtn")
   };
+  if (dedicatedEditor && ui.localSlot && ui.localEnvironmentBanner) {
+    ui.localSlot.append(ui.localEnvironmentBanner);
+  }
   const localStore = createNoteLocalStore();
   const noteStore = createNoteStore({
     getDb,
@@ -208,6 +255,15 @@ export function createStudyNotes(dependencies) {
   let currentTool = "pen";
   let selectedIds = [];
   let activeGesture = null;
+  let pendingStrokeWork = null;
+  let pendingStrokeTimer = 0;
+  let pendingThumbnailTimer = 0;
+  let swipeGesture = null;
+  let pageSwitching = false;
+  let maskMultiSelect = false;
+  let eraserCursorFrame = 0;
+  let transientUi = createClosedTransientUi();
+  let syncingTransientUi = false;
   let renderToken = 0;
   let backgroundRenderToken = 0;
   let renderedBackgroundSignature = "";
@@ -220,6 +276,7 @@ export function createStudyNotes(dependencies) {
   let pasteOffset = 0;
   let studyMode = false;
   let revealedMaskIds = new Set();
+  let editingHiddenMaskIds = new Set();
   let assetCache = new Map();
   let contentCache = new Map();
   let hasSeenPen = false;
@@ -233,12 +290,12 @@ export function createStudyNotes(dependencies) {
   let editorTabId = routeParams.get("editorTabId") || randomId();
   let conflictPageIds = new Set();
   const activeTouchPointerIds = new Set();
-  let pageZoomGestureActive = false;
   let routeOpened = false;
   const inputGuard = createNoteInputGuard();
   const pendingAssetRecoveryPromises = new Map();
   const pendingRecoveryPromises = new Map();
   const pendingRecoverySweeps = new Map();
+  const pendingLocalSavePromises = new Map();
   let userSessionGeneration = 0;
   let cropSession = null;
   const thumbnailTokens = new Map();
@@ -248,8 +305,24 @@ export function createStudyNotes(dependencies) {
   let lastSaveError = null;
   let lastSaveSucceededAt = "";
   let currentSaveState = "saved";
+  const drawingDiagnostics = {
+    pointerdown: 0,
+    pointerup: 0,
+    pointercancel: 0,
+    lostpointercapture: 0,
+    sessionsCreated: 0,
+    strokesCommitted: 0,
+    strokesDiscarded: 0,
+    discardedReasons: {},
+    coalescedPoints: 0,
+    eventIntervals: [],
+    straightenTimerFires: 0,
+    longestMainThreadGapMs: 0
+  };
   let markupMode = true;
   let localRecoverySuppressed = false;
+  let textEditorSession = null;
+  let editorNoticeTimer = null;
 
   function captureUserSession() {
     const uid = getCurrentUser()?.uid;
@@ -309,7 +382,7 @@ export function createStudyNotes(dependencies) {
     }
     ui.saveStatus.dataset.state = state;
     ui.saveStatusIcon.textContent = presentation.icon;
-    ui.saveStatusButtonText.textContent = presentation.label;
+    ui.saveStatusButtonText.textContent = presentation.shortLabel || presentation.label;
     ui.saveStatus.setAttribute("aria-label", presentation.label);
     ui.saveStatus.title = presentation.label;
     ui.saveStatusLive.textContent = presentation.label;
@@ -328,8 +401,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function closeSavePopover() {
-    ui.savePopover?.classList.add("hidden");
-    ui.saveStatus?.setAttribute("aria-expanded", "false");
+    if (transientUi.type === "save-status-popover") closeTransientUi();
   }
 
   function setLocalDraftRecoveryAvailable(available) {
@@ -337,14 +409,14 @@ export function createStudyNotes(dependencies) {
   }
 
   function toggleSavePopover(force) {
-    const open = force ?? ui.savePopover.classList.contains("hidden");
-    ui.savePopover.classList.toggle("hidden", !open);
-    ui.saveStatus.setAttribute("aria-expanded", String(open));
+    const open = force ?? transientUi.type !== "save-status-popover";
+    if (open) setTransientUi("save-status-popover");
+    else closeTransientUi();
   }
 
   function noteListUrl() {
     const url = new URL(globalThis.location.href);
-    ["noteEditor", "noteId", "editorTabId", "study"].forEach(name => url.searchParams.delete(name));
+    ["noteEditor", "noteId", "editorTabId", "study", "create", "creationSessionId"].forEach(name => url.searchParams.delete(name));
     return url;
   }
 
@@ -391,7 +463,14 @@ export function createStudyNotes(dependencies) {
       viewport: { width: globalThis.innerWidth || 0, height: globalThis.innerHeight || 0 },
       zoom: zoomController?.zoom || 1,
       pageRect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
-      startupState
+      startupState,
+      drawing: {
+        ...drawingDiagnostics,
+        eventIntervals: undefined,
+        averageEventIntervalMs: drawingDiagnostics.eventIntervals.length
+          ? drawingDiagnostics.eventIntervals.reduce((sum, value) => sum + value, 0) / drawingDiagnostics.eventIntervals.length
+          : 0
+      }
     });
   }
 
@@ -455,7 +534,152 @@ export function createStudyNotes(dependencies) {
       width: toolSettings.eraserSize,
       opacity: 100
     };
+    if (currentTool === "shape") return {
+      color: toolSettings.shapeStrokeColor,
+      width: toolSettings.shapeStrokeWidth,
+      opacity: toolSettings.shapeStrokeOpacity
+    };
+    if (currentTool === "text") return {
+      color: toolSettings.textColor,
+      width: toolSettings.textFontSize,
+      opacity: toolSettings.textOpacity
+    };
     return { color: toolSettings.penColor, width: toolSettings.penWidth, opacity: toolSettings.penOpacity };
+  }
+
+  function syncTransientUi() {
+    const type = transientUi.type;
+    const settingsOpen = transientUiIsSettings(transientUi);
+    syncingTransientUi = true;
+    try {
+      ui.settings.classList.toggle("hidden", !settingsOpen);
+      ui.settings.setAttribute("aria-hidden", String(!settingsOpen));
+      ui.imageSourceMenu?.classList.toggle("hidden", type !== "image-source-menu");
+      ui.savePopover?.classList.toggle("hidden", type !== "save-status-popover");
+      ui.saveStatus?.setAttribute("aria-expanded", String(type === "save-status-popover"));
+      ui.localEnvironmentDetails?.classList.toggle("hidden", type !== "local-environment-popover");
+      ui.localEnvironmentToggle?.setAttribute("aria-expanded", String(type === "local-environment-popover"));
+      ui.pasteFallback?.classList.toggle("hidden", type !== "paste-fallback");
+      if (ui.moreMenu) ui.moreMenu.open = type === "more-menu";
+      ui.toolbar?.querySelectorAll("[data-note-tool]").forEach(button => {
+        const buttonType = settingsTransientType(button.dataset.noteTool === "eraser-object" ? currentTool : button.dataset.noteTool);
+        button.setAttribute("aria-expanded", String(settingsOpen && buttonType === type));
+      });
+      ui.inputSettings?.setAttribute("aria-expanded", String(type === "input-settings"));
+      renderSelectionActionsVisibility();
+    } finally {
+      syncingTransientUi = false;
+    }
+  }
+
+  function showEditorNotice(message) {
+    if (!ui.editorNotice) return;
+    clearTimeout(editorNoticeTimer);
+    ui.editorNotice.textContent = String(message || "");
+    ui.editorNotice.classList.remove("hidden");
+    editorNoticeTimer = setTimeout(() => {
+      ui.editorNotice.classList.add("hidden");
+      ui.editorNotice.textContent = "";
+    }, 4_000);
+  }
+
+  function setTransientUi(type = "closed", options = {}) {
+    if (!transientUiCanTransition(transientUi, type, { cropActive: Boolean(cropSession) })) {
+      syncTransientUi();
+      showEditorNotice("トリミング編集中です。適用またはキャンセルしてから操作してください。");
+      return false;
+    }
+    const previousType = transientUi.type;
+    transientUi = type === "closed" ? createClosedTransientUi() : createTransientUi(type, options);
+    const nextType = transientUi.type;
+    syncTransientUi();
+    requestAnimationFrame(() => {
+      if (transientUi.type !== nextType) return;
+      positionTransientUi();
+      if (nextType === "save-status-popover" && previousType !== "save-status-popover") {
+        ui.savePopover?.querySelector("button:not(.hidden):not(:disabled)")?.focus({ preventScroll: true });
+      } else if (previousType === "save-status-popover" && nextType !== "save-status-popover") {
+        ui.saveStatus?.focus({ preventScroll: true });
+      }
+    });
+    return true;
+  }
+
+  function closeTransientUi() {
+    return setTransientUi("closed");
+  }
+
+  function positionTransientUi() {
+    if (transientUiIsSettings(transientUi)) positionTransientPanel(ui.settings);
+    else if (transientUi.type === "image-source-menu") positionTransientPanel(ui.imageSourceMenu);
+    else if (transientUi.type === "save-status-popover") positionSavePopover();
+    else if (transientUi.type === "crop-editor") positionCropActions();
+  }
+
+  function positionSavePopover() {
+    if (!ui.savePopover || ui.savePopover.classList.contains("hidden")) return true;
+    const viewport = globalThis.visualViewport;
+    const view = {
+      left: Number(viewport?.offsetLeft || 0),
+      top: Number(viewport?.offsetTop || 0),
+      width: Number(viewport?.width || globalThis.innerWidth || 0),
+      height: Number(viewport?.height || globalThis.innerHeight || 0)
+    };
+    const margin = 12;
+    const availableWidth = view.width - margin * 2;
+    const availableHeight = view.height - margin * 2;
+    if (availableWidth <= 0 || availableHeight <= 0) {
+      closeTransientUi();
+      return false;
+    }
+    ui.savePopover.style.maxInlineSize = `${Math.floor(availableWidth)}px`;
+    ui.savePopover.style.maxBlockSize = `${Math.floor(availableHeight)}px`;
+    const anchor = ui.saveStatus.getBoundingClientRect();
+    const popover = ui.savePopover.getBoundingClientRect();
+    if (popover.width > availableWidth + 1 || popover.height > availableHeight + 1) {
+      closeTransientUi();
+      return false;
+    }
+    const gap = 6;
+    const minLeft = view.left + margin;
+    const maxLeft = view.left + view.width - popover.width - margin;
+    const left = Math.min(Math.max(anchor.right - popover.width, minLeft), Math.max(minLeft, maxLeft));
+    const minTop = view.top + margin;
+    const maxTop = view.top + view.height - popover.height - margin;
+    const below = anchor.bottom + gap;
+    const above = anchor.top - popover.height - gap;
+    const preferredTop = below <= maxTop ? below : above;
+    const top = Math.min(Math.max(preferredTop, minTop), Math.max(minTop, maxTop));
+    ui.savePopover.style.left = `${Math.round(left)}px`;
+    ui.savePopover.style.top = `${Math.round(top)}px`;
+    return true;
+  }
+
+  function renderSelectionActionsVisibility() {
+    if (!ui.selectionActions) return;
+    const hasSelection = Boolean(currentContent) && (currentTool === "select"
+      ? selectedElements().length > 0
+      : currentTool === "mask" && selectedMasks().length > 0);
+    ui.selectionActions.classList.toggle("hidden", !hasSelection || studyMode || transientUi.type !== "selection-context-menu");
+    if (hasSelection && ui.selectionActionsTitle) {
+      const elements = selectedElements();
+      ui.selectionActionsTitle.textContent = currentTool === "mask"
+        ? `${selectedMasks().length}個選択中`
+        : elements.length === 1 && elements[0].type === "image"
+          ? "画像を編集"
+          : "選択項目を編集";
+    }
+    const maskActions = new Set(["duplicate", "front", "back", "weak", "weak-on", "weak-off", "delete", "select-page-masks", "clear-selection"]);
+    ui.selectionActions.querySelectorAll("button[data-selection-action]").forEach(button => {
+      button.classList.toggle("hidden", currentTool === "mask" && !maskActions.has(button.dataset.selectionAction));
+    });
+  }
+
+  function showSelectionContext() {
+    const ids = currentTool === "mask" ? selectedMasks().map(mask => mask.id) : selectedElements().map(element => element.id);
+    if (ids.length) setTransientUi("selection-context-menu", { ownerTool: currentTool, targetElementIds: ids });
+    else if (transientUi.type === "selection-context-menu") closeTransientUi();
+    else renderSelectionActionsVisibility();
   }
 
   function applyToolbarDock(dock = toolSettings.toolbarDock) {
@@ -466,6 +690,8 @@ export function createStudyNotes(dependencies) {
     ui.toolbar.classList.add(`dock-${value}`);
     ui.settings.classList.remove("dock-top", "dock-right", "dock-bottom", "dock-left");
     ui.settings.classList.add(`dock-${value}`);
+    ui.imageSourceMenu?.classList.remove("dock-top", "dock-right", "dock-bottom", "dock-left");
+    ui.imageSourceMenu?.classList.add(`dock-${value}`);
     ui.editorView.dataset.toolbarDock = value;
     if (ui.toolbarDock) ui.toolbarDock.value = value;
   }
@@ -494,6 +720,12 @@ export function createStudyNotes(dependencies) {
       button.classList.toggle("active", Number(selected.width) === value);
       return button;
     }));
+    ui.eraserPresets?.replaceChildren(...[["小", 14], ["中", 30], ["大", 60]].map(([label, value]) => {
+      const button = document.createElement("button"); button.type = "button";
+      button.textContent = label; button.dataset.width = String(value);
+      button.classList.toggle("active", Number(toolSettings.eraserSize) === value);
+      return button;
+    }));
   }
 
   function applyToolSettingsToUi() {
@@ -502,19 +734,46 @@ export function createStudyNotes(dependencies) {
     ui.width.value = String(selected.width);
     ui.opacity.value = String(selected.opacity);
     ui.currentColor.style.background = selected.color;
+    if (ui.widthValue) ui.widthValue.value = String(Math.round(selected.width));
+    if (ui.opacityValue) ui.opacityValue.value = `${Math.round(selected.opacity)}%`;
     ui.eraserMode.value = toolSettings.eraserMode;
     if (ui.eraserSize) ui.eraserSize.value = String(toolSettings.eraserSize);
+    if (ui.eraserSizeValue) ui.eraserSizeValue.value = String(Math.round(toolSettings.eraserSize));
+    ui.shapeType.value = toolSettings.shapeType;
+    ui.shapeStrokeColor.value = toolSettings.shapeStrokeColor;
+    ui.shapeStrokeWidth.value = String(toolSettings.shapeStrokeWidth);
+    ui.shapeStrokeOpacity.value = String(toolSettings.shapeStrokeOpacity);
+    ui.shapeStrokeWidthValue.value = String(Math.round(toolSettings.shapeStrokeWidth));
+    ui.shapeStrokeOpacityValue.value = `${Math.round(toolSettings.shapeStrokeOpacity)}%`;
+    ui.lineStyle.value = toolSettings.shapeLineStyle;
+    ui.fillColor.value = toolSettings.shapeFillColor;
+    ui.fillOpacity.value = String(toolSettings.shapeFillOpacity);
+    ui.fillOpacityValue.value = `${Math.round(toolSettings.shapeFillOpacity)}%`;
+    ui.fontFamily.value = toolSettings.textFontFamily;
+    ui.fontSize.value = String(toolSettings.textFontSize);
+    ui.fontSizeValue.value = String(Math.round(toolSettings.textFontSize));
+    ui.textColor.value = toolSettings.textColor;
+    ui.textOpacity.value = String(toolSettings.textOpacity);
+    ui.textOpacityValue.value = `${Math.round(toolSettings.textOpacity)}%`;
+    ui.fontBold.checked = toolSettings.textBold;
+    ui.fontItalic.checked = toolSettings.textItalic;
+    ui.textAlign.value = toolSettings.textAlign;
+    ui.lineHeight.value = String(toolSettings.textLineHeight);
     if (ui.pencilMode) ui.pencilMode.checked = toolSettings.pencilMode;
+    if (ui.fingerDraw) ui.fingerDraw.checked = toolSettings.fingerDraw;
     if (ui.straightenEnabled) ui.straightenEnabled.checked = toolSettings.straightenEnabled;
     if (ui.quickSwitchAction) ui.quickSwitchAction.value = toolSettings.quickSwitchAction;
+    if (ui.pageNavigation) ui.pageNavigation.value = toolSettings.pageNavigation;
     if (ui.toolbarAutoHide) ui.toolbarAutoHide.checked = toolSettings.toolbarAutoHide;
     if (ui.eraserBadge) ui.eraserBadge.textContent = toolSettings.eraserMode === "pixel" ? "P" : "O";
+    syncMaskVisibilityControl();
     ui.editorLayout?.classList.toggle("sidebar-hidden", toolSettings.sidebarVisible === false);
     ui.pageSidebar.classList.toggle("open", toolSettings.sidebarVisible !== false);
     ui.pagesButton.setAttribute("aria-expanded", String(toolSettings.sidebarVisible !== false));
     ui.pagesButton.setAttribute("aria-label", toolSettings.sidebarVisible === false ? "ページ一覧を表示" : "ページ一覧を隠す");
     applyToolbarDock();
     renderToolPresets();
+    renderSelectionActionsVisibility();
   }
 
   function persistToolSettings(patch = {}) {
@@ -536,6 +795,7 @@ export function createStudyNotes(dependencies) {
     ui.backgroundBtn.disabled = readOnlyEditor || conflictPageIds.has(pages[currentPageIndex]?.pageId);
     ui.lockBanner.classList.toggle("hidden", !message);
     if (message) ui.lockMessage.textContent = message;
+    syncDrawingInputLayer();
   }
 
   function hasWriterOwnership() {
@@ -613,8 +873,31 @@ export function createStudyNotes(dependencies) {
     url.searchParams.set("noteEditor", "1");
     url.searchParams.set("noteId", noteId);
     url.searchParams.set("editorTabId", randomId());
+    url.searchParams.delete("create");
+    url.searchParams.delete("creationSessionId");
     if (study) url.searchParams.set("study", "1"); else url.searchParams.delete("study");
     return url;
+  }
+
+  function pdfCreationUrl() {
+    const url = new URL(globalThis.location.href);
+    url.searchParams.set("noteEditor", "1");
+    url.searchParams.set("create", "pdf");
+    url.searchParams.set("creationSessionId", randomId());
+    ["noteId", "editorTabId", "study"].forEach(name => url.searchParams.delete(name));
+    return url;
+  }
+
+  function openPdfCreationSurface() {
+    const url = pdfCreationUrl().toString();
+    const opened = globalThis.open?.(url, "_blank");
+    if (opened) {
+      try { opened.opener = null; } catch {}
+      return opened;
+    }
+    showEditorNotice("新しいタブを開けませんでした。この画面でPDFノート作成を続けます。");
+    globalThis.location.assign(url);
+    return null;
   }
 
   function reserveEditorTab() {
@@ -737,6 +1020,25 @@ export function createStudyNotes(dependencies) {
     };
   }
 
+  function localSaveKey(saveIdentity) {
+    return noteLocalKey(saveIdentity.uid, saveIdentity.noteId, saveIdentity.pageId);
+  }
+
+  function scheduleLocalSave(saveIdentity, content) {
+    const key = localSaveKey(saveIdentity);
+    const task = saveCoordinator.schedule(saveIdentity, content);
+    pendingLocalSavePromises.set(key, task);
+    const clear = () => {
+      if (pendingLocalSavePromises.get(key) === task) pendingLocalSavePromises.delete(key);
+    };
+    task.then(clear, clear);
+    return task;
+  }
+
+  async function waitForLocalSave(saveIdentity) {
+    await pendingLocalSavePromises.get(localSaveKey(saveIdentity));
+  }
+
   async function loadConflictRecord(noteId, pageId, uid = getCurrentUser()?.uid) {
     if (!uid || !noteId || !pageId) return null;
     const conflict = await localStore.get("conflicts", noteLocalKey(uid, noteId, pageId));
@@ -838,10 +1140,20 @@ export function createStudyNotes(dependencies) {
     backgroundRenderToken += 1;
     renderedBackgroundSignature = "";
     releaseObjectUrls();
-    ui.stage.replaceChildren();
+    removeCropActions();
+    [...ui.stage.children].forEach(node => {
+      if (node !== ui.drawingInput && node !== ui.eraserCursor) node.remove();
+    });
+    syncDrawingInputLayer();
   }
 
   function show(view) {
+    if (view !== "editor") {
+      cancelActiveInteraction("close");
+      cancelCropEditor({ restore: true });
+      closeTransientUi();
+      selectedIds = [];
+    }
     ui.listView.classList.toggle("hidden", view !== "list");
     ui.createView.classList.toggle("hidden", view !== "create");
     ui.editorView.classList.toggle("hidden", view !== "editor");
@@ -896,7 +1208,11 @@ export function createStudyNotes(dependencies) {
       setListStatus(notes.length
         ? `${notes.length}件のノートがあります。${unsyncedCount ? ` 端末内に未同期の変更が${unsyncedCount}ページあります。` : ""}${orphanedDrafts.length ? ` 一覧にないノートの下書きが${orphanedDrafts.length}件あります。` : ""}`
         : orphanedDrafts.length ? `一覧にないノートの下書きが${orphanedDrafts.length}件あります。復元できます。` : "ノートはまだありません。");
-      if (dedicatedEditor && !routeOpened) {
+      if (dedicatedEditorCreateMode === "pdf" && !routeOpened) {
+        routeOpened = true;
+        ui.newTitle.value = "新しいPDFノート";
+        show("create");
+      } else if (dedicatedEditor && !routeOpened) {
         await openNote(dedicatedEditorNoteId, { study: routeParams.get("study") === "1", inline: true });
         routeOpened = true;
       }
@@ -1251,7 +1567,11 @@ export function createStudyNotes(dependencies) {
       await noteStore.finalizeCreatingNote(noteId, notePages, session.uid);
       assertUserSession(session);
       await refreshNotes();
-      openEditorTab(noteId, {}, reservedWindow);
+      if (dedicatedEditorCreateMode === "pdf") {
+        globalThis.location.replace(editorUrl(noteId).toString());
+      } else {
+        openEditorTab(noteId, {}, reservedWindow);
+      }
     } catch (error) {
       await compensateCreationFailure(noteId, {
         pageIds: notePages.map(page => page.pageId),
@@ -1285,6 +1605,17 @@ export function createStudyNotes(dependencies) {
     return content;
   }
 
+  function preloadAdjacentPages() {
+    [currentPageIndex - 1, currentPageIndex + 1]
+      .filter(index => index >= 0 && index < pages.length)
+      .forEach(index => {
+        const page = pages[index];
+        void pageContent(page)
+          .then(() => ["pdf-source-page", "material-page"].includes(page.background?.type) ? resolveBackgroundBlob(page) : null)
+          .catch(error => console.debug("隣接ページの先読みを完了できませんでした。", error));
+      });
+  }
+
   async function openNote(noteId, { study = false, inline = false, preferCloud = false, forceReadOnly = false } = {}) {
     if (!dedicatedEditor && !inline) {
       openEditorTab(noteId, { study });
@@ -1292,8 +1623,9 @@ export function createStudyNotes(dependencies) {
     }
     const session = captureUserSession();
     assertUserSession(session);
-    closeToolSettings();
-    closeSavePopover();
+    cancelActiveInteraction("close");
+    cancelCropEditor({ restore: true });
+    closeTransientUi();
     setLocalDraftRecoveryAvailable(false);
     setEditorStartupState("loading-note-metadata");
     if (currentNote && !await flushWithDecision(pages[currentPageIndex], "別のノートを開く操作")) return;
@@ -1311,7 +1643,8 @@ export function createStudyNotes(dependencies) {
     await establishEditorLease(noteId, session, { forceReadOnly });
     currentPageIndex = 0;
     applyToolSettingsToUi();
-    contentCache = new Map(); assetCache = new Map(); selectedIds = []; revealedMaskIds = new Set();
+    contentCache = new Map(); assetCache = new Map(); selectedIds = [];
+    revealedMaskIds = new Set(); editingHiddenMaskIds = new Set();
     // Choosing the cloud version must only read cloud state. Local drafts and
     // assets remain durable in IndexedDB until the user explicitly retries or
     // creates a recovered copy from the save-status popover.
@@ -1363,11 +1696,14 @@ export function createStudyNotes(dependencies) {
     const page = pages[currentPageIndex];
     if (!page) return;
     selectedIds = [];
-    closeToolSettings();
+    cancelActiveInteraction("page-change");
+    cancelCropEditor({ restore: true });
+    closeTransientUi();
     currentContent = await pageContent(page, options);
     ui.conflictBanner.classList.toggle("hidden", !conflictPageIds.has(page.pageId));
     renderPageList();
     renderPage();
+    preloadAdjacentPages();
   }
 
   function renderPageList() {
@@ -1484,15 +1820,38 @@ export function createStudyNotes(dependencies) {
     });
   }
 
-  async function switchPage(index) {
-    if (index < 0 || index >= pages.length || index === currentPageIndex) return;
-    closeToolSettings();
-    closeSavePopover();
-    if (!await flushWithDecision(pages[currentPageIndex], "ページ切替")) return;
-    contentCache.set(pages[currentPageIndex].pageId, clone(currentContent));
+  async function switchPage(index, { localOnly = false, direction = "" } = {}) {
+    if (pageSwitching || index < 0 || index >= pages.length || index === currentPageIndex) return;
+    const sourcePage = pages[currentPageIndex];
+    pageSwitching = true;
+    try {
+    if (textEditorSession && !textEditorSession.finish()) return;
+    await flushPendingStrokeWork({ render: false, throwOnError: localOnly });
+    cancelActiveInteraction("page-change");
+    cancelCropEditor({ restore: true });
+    closeTransientUi();
+    selectedIds = [];
+    if (localOnly) {
+      try {
+        await waitForLocalSave(identity(sourcePage));
+      } catch (error) {
+        reportError(error);
+        return;
+      }
+    } else if (!await flushWithDecision(sourcePage, "ページ切替")) return;
+    contentCache.set(sourcePage.pageId, clone(currentContent));
     currentPageIndex = index;
     history.clear();
     await loadCurrentPage();
+    if (direction) {
+      ui.stage.classList.remove("page-slide-next", "page-slide-previous");
+      void ui.stage.offsetWidth;
+      ui.stage.classList.add(`page-slide-${direction}`);
+      setTimeout(() => ui.stage.classList.remove(`page-slide-${direction}`), 230);
+    }
+    } finally {
+      pageSwitching = false;
+    }
   }
 
   function currentMaterial() {
@@ -1858,6 +2217,13 @@ export function createStudyNotes(dependencies) {
     const anchorX = align === "center"
       ? (element.bounds.x + element.bounds.width / 2) * 1000
       : align === "right" ? (element.bounds.x + element.bounds.width) * 1000 : element.bounds.x * 1000;
+    const lineHeight = fontSize * Number(style.lineHeight || 1.25);
+    const layout = layoutTextBox(element.text, {
+      maxWidth: element.bounds.width * 1000,
+      lineHeight,
+      measureText: value => measurement.measureText(value).width
+    });
+    const effectiveHeight = Math.max(element.bounds.height, layout.requiredHeight / 1414);
     const node = createSvgElement("text", {
       x: anchorX,
       y: element.bounds.y * 1414,
@@ -1870,19 +2236,26 @@ export function createStudyNotes(dependencies) {
       "text-anchor": align === "center" ? "middle" : align === "right" ? "end" : "start",
       class: "note-element",
       "data-element-id": element.id,
-      transform: `rotate(${element.rotation || 0} ${(element.bounds.x + element.bounds.width / 2) * 1000} ${(element.bounds.y + element.bounds.height / 2) * 1414})`
+      transform: `rotate(${element.rotation || 0} ${(element.bounds.x + element.bounds.width / 2) * 1000} ${(element.bounds.y + effectiveHeight / 2) * 1414})`
     });
-    const lineHeight = fontSize * Number(style.lineHeight || 1.25);
-    visibleTextLines(element.text, {
-      maxWidth: element.bounds.width * 1000,
-      maxHeight: element.bounds.height * 1414,
-      lineHeight,
-      measureText: value => measurement.measureText(value).width
-    }).forEach((line, index) => {
+    layout.lines.forEach((line, index) => {
       const span = createSvgElement("tspan", { x: anchorX, dy: index ? lineHeight : fontSize });
       span.textContent = line || " "; node.append(span);
     });
     return node;
+  }
+
+  function normalizeTextElementHeight(element) {
+    if (element?.type !== "text") return element;
+    const style = element.style || {};
+    const fontSize = Math.max(8, Number(style.fontSizeRatio || .025) * 1414);
+    const family = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
+    const measurement = document.createElement("canvas").getContext("2d");
+    measurement.font = `${style.fontStyle || "normal"} ${style.fontWeight || "normal"} ${fontSize}px ${family}`;
+    return ensureTextElementHeight(element, {
+      pageHeight: 1414,
+      measureText: value => measurement.measureText(value).width
+    });
   }
 
   function appendTransformHandle(overlay, handle, label) {
@@ -1895,10 +2268,79 @@ export function createStudyNotes(dependencies) {
     return node;
   }
 
+  function removeCropActions() {
+    document.querySelectorAll(".note-crop-actions[data-crop-overlay]").forEach(node => node.remove());
+  }
+
+  function cropSafeArea(actions) {
+    const style = getComputedStyle(actions);
+    const inset = side => Math.max(0, Number.parseFloat(style.getPropertyValue(`--note-safe-area-${side}`)) || 0);
+    return { top: inset("top"), right: inset("right"), bottom: inset("bottom"), left: inset("left") };
+  }
+
+  function positionCropActions() {
+    const overlay = ui.stage.querySelector(".note-crop-overlay");
+    const actions = document.querySelector(".note-crop-actions[data-crop-overlay]");
+    if (!overlay || !actions || !cropSession) return false;
+    const viewport = globalThis.visualViewport;
+    const view = {
+      left: Number(viewport?.offsetLeft || 0),
+      top: Number(viewport?.offsetTop || 0),
+      width: Number(viewport?.width || globalThis.innerWidth || 0),
+      height: Number(viewport?.height || globalThis.innerHeight || 0)
+    };
+    const safeArea = cropSafeArea(actions);
+    const margin = 12;
+    const minLeft = view.left + Math.max(margin, safeArea.left);
+    const minTop = view.top + Math.max(margin, safeArea.top);
+    const boundaryRight = view.left + view.width - Math.max(margin, safeArea.right);
+    const boundaryBottom = view.top + view.height - Math.max(margin, safeArea.bottom);
+    const availableWidth = Math.max(0, boundaryRight - minLeft);
+    const availableHeight = Math.max(0, boundaryBottom - minTop);
+    actions.style.maxInlineSize = `${Math.floor(availableWidth)}px`;
+    actions.style.maxBlockSize = `${Math.floor(availableHeight)}px`;
+    const overlayRect = overlay.getBoundingClientRect();
+    const actionsRect = actions.getBoundingClientRect();
+    const maxLeft = Math.max(minLeft, boundaryRight - actionsRect.width);
+    const maxTop = Math.max(minTop, boundaryBottom - actionsRect.height);
+    const gap = 8;
+    const below = overlayRect.bottom + gap;
+    const above = overlayRect.top - actionsRect.height - gap;
+    const preferredTop = below <= maxTop ? below : above;
+    const left = Math.min(Math.max(overlayRect.left + overlayRect.width / 2 - actionsRect.width / 2, minLeft), maxLeft);
+    const top = Math.min(Math.max(preferredTop, minTop), maxTop);
+    actions.style.left = `${Math.round(left)}px`;
+    actions.style.top = `${Math.round(top)}px`;
+    return availableWidth > 0 && availableHeight > 0;
+  }
+
+  function handleCropAction(action) {
+    if (!action || !cropSession) return;
+    const image = currentContent.elements.find(element => element.id === cropSession.elementId);
+    if (action === "reset" && image) {
+      Object.assign(image, resetImageCrop(image));
+      cropSession.draft = { crop: clone(image.crop), bounds: clone(image.bounds) };
+      renderPage();
+      return;
+    }
+    const before = cropSession.before;
+    if (action === "cancel") currentContent = clone(before);
+    cropSession = null;
+    showSelectionContext();
+    if (action === "apply") commitChange(before, "画像トリミング");
+    else renderPage();
+  }
+
   function renderCropOverlay() {
+    removeCropActions();
     if (!cropSession) return;
+    const reconciled = reconcileCropSession(cropSession, currentContent.elements);
+    cropSession = reconciled.cropSession;
+    if (reconciled.shouldCloseTransientUi) {
+      closeTransientUi();
+      return;
+    }
     const image = currentContent.elements.find(element => element.id === cropSession.elementId && element.type === "image");
-    if (!image) { cropSession = null; return; }
     const overlay = document.createElement("div");
     overlay.className = "note-crop-overlay";
     overlay.dataset.cropOverlay = "true";
@@ -1909,6 +2351,9 @@ export function createStudyNotes(dependencies) {
     );
     const actions = document.createElement("div");
     actions.className = "note-crop-actions";
+    actions.dataset.cropOverlay = "true";
+    actions.setAttribute("role", "toolbar");
+    actions.setAttribute("aria-label", "画像トリミング操作");
     [
       ["適用", "apply", "現在のトリミングを適用して編集を終了します"],
       ["キャンセル", "cancel", "編集前の画像へ戻してトリミングを終了します"],
@@ -1919,8 +2364,10 @@ export function createStudyNotes(dependencies) {
       button.title = description; button.setAttribute("aria-label", description);
       actions.append(button);
     });
-    overlay.append(actions);
+    actions.addEventListener("click", event => handleCropAction(event.target?.closest?.("[data-crop-action]")?.dataset.cropAction));
     ui.stage.append(overlay);
+    document.body.append(actions);
+    positionCropActions();
   }
 
   function renderSelectionOverlay() {
@@ -1958,6 +2405,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function clearInteractiveLayers() {
+    removeCropActions();
     const selectors = [".note-elements-layer", '[data-layer="masks"]', "[data-selection-overlay]", "[data-crop-overlay]", "[data-note-draft]"];
     ui.stage.querySelectorAll(selectors.join(",")).forEach(node => {
       node.querySelectorAll?.("img[data-note-object-url]").forEach(image => {
@@ -1966,6 +2414,38 @@ export function createStudyNotes(dependencies) {
       });
       node.remove();
     });
+  }
+
+  function syncDrawingInputLayer() {
+    const layer = ui.drawingInput;
+    if (!layer) return;
+    const enabled = Boolean(currentContent) && !studyMode && markupMode && !readOnlyEditor && ["pen", "highlighter"].includes(currentTool);
+    layer.classList.toggle("active", enabled);
+    ui.stage.classList.toggle("is-drawing-input", enabled);
+    ui.editorView.classList.toggle("drawing-input-active", enabled);
+  }
+
+  function bindDrawingInputLayer() {
+    const layer = ui.drawingInput;
+    if (!layer) throw new Error("描画入力レイヤーを初期化できませんでした。");
+    const forwardDrawingPointer = handler => event => {
+      // Touch stays on the viewport/stage path so single-finger pan and
+      // two-finger pinch keep working. Pencil and mouse use one stable layer.
+      if (event.pointerType === "touch") return;
+      event.stopPropagation();
+      handler(event);
+    };
+    layer.addEventListener("pointerdown", forwardDrawingPointer(beginPointer));
+    layer.addEventListener("pointermove", forwardDrawingPointer(movePointer));
+    layer.addEventListener("pointerup", forwardDrawingPointer(endPointer));
+    layer.addEventListener("pointercancel", forwardDrawingPointer(endPointer));
+    layer.addEventListener("lostpointercapture", event => {
+      if (event.pointerType === "touch") return;
+      event.stopPropagation();
+      drawingDiagnostics.lostpointercapture += 1;
+      if (activeGesture?.pointerId === event.pointerId) finishPointerGesture("lostpointercapture", event);
+    });
+    syncDrawingInputLayer();
   }
 
   async function renderPage() {
@@ -1980,7 +2460,9 @@ export function createStudyNotes(dependencies) {
       const backgroundToken = ++backgroundRenderToken;
       renderedBackgroundSignature = backgroundSignature;
       releaseObjectUrls();
-      ui.stage.replaceChildren();
+      [...ui.stage.children].forEach(node => {
+        if (node !== ui.drawingInput && node !== ui.eraserCursor) node.remove();
+      });
       const paper = document.createElement("div");
       paper.className = `note-layer note-paper-layer ${page.background?.type === "ruled" ? "ruled" : ""}`;
       paper.style.setProperty("--paper-color", page.background?.paperColor || "#fff");
@@ -2074,17 +2556,27 @@ export function createStudyNotes(dependencies) {
 
     const maskLayer = document.createElement("div"); maskLayer.className = "note-layer"; maskLayer.dataset.layer = "masks"; maskLayer.style.zIndex = "20";
     const materialMasks = getMaterialPageMasks(currentMaterial(), page.background?.materialPage);
-    [...materialMasks, ...(currentContent.noteMasks || [])].forEach(mask => {
+    [
+      ...materialMasks.map(mask => ({ mask, source: "material" })),
+      ...(currentContent.noteMasks || []).map(mask => ({ mask, source: "note" }))
+    ].forEach(({ mask, source }) => {
       const node = document.createElement("div");
-      const revealed = revealedMaskIds.has(mask.id);
-      node.className = `note-mask ${mask.weak ? "weak" : ""} ${revealed ? "revealed" : ""} ${!mask.readOnly && currentTool === "mask" ? "editable" : ""} ${selectedIds.includes(mask.id) ? "note-selected" : ""}`;
-      node.dataset.maskId = mask.id; node.dataset.readOnly = String(mask.readOnly === true); setBoundsStyle(node, mask);
+      const visibilityKey = maskVisibilityKey(mask, source);
+      const revealed = studyMode && revealedMaskIds.has(visibilityKey);
+      const editingHidden = !studyMode && editingHiddenMaskIds.has(visibilityKey);
+      node.className = `note-mask ${mask.weak ? "weak" : ""} ${revealed ? "revealed" : ""} ${editingHidden ? "editing-hidden" : ""} ${!mask.readOnly && currentTool === "mask" ? "editable" : ""} ${selectedIds.includes(mask.id) ? "note-selected" : ""}`;
+      node.dataset.maskId = mask.id;
+      node.dataset.maskVisibilityKey = visibilityKey;
+      node.dataset.readOnly = String(mask.readOnly === true);
+      setBoundsStyle(node, mask);
       node.title = mask.readOnly ? "既存教材マスク（教材管理で編集）" : "ノート専用マスク";
       maskLayer.append(node);
     });
     ui.stage.append(maskLayer);
+    syncMaskVisibilityControl();
+    syncDrawingInputLayer();
     renderSelectionOverlay();
-    ui.selectionActions.classList.toggle("hidden", selectedIds.length === 0 || studyMode);
+    renderSelectionActionsVisibility();
     const maskRotationDisabled = selectedMasks().length > 0;
     ui.selectionActions.querySelectorAll('[data-selection-action="rotate-left"], [data-selection-action="rotate-right"], [data-selection-action="rotate"]').forEach(button => {
       button.disabled = maskRotationDisabled;
@@ -2112,7 +2604,7 @@ export function createStudyNotes(dependencies) {
     const after = clone(currentContent);
     if (!history.push(historySnapshot(before), historySnapshot(after), label)) return;
     contentCache.set(pages[currentPageIndex].pageId, clone(after));
-    void saveCoordinator.schedule(identity(), after).catch(reportError);
+    void scheduleLocalSave(identity(), after).catch(reportError);
     renderPage();
     refreshCurrentPageThumbnail();
   }
@@ -2153,19 +2645,70 @@ export function createStudyNotes(dependencies) {
     currentContent = clone(snapshot.content);
     contentCache.set(pages[currentPageIndex].pageId, clone(currentContent));
     await Promise.all([
-      saveCoordinator.schedule(identity(), currentContent),
+      scheduleLocalSave(identity(), currentContent),
       ...metadataUpdates
     ]);
     renderPageList();
     renderPage();
   }
 
+  function releaseActivePointer(pointerId = activeGesture?.pointerId, captureTarget = activeGesture?.captureTarget || ui.stage) {
+    if (pointerId === undefined || pointerId === null) return;
+    try {
+      if (captureTarget?.hasPointerCapture?.(pointerId)) captureTarget.releasePointerCapture(pointerId);
+    } catch (error) {
+      console.debug("pointer captureを解放できませんでした。", error);
+    }
+  }
+
+  function captureActivePointer(event) {
+    if (!activeGesture) return;
+    // The full-page drawing layer owns capture only for Pencil. Touch must keep
+    // bubbling to the viewport so a second contact can start pinch zoom.
+    if (event.pointerType !== "pen" && event.target === ui.drawingInput) return;
+    const target = event.currentTarget?.setPointerCapture ? event.currentTarget : ui.stage;
+    activeGesture.captureTarget = target;
+    if (!event.isTrusted) return;
+    try { target.setPointerCapture?.(event.pointerId); }
+    catch (error) { console.debug("pointer captureを開始できませんでした。", error); }
+  }
+
+  function cancelCropEditor({ restore = true } = {}) {
+    removeCropActions();
+    if (!cropSession) return;
+    if (restore && cropSession.before) currentContent = clone(cropSession.before);
+    cropSession = null;
+  }
+
+  function cancelActiveInteraction(reason = "tool-change", { render = false } = {}) {
+    if (activeGesture) finishPointerGesture(reason);
+    else ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
+    globalThis.getSelection?.()?.removeAllRanges?.();
+    if (render && currentContent) renderPage();
+  }
+
   function setTool(tool, { keepSettings = false } = {}) {
     if (tool === "eraser-object") tool = ui.eraserMode.value === "pixel" ? "eraser-pixel" : "eraser-object";
     const nextTool = TOOL_LABELS[tool] ? tool : "pen";
-    if (nextTool !== currentTool) previousTool = currentTool;
-    if (nextTool !== currentTool && !keepSettings) closeToolSettings();
+    const changed = nextTool !== currentTool;
+    if (cropSession && changed) return;
+    if (changed) {
+      if (textEditorSession && !textEditorSession.finish()) return;
+      previousTool = currentTool;
+      cancelActiveInteraction("tool-change");
+      if (pendingStrokeWork) {
+        void flushPendingStrokeWork({ render: false });
+        currentContent = clone(currentContent);
+      }
+      if (!keepSettings) closeTransientUi();
+      if (!toolKeepsSelection(nextTool)) selectedIds = [];
+    }
     currentTool = nextTool;
+    if (currentTool !== "eraser-pixel") hidePixelEraserCursor();
+    if (currentTool !== "mask") {
+      maskMultiSelect = false;
+      ui.maskSelectMode?.setAttribute("aria-pressed", "false");
+    }
     [...ui.toolbar.querySelectorAll("[data-note-tool]")].forEach(button => button.classList.toggle("active", button.dataset.noteTool === tool || (button.dataset.noteTool === "eraser-object" && tool === "eraser-pixel")));
     ui.stage.dataset.tool = currentTool;
     ui.stage.setAttribute("aria-label", `編集ページ: ${TOOL_LABELS[currentTool]}`);
@@ -2173,22 +2716,182 @@ export function createStudyNotes(dependencies) {
     applyToolSettingsToUi();
     renderPage();
     if (tool === "image") showImageMenu();
+    else if (toolKeepsSelection(currentTool) && selectedIds.length) showSelectionContext();
   }
 
-  function gesturePoint(event) {
-    return clientPointToNormalized(event.clientX, event.clientY, ui.stage.getBoundingClientRect());
+  function gesturePoint(event, pageRect = activeGesture?.pageRect) {
+    return clientPointToNormalized(event.clientX, event.clientY, pageRect || ui.stage.getBoundingClientRect());
+  }
+
+  function historySnapshotReference(content) {
+    return {
+      content,
+      defaultBackground: clone(currentNote?.defaultBackground || DEFAULT_BACKGROUND),
+      pageMetadata: pages.map(page => ({
+        pageId: page.pageId,
+        pageType: page.pageType,
+        background: clone(page.background)
+      }))
+    };
+  }
+
+  async function flushPendingStrokeWork({ render = true, throwOnError = false } = {}) {
+    clearTimeout(pendingStrokeTimer);
+    pendingStrokeTimer = 0;
+    const work = pendingStrokeWork;
+    pendingStrokeWork = null;
+    if (!work) return;
+    for (const entry of work.historyEntries || []) {
+      history.pushImmutable(
+        historySnapshotReference(clone(entry.before)),
+        historySnapshotReference(clone(entry.after)),
+        entry.label
+      );
+    }
+    ui.undo.disabled = !history.canUndo();
+    if (render && currentNote?.id === work.identity.noteId && pages[currentPageIndex]?.pageId === work.identity.pageId) {
+      await renderPage();
+    }
+    try {
+      await scheduleLocalSave(work.identity, work.content);
+    } catch (error) {
+      if (throwOnError) {
+        if (!pendingStrokeWork) pendingStrokeWork = work;
+        throw error;
+      }
+      reportError(error);
+    }
+    clearTimeout(pendingThumbnailTimer);
+    pendingThumbnailTimer = setTimeout(() => {
+      if (currentNote?.id === work.identity.noteId && pages[currentPageIndex]?.pageId === work.identity.pageId) {
+        refreshCurrentPageThumbnail();
+      }
+    }, 650);
+  }
+
+  function queueStrokeWork(before, after, label) {
+    const pageId = pages[currentPageIndex].pageId;
+    contentCache.set(pageId, after);
+    if (!pendingStrokeWork) pendingStrokeWork = { identity: identity(), content: after, historyEntries: [] };
+    pendingStrokeWork.content = after;
+    pendingStrokeWork.historyEntries.push({ before, after, label });
+    clearTimeout(pendingStrokeTimer);
+    pendingStrokeTimer = setTimeout(() => { void flushPendingStrokeWork(); }, 140);
+    ui.undo.disabled = false;
+  }
+
+  function scheduleStrokePreview(gesture) {
+    if (!gesture || gesture.previewFrame) return;
+    gesture.previewFrame = requestAnimationFrame(() => {
+      gesture.previewFrame = 0;
+      flushStrokePoints(gesture);
+      if (activeGesture === gesture || gesture.isFinalizing) drawDraftPath(gesture.points, gesture.type, gesture);
+    });
+  }
+
+  function flushGestureSamples(gesture, event, { ensureRenderable = false } = {}) {
+    if (!gesture || !["pen", "highlighter", "eraser-pixel"].includes(gesture.type)) return;
+    if (event && event.pointerId === gesture.pointerId) {
+      appendPointerSamples(gesture, event, sample => gesturePoint(sample, gesture.pageRect));
+    }
+    if (gesture.previewFrame) cancelAnimationFrame(gesture.previewFrame);
+    gesture.previewFrame = 0;
+    flushStrokePoints(gesture, { ensureRenderable });
+    drawingDiagnostics.coalescedPoints += Number(gesture.coalescedPointCount || 0) - Number(gesture.reportedCoalescedPoints || 0);
+    gesture.reportedCoalescedPoints = Number(gesture.coalescedPointCount || 0);
+    drawingDiagnostics.longestMainThreadGapMs = Math.max(drawingDiagnostics.longestMainThreadGapMs, Number(gesture.maxEventGapMs || 0));
+  }
+
+  function removeGesturePreview(gesture) {
+    if (gesture?.previewFrame) cancelAnimationFrame(gesture.previewFrame);
+    gesture.previewFrame = 0;
+    gesture?.previewNode?.remove?.();
+    gesture.previewNode = null;
+    gesture.previewPath = null;
+  }
+
+  function hidePixelEraserCursor() {
+    if (eraserCursorFrame) cancelAnimationFrame(eraserCursorFrame);
+    eraserCursorFrame = 0;
+    ui.eraserCursor?.classList.add("hidden");
+  }
+
+  function updatePixelEraserCursor(event) {
+    if (!ui.eraserCursor || currentTool !== "eraser-pixel" || event?.pointerType === "touch") {
+      hidePixelEraserCursor();
+      return;
+    }
+    const point = gesturePoint(event, activeGesture?.pageRect);
+    const pageRect = activeGesture?.pageRect || ui.stage.getBoundingClientRect();
+    const diameter = Math.max(8, Number(toolSettings.eraserSize) / 1000 * 5 * pageRect.width);
+    if (eraserCursorFrame) cancelAnimationFrame(eraserCursorFrame);
+    eraserCursorFrame = requestAnimationFrame(() => {
+      eraserCursorFrame = 0;
+      const zoom = Math.max(.001, zoomController?.zoom || 1);
+      ui.eraserCursor.style.width = `${diameter / zoom}px`;
+      ui.eraserCursor.style.height = `${diameter / zoom}px`;
+      ui.eraserCursor.style.left = `${point.x * 100}%`;
+      ui.eraserCursor.style.top = `${point.y * 100}%`;
+      ui.eraserCursor.classList.remove("hidden");
+    });
   }
 
   function targetElementId(event) {
     return event.target?.closest?.("[data-element-id]")?.dataset.elementId || "";
   }
 
+  function hitTestElementId(point) {
+    if (!point || !currentContent?.elements?.length) return "";
+    const pageSize = pages[currentPageIndex]?.size;
+    return [...currentContent.elements]
+      .map((element, index) => ({ element, index }))
+      .sort((a, b) => Number(b.element.zIndex || 0) - Number(a.element.zIndex || 0) || b.index - a.index)
+      .find(({ element }) => {
+        const tolerance = Math.max(.006, Number(element.style?.widthRatio || 0) * 1.5);
+        if (["stroke", "highlighter"].includes(element.type)) {
+          const points = element.points || [];
+          return points.length === 1
+            ? Math.hypot(points[0].x - point.x, points[0].y - point.y) <= tolerance
+            : points.slice(1).some((end, index) => distanceToSegment(point, points[index], end) <= tolerance);
+        }
+        if (element.type === "shape" && ["line", "arrow"].includes(element.shapeType)) {
+          const [start, end] = lineEndpoints(element, pageSize);
+          return distanceToSegment(point, start, end) <= tolerance;
+        }
+        const bounds = elementBounds(element, pageSize);
+        return point.x >= bounds.x - tolerance && point.x <= bounds.x + bounds.width + tolerance &&
+          point.y >= bounds.y - tolerance && point.y <= bounds.y + bounds.height + tolerance;
+      })?.element?.id || "";
+  }
+
   function targetMaskId(event) {
-    return event.target?.closest?.("[data-mask-id]")?.dataset.maskId || "";
+    const node = event.target?.closest?.("[data-mask-id]");
+    return node?.dataset.readOnly === "true" ? "" : node?.dataset.maskId || "";
+  }
+
+  function targetMaskVisibilityKey(event) {
+    return event.target?.closest?.("[data-mask-visibility-key]")?.dataset.maskVisibilityKey || "";
   }
 
   function targetTransformHandle(event) {
     return event.target?.closest?.("[data-transform-handle]")?.dataset.transformHandle || "";
+  }
+
+  function currentPageMasks() {
+    if (!currentContent || !pages[currentPageIndex]) return [];
+    const page = pages[currentPageIndex];
+    return [
+      ...getMaterialPageMasks(currentMaterial(), page.background?.materialPage),
+      ...(currentContent.noteMasks || [])
+    ];
+  }
+
+  function syncMaskVisibilityControl() {
+    if (!ui.maskVisibility) return;
+    const hasEditingHiddenMask = currentPageMasks().some(mask => editingHiddenMaskIds.has(maskVisibilityKey(mask)));
+    ui.maskVisibility.setAttribute("aria-pressed", String(!hasEditingHiddenMask));
+    ui.maskVisibility.setAttribute("aria-label", hasEditingHiddenMask ? "編集時の暗記マスクを表示" : "編集時の暗記マスクを非表示");
+    ui.maskVisibility.title = hasEditingHiddenMask ? "編集時の暗記マスクを表示" : "編集時の暗記マスクを非表示";
   }
 
   function replaceSelectedElements(transformed) {
@@ -2249,6 +2952,7 @@ export function createStudyNotes(dependencies) {
       clearStraightenTimer(gesture);
       gesture.straightenTimer = setTimeout(() => {
         if (activeGesture !== gesture || gesture.straightened) return;
+        flushStrokePoints(gesture);
         const points = clone(gesture.points);
         if (!canStraightenStroke({
           points,
@@ -2259,41 +2963,87 @@ export function createStudyNotes(dependencies) {
         gesture.freehandPoints = points;
         gesture.straightened = true;
         gesture.points = straightenedPoints(points);
-        drawDraftPath(gesture.points, gesture.type);
+        drawingDiagnostics.straightenTimerFires += 1;
+        drawDraftPath(gesture.points, gesture.type, gesture);
       }, NOTE_STRAIGHTEN_HOLD_MS);
     }
   }
 
+  function applyPendingStraightening(gesture) {
+    if (!gesture || gesture.straightened || !["pen", "highlighter"].includes(gesture.type) || !toolSettings.straightenEnabled) return;
+    const points = clone(gesture.points || []);
+    if (!canStraightenStroke({
+      points,
+      elapsedMs: performance.now() - Number(gesture.holdStartedAt || performance.now()),
+      movementPx: 0,
+      enabled: true
+    })) return;
+    gesture.freehandPoints = points;
+    gesture.straightened = true;
+    gesture.points = straightenedPoints(points);
+  }
+
+  function finalizeInterruptedDrawingStroke(event) {
+    const gesture = activeGesture;
+    if (!gesture || !["pen", "highlighter"].includes(gesture.type)) return false;
+    if (event.pointerType !== gesture.pointerType) return false;
+    return finishPointerGesture("interrupted-drawing", event, { interrupted: true });
+  }
+
   function beginPointer(event) {
-    closeToolSettings();
-    closeSavePopover();
+    if (isTextEditingTarget(event.target)) return;
+    const requestedHandle = targetTransformHandle(event);
+    const cropControl = requestedHandle.startsWith("crop-") || event.target?.closest?.("[data-crop-action]");
+    if (cropSession && !cropControl) {
+      event.preventDefault();
+      return;
+    }
+    if (!cropControl) closeTransientUi();
+    globalThis.getSelection?.()?.removeAllRanges?.();
     if (toolSettings.toolbarAutoHide && ["pen", "highlighter"].includes(currentTool)) {
       ui.toolbar.classList.add("collapsed");
     }
     if (!currentContent || event.button > 0) return;
+    if (["pen", "highlighter"].includes(currentTool)) {
+      clearTimeout(pendingStrokeTimer);
+      pendingStrokeTimer = 0;
+    }
     if (event.target?.closest?.("[data-crop-action]")) return;
     if (!studyMode && !isEditableNow()) { explainBlockedEdit(); return; }
-    inputGuard.notePointerDown(event);
     const touchCount = event.pointerType === "touch" ? activeTouchPointerIds.size : 0;
-    if (event.pointerType === "touch" && (pageZoomGestureActive || zoomController?.isPinchGestureActive || touchCount >= 2)) {
+    if (activeGesture) {
+      // A second touch belongs to the viewport pinch controller. It must bubble
+      // through the Pencil capture layer without settling the first touch here.
+      if (event.pointerType === "touch" && touchCount >= 2) return;
+      if (!finalizeInterruptedDrawingStroke(event)) {
+        event.preventDefault();
+        return;
+      }
+    }
+    if (event.pointerType === "touch" && (zoomController?.isPinchGestureActive || zoomController?.isPinching || touchCount >= 2)) {
       event.preventDefault();
       return;
     }
     if (event.pointerType === "touch" && inputGuard.isPalmCandidate(event)) return;
+    inputGuard.notePointerDown(event);
     if (event.pointerType === "pen") {
       hasSeenPen = true;
-      ui.fingerDraw.checked = false;
-      if (!toolSettings.pencilMode) persistToolSettings({ pencilMode: true });
+      if (["pen", "highlighter"].includes(currentTool)) ui.editorView.classList.add("pen-contact-active");
+      if (!toolSettings.pencilMode || toolSettings.fingerDraw) {
+        persistToolSettings({ pencilMode: true, fingerDraw: false });
+      }
     }
-    const point = gesturePoint(event);
+    const pageRect = ui.stage.getBoundingClientRect();
+    const point = gesturePoint(event, pageRect);
     lastTap = point;
-    const elementId = targetElementId(event);
+    const elementId = targetElementId(event) || (["select", "text"].includes(currentTool) ? hitTestElementId(point) : "");
     const maskId = targetMaskId(event);
-    const transformHandle = targetTransformHandle(event);
+    const maskVisibilityId = targetMaskVisibilityKey(event);
+    const transformHandle = requestedHandle;
 
     if (studyMode) {
-      if (maskId) {
-        revealedMaskIds.has(maskId) ? revealedMaskIds.delete(maskId) : revealedMaskIds.add(maskId);
+      if (maskVisibilityId) {
+        revealedMaskIds.has(maskVisibilityId) ? revealedMaskIds.delete(maskVisibilityId) : revealedMaskIds.add(maskVisibilityId);
         renderPage();
       }
       return;
@@ -2303,7 +3053,7 @@ export function createStudyNotes(dependencies) {
         const image = currentContent.elements.find(element => element.id === cropSession?.elementId);
         if (!image) return;
         activeGesture = {
-          type: "crop-resize", pointerId: event.pointerId,
+          type: "crop-resize", pointerId: event.pointerId, pointerType: event.pointerType,
           handle: transformHandle.slice(5), imageId: image.id,
           original: clone(image), before: clone(currentContent)
         };
@@ -2311,7 +3061,7 @@ export function createStudyNotes(dependencies) {
         const line = selectedElements()[0];
         if (!line) return;
         activeGesture = {
-          type: "line-endpoint", pointerId: event.pointerId,
+          type: "line-endpoint", pointerId: event.pointerId, pointerType: event.pointerType,
           endpoint: transformHandle === "line-start" ? 0 : 1,
           original: clone(line), before: clone(currentContent)
         };
@@ -2322,7 +3072,7 @@ export function createStudyNotes(dependencies) {
         if (!bounds) return;
         activeGesture = {
           type: transformHandle === "rotate" ? "rotate-selection" : "resize-selection",
-          pointerId: event.pointerId,
+          pointerId: event.pointerId, pointerType: event.pointerType,
           handle: transformHandle.replace("resize-", ""),
           start: point,
           startAngle: angleFromCenter(point, { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 }, pages[currentPageIndex]?.size),
@@ -2332,42 +3082,81 @@ export function createStudyNotes(dependencies) {
           before: clone(currentContent)
         };
       }
-      if (event.isTrusted) ui.stage.setPointerCapture?.(event.pointerId);
+      captureActivePointer(event);
       event.preventDefault();
       return;
     }
     const guardedTouch = inputGuard.shouldIgnoreTouch(event, { pencilMode: toolSettings.pencilMode, touchCount });
-    const drawWithTouch = event.pointerType !== "touch" || (!guardedTouch && (ui.fingerDraw.checked || !hasSeenPen));
+    const reservedForPageSwipe = event.pointerType === "touch" && swipeGesture?.pointerId === event.pointerId &&
+      (!toolSettings.fingerDraw || swipeGesture.startedAtEdge);
+    const drawWithTouch = event.pointerType !== "touch" || (!reservedForPageSwipe && !guardedTouch && (toolSettings.fingerDraw || !hasSeenPen));
     if (["pen", "highlighter", "shape", "text", "mask", "eraser-object", "eraser-pixel"].includes(currentTool) && !drawWithTouch) {
-      activeGesture = { type: "pan", pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
+      activeGesture = { type: "pan", pointerId: event.pointerId, pointerType: event.pointerType, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
     } else if (currentTool === "pan") {
-      activeGesture = { type: "pan", pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
+      activeGesture = { type: "pan", pointerId: event.pointerId, pointerType: event.pointerType, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
     } else if (currentTool === "text" && elementId) {
       openTextEditor(point, elementId);
       return;
     } else if (currentTool === "eraser-object") {
-      activeGesture = { type: "eraser-object", pointerId: event.pointerId, changed: false, before: clone(currentContent) };
+      activeGesture = { type: "eraser-object", pointerId: event.pointerId, pointerType: event.pointerType, changed: false, before: clone(currentContent) };
       eraseObjectsAt(point, activeGesture);
     } else if (currentTool === "select" && elementId) {
       const target = currentContent.elements.find(element => element.id === elementId);
       if (target?.locked) return;
       if (!event.shiftKey && !selectedIds.includes(elementId)) selectedIds = [elementId];
       else if (event.shiftKey && !selectedIds.includes(elementId)) selectedIds.push(elementId);
-      activeGesture = { type: "move-elements", pointerId: event.pointerId, start: point, original: clone(currentContent.elements), before: clone(currentContent) };
+      activeGesture = { type: "move-elements", pointerId: event.pointerId, pointerType: event.pointerType, start: point, original: clone(currentContent.elements), before: clone(currentContent) };
+      showSelectionContext();
       renderPage();
     } else if (currentTool === "mask" && maskId) {
       const mask = currentContent.noteMasks.find(item => item.id === maskId);
       if (!mask) return;
+      if (maskMultiSelect) {
+        selectedIds = selectedIds.includes(maskId)
+          ? selectedIds.filter(id => id !== maskId)
+          : [...selectedIds, maskId];
+        if (selectedIds.length) showSelectionContext(); else closeTransientUi();
+        renderPage();
+        event.preventDefault();
+        return;
+      }
       selectedIds = [maskId];
-      activeGesture = { type: "move-mask", pointerId: event.pointerId, start: point, original: clone(mask), before: clone(currentContent) };
+      activeGesture = { type: "move-mask", pointerId: event.pointerId, pointerType: event.pointerType, start: point, original: clone(mask), before: clone(currentContent) };
+      showSelectionContext();
       renderPage();
+    } else if (currentTool === "text") {
+      activeGesture = { type: "text", pointerId: event.pointerId, pointerType: event.pointerType, start: point, end: point, before: clone(currentContent) };
+      if (!openTextEditor(point, "", null, { deferFocus: true })) {
+        activeGesture = null;
+        return;
+      }
+    } else if (["pen", "highlighter"].includes(currentTool)) {
+      drawingDiagnostics.pointerdown += 1;
+      activeGesture = {
+        ...createStrokeSession({
+          id: randomId(),
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          tool: currentTool,
+          firstPoint: { ...point, pressure: Number(event.pressure || .5) },
+          startedAt: Number(event.timeStamp || performance.now())
+        }),
+        type: currentTool,
+        start: point,
+        end: point,
+        before: currentContent,
+        pageRect
+      };
+      drawingDiagnostics.sessionsCreated += 1;
+      drawDraftPath(activeGesture.points, activeGesture.type, activeGesture);
     } else {
-      activeGesture = { type: currentTool === "select" ? "lasso" : currentTool, pointerId: event.pointerId, start: point, points: [{ ...point, pressure: Number(event.pressure || .5) }], end: point, additive: event.shiftKey, before: clone(currentContent) };
+      activeGesture = { type: currentTool === "select" ? "lasso" : currentTool, pointerId: event.pointerId, pointerType: event.pointerType, start: point, points: [{ ...point, pressure: Number(event.pressure || .5) }], end: point, additive: event.shiftKey, before: clone(currentContent) };
+      activeGesture.pageRect = pageRect;
       if (currentTool === "eraser-pixel") activeGesture.radius = Number(toolSettings.eraserSize) / 1000 * 2.5;
       if (currentTool === "select") drawLasso([point]);
-      else if (currentTool === "text") drawSelectionRect(point, point);
     }
-    if (event.isTrusted) ui.stage.setPointerCapture?.(event.pointerId);
+    captureActivePointer(event);
+    if (currentTool === "eraser-pixel") updatePixelEraserCursor(event);
     armStraightenTimer(activeGesture, event);
     event.preventDefault();
   }
@@ -2379,7 +3168,7 @@ export function createStudyNotes(dependencies) {
       ui.viewport.scrollTop = activeGesture.scrollTop - (event.clientY - activeGesture.clientY);
       return;
     }
-    const point = gesturePoint(event);
+    const point = gesturePoint(event, activeGesture.pageRect);
     activeGesture.end = point;
     if (activeGesture.type === "resize-selection") {
       const targetBounds = resizeBoundsFromHandle(activeGesture.bounds, activeGesture.handle, point);
@@ -2416,16 +3205,27 @@ export function createStudyNotes(dependencies) {
       Object.assign(image, updated);
       cropSession.draft = { crop: clone(image.crop), bounds: clone(image.bounds) };
       renderPage();
-    } else if (["pen", "highlighter", "eraser-pixel"].includes(activeGesture.type)) {
+    } else if (["pen", "highlighter"].includes(activeGesture.type)) {
       if (activeGesture.straightened) {
         activeGesture.points = straightenedPoints(activeGesture.freehandPoints, point);
+        drawDraftPath(activeGesture.points, activeGesture.type, activeGesture);
       } else {
-        const coalesced = event.getCoalescedEvents?.();
-        const events = coalesced?.length ? coalesced : [event];
-        events.forEach(item => activeGesture.points.push({ ...gesturePoint(item), pressure: Number(item.pressure || .5) }));
+        appendPointerSamples(activeGesture, event, sample => gesturePoint(sample, activeGesture.pageRect));
+        const gap = Number(activeGesture.lastEventGapMs || 0);
+        if (gap) {
+          drawingDiagnostics.eventIntervals.push(gap);
+          if (drawingDiagnostics.eventIntervals.length > 500) {
+            drawingDiagnostics.eventIntervals.splice(0, drawingDiagnostics.eventIntervals.length - 500);
+          }
+        }
         armStraightenTimer(activeGesture, event);
+        scheduleStrokePreview(activeGesture);
       }
-      drawDraftPath(activeGesture.points, activeGesture.type);
+    } else if (activeGesture.type === "eraser-pixel") {
+      const coalesced = event.getCoalescedEvents?.();
+      const events = coalesced?.length ? coalesced : [event];
+      events.forEach(item => activeGesture.points.push({ ...gesturePoint(item, activeGesture.pageRect), pressure: Number(item.pressure || .5) }));
+      updatePixelEraserCursor(event);
     } else if (activeGesture.type === "eraser-object") {
       eraseObjectsAt(point, activeGesture);
     } else if (activeGesture.type === "move-elements") {
@@ -2446,27 +3246,122 @@ export function createStudyNotes(dependencies) {
       activeGesture.points.push(point);
       drawLasso(activeGesture.points);
     } else if (activeGesture.type === "text") {
-      drawSelectionRect(activeGesture.start, point);
+      textEditorSession?.setBounds(normalizedBoundsFromPoints(activeGesture.start, point, .01));
     } else if (["shape", "mask"].includes(activeGesture.type)) {
       drawSelectionRect(activeGesture.start, point);
     }
     event.preventDefault();
   }
 
+  function commitDrawGesture(gesture) {
+    if (gesture?.committed || !["pen", "highlighter"].includes(gesture?.type) || !Array.isArray(gesture.points) || gesture.points.length <= 1) return false;
+    gesture.committed = true;
+    const isHighlighter = gesture.type === "highlighter";
+    const element = {
+      id: randomId(), type: isHighlighter ? "highlighter" : "stroke", points: copyStrokePointsForCommit(gesture.points),
+      pressureEnabled: false,
+      straightened: gesture.straightened === true,
+      style: {
+        color: isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor,
+        widthRatio: Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10000 * (isHighlighter ? 10 : 1),
+        opacity: Number(isHighlighter ? toolSettings.highlighterOpacity : toolSettings.penOpacity) / 100
+      },
+      zIndex: elementZIndex(currentContent.elements), createdAt: new Date().toISOString()
+    };
+    currentContent = { ...currentContent, elements: [...currentContent.elements, element] };
+    gesture.previewNode?.setAttribute("data-note-draft", "settled");
+    queueStrokeWork(gesture.before, currentContent, isHighlighter ? "ハイライト追加" : "ペン追加");
+    drawingDiagnostics.strokesCommitted += 1;
+    return true;
+  }
+
+  function finishPointerGesture(reason = "pointercancel", event = null, { interrupted = false } = {}) {
+    const gesture = activeGesture;
+    if (!gesture || gesture.settling) return false;
+    if (!interrupted && event?.pointerId !== undefined && gesture.pointerId !== event.pointerId) return false;
+    gesture.settling = true;
+    gesture.isFinalizing = true;
+    if (gesture.pointerType === "pen") {
+      inputGuard.notePointerEnd({ pointerType: "pen" });
+    }
+    ui.editorView.classList.remove("pen-contact-active");
+    clearStraightenTimer(gesture);
+    const drawingGesture = ["pen", "highlighter"].includes(gesture.type);
+    if (drawingGesture && gesture.straightened) {
+      if (event && event.pointerId === gesture.pointerId) {
+        const terminal = gesturePoint(event, gesture.pageRect);
+        gesture.points = straightenedPoints(gesture.freehandPoints || gesture.points, terminal);
+      }
+      if (gesture.previewFrame) cancelAnimationFrame(gesture.previewFrame);
+      gesture.previewFrame = 0;
+      drawDraftPath(gesture.points, gesture.type, gesture);
+    } else if (drawingGesture) {
+      flushGestureSamples(gesture, event, { ensureRenderable: true });
+    }
+    const shouldCommitDrawing = drawingGesture && (reason === "pointerup" || interrupted
+      ? Array.isArray(gesture.points) && gesture.points.length > 1
+      : cancelledStrokeCanBeCommitted({
+        type: gesture.type,
+        pointerType: gesture.pointerType || event?.pointerType,
+        reason,
+        points: gesture.points
+      }));
+
+    let committed = false;
+    if (shouldCommitDrawing) {
+      // A stroke has one settlement path: stop its timer, apply any eligible
+      // straightening, commit once, and only then clear the active owner.
+      applyPendingStraightening(gesture);
+      committed = commitDrawGesture(gesture);
+    } else if (gesture.type === "text") {
+      textEditorSession?.finish({ cancel: true });
+    } else {
+      if (gesture.type === "pan") {
+        ui.viewport.scrollLeft = gesture.scrollLeft;
+        ui.viewport.scrollTop = gesture.scrollTop;
+      }
+      if (gesture.before) currentContent = clone(gesture.before);
+    }
+
+    if (activeGesture === gesture) activeGesture = null;
+    releaseActivePointer(gesture.pointerId, gesture.captureTarget);
+    if (!committed) {
+      removeGesturePreview(gesture);
+      if (drawingGesture) {
+        drawingDiagnostics.strokesDiscarded += 1;
+        drawingDiagnostics.discardedReasons[reason] = Number(drawingDiagnostics.discardedReasons[reason] || 0) + 1;
+      }
+    }
+    if (!committed && gesture.type !== "text" && currentContent) renderPage();
+    return true;
+  }
+
   function endPointer(event) {
     inputGuard.notePointerEnd(event);
-    if (!activeGesture || activeGesture.pointerId !== event.pointerId) return;
+    const ownsActiveGesture = activeGesture?.pointerId === event.pointerId;
+    if (event.pointerType === "pen" && ownsActiveGesture) ui.editorView.classList.remove("pen-contact-active");
+    if (!ownsActiveGesture) return;
+    if (["pen", "highlighter"].includes(activeGesture.type)) {
+      if (event.type === "pointerup") drawingDiagnostics.pointerup += 1;
+      if (event.type === "pointercancel") drawingDiagnostics.pointercancel += 1;
+    }
+    if (activeGesture.type === "eraser-pixel") hidePixelEraserCursor();
+    if (event.type === "pointercancel") {
+      finishPointerGesture("pointercancel", event);
+      return;
+    }
+    if (["pen", "highlighter"].includes(activeGesture.type)) {
+      finishPointerGesture("pointerup", event);
+      return;
+    }
     const gesture = activeGesture;
     clearStraightenTimer(gesture);
     activeGesture = null;
-    ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
-    if (event.type === "pointercancel") {
-      if (gesture.before) currentContent = clone(gesture.before);
-      renderPage();
-      return;
-    }
+    releaseActivePointer(gesture.pointerId, gesture.captureTarget);
+    removeGesturePreview(gesture);
     if (gesture.type === "pan") return;
     if (["resize-selection", "rotate-selection", "line-endpoint"].includes(gesture.type)) {
+      showSelectionContext();
       commitChange(gesture.before, gesture.type === "line-endpoint" ? "直線端点移動" : gesture.type === "rotate-selection" ? "選択回転" : "選択サイズ変更");
       return;
     }
@@ -2480,21 +3375,7 @@ export function createStudyNotes(dependencies) {
       return;
     }
     const end = gesture.end || gesture.start;
-    if (["pen", "highlighter"].includes(gesture.type) && gesture.points.length > 1) {
-      const isHighlighter = gesture.type === "highlighter";
-      currentContent.elements.push({
-        id: randomId(), type: isHighlighter ? "highlighter" : "stroke", points: gesture.points,
-        pressureEnabled: false,
-        straightened: gesture.straightened === true,
-        style: {
-          color: isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor,
-          widthRatio: Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10000 * (isHighlighter ? 10 : 1),
-          opacity: Number(isHighlighter ? toolSettings.highlighterOpacity : toolSettings.penOpacity) / 100
-        },
-        zIndex: elementZIndex(currentContent.elements), createdAt: new Date().toISOString()
-      });
-      commitChange(gesture.before, isHighlighter ? "ハイライト追加" : "ペン追加");
-    } else if (gesture.type === "eraser-pixel") {
+    if (gesture.type === "eraser-pixel") {
       currentContent.elements = currentContent.elements.flatMap(element => {
         if (!["stroke", "highlighter"].includes(element.type)) return [element];
         return splitStrokeByEraser(element, gesture.points, gesture.radius);
@@ -2503,12 +3384,20 @@ export function createStudyNotes(dependencies) {
     } else if (gesture.type === "text") {
       const bounds = normalizedBoundsFromPoints(gesture.start, end, .01);
       const dragged = Math.abs(end.x - gesture.start.x) > .01 || Math.abs(end.y - gesture.start.y) > .01;
-      openTextEditor(gesture.start, "", dragged ? bounds : null);
+      if (dragged) textEditorSession?.setBounds(bounds);
+      textEditorSession?.activate();
     } else if (gesture.type === "shape") {
       const bounds = normalizedBoundsFromPoints(gesture.start, end, .01);
       const shape = {
-        id: randomId(), type: "shape", shapeType: ui.shapeType.value, bounds, rotation: 0,
-        style: { strokeColor: ui.color.value, strokeWidthRatio: Number(ui.width.value) / 10000, strokeOpacity: Number(ui.opacity.value) / 100, fillColor: ui.fillColor.value, fillOpacity: Number(ui.fillOpacity.value) / 100, lineStyle: ui.lineStyle.value },
+        id: randomId(), type: "shape", shapeType: toolSettings.shapeType, bounds, rotation: 0,
+        style: {
+          strokeColor: toolSettings.shapeStrokeColor,
+          strokeWidthRatio: Number(toolSettings.shapeStrokeWidth) / 10000,
+          strokeOpacity: Number(toolSettings.shapeStrokeOpacity) / 100,
+          fillColor: toolSettings.shapeFillColor,
+          fillOpacity: Number(toolSettings.shapeFillOpacity) / 100,
+          lineStyle: toolSettings.shapeLineStyle
+        },
         zIndex: elementZIndex(currentContent.elements)
       };
       currentContent.elements.push(["line", "arrow"].includes(shape.shapeType)
@@ -2519,27 +3408,34 @@ export function createStudyNotes(dependencies) {
       const bounds = normalizedBoundsFromPoints(gesture.start, end, .01);
       const mask = { id: randomId(), ...bounds, weak: false };
       currentContent.noteMasks.push(mask); selectedIds = [mask.id];
+      showSelectionContext();
       commitChange(gesture.before, "暗記マスク追加");
     } else if (gesture.type === "lasso") {
       const hits = currentContent.elements
         .filter(element => lassoContainsElement(gesture.points, element, pages[currentPageIndex]?.size))
         .map(element => element.id);
       selectedIds = gesture.additive ? [...new Set([...selectedIds, ...hits])] : hits;
+      showSelectionContext();
       renderPage();
     }
   }
 
-  function drawDraftPath(points, type) {
-    ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
-    const svg = createSvgElement("svg", { viewBox: "0 0 1000 1414", preserveAspectRatio: "none", class: "note-layer", "data-note-draft": "true" });
-    svg.style.zIndex = "30";
+  function drawDraftPath(points, type, gesture = activeGesture) {
+    if (!gesture) return;
     const isHighlighter = type === "highlighter";
-    svg.append(createSvgElement("path", {
-      d: pathData(points), class: "note-draft-path", stroke: isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor,
-      "stroke-width": Math.max(1, Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10 * (isHighlighter ? 10 : 1)),
-      "stroke-opacity": Number(isHighlighter ? toolSettings.highlighterOpacity : toolSettings.penOpacity) / 100
-    }));
-    ui.stage.append(svg);
+    if (!gesture.previewNode?.isConnected) {
+      const svg = createSvgElement("svg", { viewBox: "0 0 1000 1414", preserveAspectRatio: "none", class: "note-layer", "data-note-draft": gesture.strokeSessionId || "active" });
+      svg.style.zIndex = "30";
+      gesture.previewPath = createSvgElement("path", {
+        class: "note-draft-path", stroke: isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor,
+        "stroke-width": Math.max(1, Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10 * (isHighlighter ? 10 : 1)),
+        "stroke-opacity": Number(isHighlighter ? toolSettings.highlighterOpacity : toolSettings.penOpacity) / 100
+      });
+      svg.append(gesture.previewPath);
+      ui.stage.append(svg);
+      gesture.previewNode = svg;
+    }
+    gesture.previewPath.setAttribute("d", pathData(points));
   }
 
   function drawSelectionRect(start, end) {
@@ -2556,40 +3452,146 @@ export function createStudyNotes(dependencies) {
     ui.stage.append(svg);
   }
 
-  function openTextEditor(point, existingId = "", requestedBounds = null) {
+  function openTextEditor(point, existingId = "", requestedBounds = null, { deferFocus = false } = {}) {
+    if (textEditorSession && !textEditorSession.finish()) return;
     const existing = currentContent.elements.find(element => element.id === existingId && element.type === "text");
     const before = clone(currentContent);
-    const editor = document.createElement("textarea"); editor.className = "note-text-editor";
-    const bounds = existing?.bounds || requestedBounds || { x: point.x, y: point.y, width: .35, height: .12 };
-    setBoundsStyle(editor, bounds); editor.value = existing?.text || ""; ui.stage.append(editor); editor.focus();
-    const finish = () => {
-      const value = editor.value.trimEnd(); editor.remove();
-      if (!value) return;
-      if (existing) existing.text = value;
-      else currentContent.elements.push({
-        id: randomId(), type: "text", bounds, rotation: 0, text: value,
-        style: { fontFamily: ui.fontFamily.value, fontSizeRatio: Number(ui.fontSize.value) / 1000, fontWeight: ui.fontBold.checked ? "bold" : "normal", fontStyle: ui.fontItalic.checked ? "italic" : "normal", textAlign: ui.textAlign.value, lineHeight: Number(ui.lineHeight.value || 1.25), color: ui.color.value, opacity: Number(ui.opacity.value) / 100 },
-        zIndex: elementZIndex(currentContent.elements)
-      });
-      commitChange(before, existing ? "テキスト編集" : "テキスト追加");
+    const fallback = requestedBounds || { x: point.x, y: point.y, width: .35, height: .12 };
+    const width = clamp(Number(existing?.bounds?.width || fallback.width), .08, 1);
+    const height = clamp(Number(existing?.bounds?.height || fallback.height), .04, 1);
+    let bounds = clone(existing?.bounds || {
+      ...fallback,
+      x: clamp(Number(fallback.x), 0, 1 - width),
+      y: clamp(Number(fallback.y), 0, 1 - height),
+      width,
+      height
+    });
+    const style = existing?.style || {
+      fontFamily: toolSettings.textFontFamily,
+      fontSizeRatio: Number(toolSettings.textFontSize) / 1000,
+      fontWeight: toolSettings.textBold ? "bold" : "normal",
+      fontStyle: toolSettings.textItalic ? "italic" : "normal",
+      textAlign: toolSettings.textAlign,
+      lineHeight: Number(toolSettings.textLineHeight || 1.25),
+      color: toolSettings.textColor,
+      opacity: Number(toolSettings.textOpacity) / 100
     };
-    editor.addEventListener("blur", finish, { once: true });
-    editor.addEventListener("keydown", event => { if (event.key === "Escape") { editor.value = ""; editor.blur(); } });
-    editor.scrollIntoView({ block: "center", behavior: "smooth" });
+    const editor = document.createElement("textarea");
+    editor.className = "note-text-editor";
+    editor.classList.toggle("is-sizing", deferFocus);
+    editor.dataset.noteTextEditor = "true";
+    editor.setAttribute("aria-label", existing ? "テキストを編集" : "テキストを入力");
+    setBoundsStyle(editor, bounds);
+    editor.value = existing?.text || "";
+    editor.style.fontFamily = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
+    editor.style.fontWeight = style.fontWeight || "normal";
+    editor.style.fontStyle = style.fontStyle || "normal";
+    editor.style.setProperty("--note-text-editor-font-size", `${Math.max(16, Number(style.fontSizeRatio || .025) * (ui.stage.clientHeight || 640))}px`);
+    editor.style.setProperty("--note-text-editor-line-height", String(style.lineHeight || 1.25));
+    editor.style.setProperty("--note-text-editor-align", style.textAlign || "left");
+    editor.style.setProperty("--note-text-editor-color", style.color || "#111111");
+    editor.style.setProperty("--note-text-editor-opacity", String(style.opacity ?? 1));
+    ui.stage.append(editor);
+
+    let composing = false;
+    let pendingFinish = false;
+    let finished = false;
+    let cancelled = false;
+    const updateAutomaticHeight = () => {
+      if (finished || !editor.isConnected) return;
+      editor.style.height = "auto";
+      const minimum = Math.max(60, editor.scrollHeight + 4);
+      const stageHeight = Math.max(1, ui.stage.clientHeight || 1);
+      const normalizedHeight = clamp(minimum / stageHeight, .04, Math.max(.04, 1 - bounds.y));
+      bounds = { ...bounds, height: Math.max(bounds.height, normalizedHeight) };
+      setBoundsStyle(editor, bounds);
+    };
+    const setEditorBounds = nextBounds => {
+      if (finished || existing || !nextBounds) return;
+      const nextWidth = clamp(Number(nextBounds.width), .01, 1);
+      const nextHeight = clamp(Number(nextBounds.height), .01, 1);
+      bounds = {
+        x: clamp(Number(nextBounds.x), 0, 1 - nextWidth),
+        y: clamp(Number(nextBounds.y), 0, 1 - nextHeight),
+        width: nextWidth,
+        height: nextHeight
+      };
+      setBoundsStyle(editor, bounds);
+    };
+    const keepVisible = () => {
+      if (!editor.isConnected) return;
+      const visual = globalThis.visualViewport;
+      const visibleBottom = (visual?.offsetTop || 0) + (visual?.height || globalThis.innerHeight || 0);
+      const rect = editor.getBoundingClientRect();
+      if (rect.bottom > visibleBottom - 12) ui.viewport.scrollTop += rect.bottom - visibleBottom + 20;
+      if (rect.top < (visual?.offsetTop || 0) + 70) ui.viewport.scrollTop -= (visual?.offsetTop || 0) + 82 - rect.top;
+    };
+    const finish = ({ cancel = false, force = false } = {}) => {
+      if (finished) return true;
+      if (composing && !force) { pendingFinish = true; cancelled ||= cancel; return false; }
+      finished = true;
+      cancelled ||= cancel;
+      globalThis.visualViewport?.removeEventListener?.("resize", keepVisible);
+      globalThis.visualViewport?.removeEventListener?.("scroll", keepVisible);
+      const value = cancelled ? "" : editor.value.trimEnd();
+      editor.remove();
+      textEditorSession = null;
+      if (!value) { renderPage(); return true; }
+      if (existing) {
+        existing.text = value;
+        existing.autoHeight = true;
+        existing.bounds = normalizeTextElementHeight({ ...existing, text: value, bounds }).bounds;
+      } else currentContent.elements.push(normalizeTextElementHeight({
+        id: randomId(), type: "text", bounds, rotation: 0, text: value, autoHeight: true,
+        style: clone(style),
+        zIndex: elementZIndex(currentContent.elements)
+      }));
+      commitChange(before, existing ? "テキスト編集" : "テキスト追加");
+      return true;
+    };
+    const activate = () => {
+      if (finished || !editor.isConnected) return false;
+      editor.classList.remove("is-sizing");
+      editor.focus({ preventScroll: true });
+      editor.setSelectionRange(editor.value.length, editor.value.length);
+      requestAnimationFrame(keepVisible);
+      return true;
+    };
+    textEditorSession = {
+      editor,
+      finish,
+      setBounds: setEditorBounds,
+      activate,
+      get isComposing() { return composing; }
+    };
+    editor.addEventListener("compositionstart", () => { composing = true; });
+    editor.addEventListener("compositionend", () => {
+      composing = false;
+      updateAutomaticHeight();
+      if (pendingFinish) queueMicrotask(() => finish({ cancel: cancelled }));
+    });
+    editor.addEventListener("input", updateAutomaticHeight);
+    editor.addEventListener("paste", () => requestAnimationFrame(updateAutomaticHeight));
+    editor.addEventListener("blur", () => { if (!composing) finish(); else pendingFinish = true; });
+    editor.addEventListener("keydown", event => {
+      if (event.key === "Escape" && !composing) { event.preventDefault(); finish({ cancel: true }); }
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && !composing) { event.preventDefault(); finish(); }
+    });
+    globalThis.visualViewport?.addEventListener?.("resize", keepVisible);
+    globalThis.visualViewport?.addEventListener?.("scroll", keepVisible);
+    updateAutomaticHeight();
+    if (!deferFocus) activate();
+    return textEditorSession;
   }
 
   function showImageMenu() {
-    document.querySelector(".note-image-menu")?.remove();
-    const menu = document.createElement("div"); menu.className = "note-image-menu note-selection-actions"; menu.style.top = "64px";
-    [["クリップボードから貼り付け", pasteFromClipboard], ["写真から選択", () => ui.photoInput.click()], ["ファイルから選択", () => ui.fileInput.click()]].forEach(([label, action]) => {
-      const button = document.createElement("button"); button.type = "button"; button.textContent = label;
-      button.addEventListener("click", () => { menu.remove(); Promise.resolve(action()).catch(() => showPasteFallback()); }); menu.append(button);
-    });
-    ui.editorView.append(menu);
+    setTransientUi("image-source-menu", { ownerTool: "image" });
+    requestAnimationFrame(() => positionTransientPanel(ui.imageSourceMenu));
   }
 
   function showPasteFallback() {
-    ui.pasteFallback.classList.remove("hidden"); ui.pasteFallback.textContent = "ここを長押しして「ペースト」を選択してください"; ui.pasteFallback.focus();
+    setTransientUi("paste-fallback", { ownerTool: "image" });
+    ui.pasteFallback.textContent = "ここを長押しして「ペースト」を選択してください"; ui.pasteFallback.focus();
   }
 
   async function pasteFromClipboard() {
@@ -2707,7 +3709,7 @@ export function createStudyNotes(dependencies) {
       assertUserSession(session);
       await localStore.deleteIfUnchanged("pendingAssets", pendingKey, pendingAssetCreatedAt);
       assertUserSession(session);
-      await saveCoordinator.schedule(saveIdentity, target.content);
+      await scheduleLocalSave(saveIdentity, target.content);
       assertUserSession(session);
     } catch (error) {
       if (error?.name === "NoteSessionChangedError") throw error;
@@ -2720,6 +3722,7 @@ export function createStudyNotes(dependencies) {
 
   async function pageAction(action, index) {
     if (!currentNote) return;
+    if (!prepareEditorAction("ページ操作")) return;
     const actionPage = pages[index] || pages[currentPageIndex];
     if (!canMutateCurrentNote(currentNote, { page: actionPage, allowConflict: false })) return;
     const session = captureUserSession();
@@ -2783,6 +3786,7 @@ export function createStudyNotes(dependencies) {
   }
 
   async function addPage(kind) {
+    if (!prepareEditorAction("ページ追加")) return;
     if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
     const session = captureUserSession();
     assertUserSession(session);
@@ -2798,8 +3802,22 @@ export function createStudyNotes(dependencies) {
     history.clear(); renderPageList(); renderPage();
   }
 
+  function prepareEditorAction(label) {
+    if (activeGesture) {
+      showEditorNotice(`${label}は現在の操作を終えてから実行してください。`);
+      return false;
+    }
+    if (textEditorSession && !textEditorSession.finish()) {
+      showEditorNotice(`${label}は文字変換を確定してから実行してください。`);
+      return false;
+    }
+    return true;
+  }
+
   async function changeBackground() {
     if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
+    if (!prepareEditorAction("背景変更")) return;
+    if (!closeTransientUi()) return;
     const session = captureUserSession();
     assertUserSession(session);
     const page = pages[currentPageIndex];
@@ -2863,8 +3881,10 @@ export function createStudyNotes(dependencies) {
     ui.fontItalic.checked = style.fontStyle === "italic";
     ui.textAlign.value = style.textAlign || "left";
     ui.lineHeight.value = String(style.lineHeight || 1.25);
-    ui.color.value = style.color || "#111111";
-    ui.opacity.value = String(Math.round(Number(style.opacity ?? 1) * 100));
+    ui.textColor.value = style.color || "#111111";
+    ui.textOpacity.value = String(Math.round(Number(style.opacity ?? 1) * 100));
+    if (ui.fontSizeValue) ui.fontSizeValue.value = String(Math.round(Number(ui.fontSize.value)));
+    if (ui.textOpacityValue) ui.textOpacityValue.value = `${Math.round(Number(ui.textOpacity.value))}%`;
   }
 
   function applySelectedTextStyle() {
@@ -2880,22 +3900,45 @@ export function createStudyNotes(dependencies) {
         fontStyle: ui.fontItalic.checked ? "italic" : "normal",
         textAlign: ui.textAlign.value,
         lineHeight: Number(ui.lineHeight.value || 1.25),
-        color: ui.color.value,
-        opacity: Number(ui.opacity.value) / 100
+        color: ui.textColor.value,
+        opacity: Number(ui.textOpacity.value) / 100
       };
+      const normalized = normalizeTextElementHeight(element);
+      element.bounds = normalized.bounds;
+      element.autoHeight = normalized.autoHeight;
     });
     commitChange(before, "テキスト書式変更");
   }
 
   function selectionAction(action) {
     if (!isEditableNow()) { explainBlockedEdit(); return; }
+    if (action === "select-page-masks") {
+      selectedIds = currentContent.noteMasks.map(mask => mask.id);
+      maskMultiSelect = true;
+      ui.maskSelectMode?.setAttribute("aria-pressed", "true");
+      showSelectionContext();
+      renderPage();
+      return;
+    }
+    if (action === "clear-selection") {
+      selectedIds = [];
+      closeTransientUi();
+      renderPage();
+      return;
+    }
     const elements = selectedElements();
     const masks = selectedMasks();
     if (!elements.length && !masks.length) return;
     const before = clone(currentContent);
     if (action === "delete") {
+      if (masks.length > 1 && !confirm(`選択した${masks.length}個のマスクを削除しますか？`)) return;
       currentContent.elements = currentContent.elements.filter(element => !selectedIds.includes(element.id) || element.locked);
       currentContent.noteMasks = currentContent.noteMasks.filter(mask => !selectedIds.includes(mask.id));
+      selectedIds.forEach(id => {
+        const visibilityKey = maskVisibilityKey({ id }, "note");
+        revealedMaskIds.delete(visibilityKey);
+        editingHiddenMaskIds.delete(visibilityKey);
+      });
       selectedIds = [];
     } else if (action === "duplicate") {
       const copies = elements.map(element => ({
@@ -2905,8 +3948,12 @@ export function createStudyNotes(dependencies) {
       const maskCopies = masks.map(mask => ({ ...mask, id: randomId(), x: clamp(mask.x + .02, 0, 1 - mask.width), y: clamp(mask.y + .02, 0, 1 - mask.height) }));
       currentContent.elements.push(...copies); currentContent.noteMasks.push(...maskCopies); selectedIds = [...copies, ...maskCopies].map(item => item.id);
     } else if (action === "front" || action === "back") {
-      const z = action === "front" ? elementZIndex(currentContent.elements) : Math.min(0, ...currentContent.elements.map(element => Number(element.zIndex || 0))) - 10;
-      elements.forEach((element, index) => { element.zIndex = z + index; });
+      if (masks.length) {
+        currentContent.noteMasks = reorderNoteMasks(currentContent.noteMasks, masks.map(mask => mask.id), action);
+      } else {
+        const z = action === "front" ? elementZIndex(currentContent.elements) : Math.min(0, ...currentContent.elements.map(element => Number(element.zIndex || 0))) - 10;
+        elements.forEach((element, index) => { element.zIndex = z + index; });
+      }
     } else if (action === "rotate-left" || action === "rotate-right") {
       if (masks.length) return;
       const bounds = selectionBounds(elements, pages[currentPageIndex]?.size);
@@ -2932,6 +3979,7 @@ export function createStudyNotes(dependencies) {
       const image = elements.find(element => element.type === "image");
       if (!image) return;
       cropSession = { elementId: image.id, before, draft: clone(image.crop || { x: 0, y: 0, width: 1, height: 1 }) };
+      setTransientUi("crop-editor", { ownerTool: "select", targetElementIds: [image.id] });
       renderPage();
       return;
     } else if (action === "resize") {
@@ -2951,7 +3999,11 @@ export function createStudyNotes(dependencies) {
       masks.forEach(mask => { mask.width = Math.min(width, 1 - mask.x); mask.height = Math.min(height, 1 - mask.y); });
     } else if (action === "weak") {
       masks.forEach(mask => { mask.weak = !mask.weak; });
+    } else if (action === "weak-on" || action === "weak-off") {
+      masks.forEach(mask => { mask.weak = action === "weak-on"; });
     }
+    if (selectedIds.length) showSelectionContext();
+    else closeTransientUi();
     commitChange(before, `選択: ${action}`);
   }
 
@@ -2970,30 +4022,41 @@ export function createStudyNotes(dependencies) {
       else currentContent.noteMasks.push({ ...copy, x: clamp(copy.x + .025, 0, 1 - copy.width), y: clamp(copy.y + .025, 0, 1 - copy.height) });
       ids.push(copy.id);
     });
-    selectedIds = ids; commitChange(before, "アプリ内部貼り付け");
+    selectedIds = ids; showSelectionContext(); commitChange(before, "アプリ内部貼り付け");
   }
 
   function undo() {
     if (!isEditableNow()) { explainBlockedEdit(); return; }
+    if (pendingStrokeWork) { void flushPendingStrokeWork({ render: false }).then(undo); return; }
     const restored = history.undo(historySnapshot()); if (!restored) return;
     void applyHistorySnapshot(restored).catch(reportError);
   }
 
   function redo() {
     if (!isEditableNow()) { explainBlockedEdit(); return; }
+    if (pendingStrokeWork) { void flushPendingStrokeWork({ render: false }).then(redo); return; }
     const restored = history.redo(historySnapshot()); if (!restored) return;
     void applyHistorySnapshot(restored).catch(reportError);
   }
 
   function setStudyMode(active) {
-    closeToolSettings();
+    if (!prepareEditorAction("暗記モードへの切り替え")) return;
+    cancelActiveInteraction("tool-change");
+    cancelCropEditor({ restore: true });
+    closeTransientUi();
     studyMode = active === true;
     if (studyMode) { currentTool = "study"; selectedIds = []; }
     else setTool("pen");
-    ui.studyToggle.textContent = studyMode ? "編集へ戻る" : "暗記モード";
+    const modeLabel = studyMode ? "編集モードへ戻る" : "暗記モード";
+    ui.studyToggle.setAttribute("aria-label", modeLabel);
+    ui.studyToggle.title = modeLabel;
+    ui.studyToggle.querySelector(".note-mode-icon-brain")?.classList.toggle("hidden", studyMode);
+    ui.studyToggle.querySelector(".note-mode-icon-edit")?.classList.toggle("hidden", !studyMode);
+    const accessibleLabel = ui.studyToggle.querySelector(".sr-only");
+    if (accessibleLabel) accessibleLabel.textContent = modeLabel;
+    ui.studyToggle.classList.toggle("active", studyMode);
     ui.studyControls.classList.toggle("hidden", !studyMode);
     ui.toolbar.classList.toggle("hidden", studyMode);
-    ui.settings.classList.add("hidden");
     renderPage();
   }
 
@@ -3301,17 +4364,34 @@ export function createStudyNotes(dependencies) {
 
   function openExportDialog() {
     if (!currentNote) return;
+    if (!prepareEditorAction("PDF書き出し")) return;
+    if (!closeTransientUi()) return;
     generatedPdf = null;
     ui.exportPurpose.value = "ai"; ui.exportQuality.value = "standard"; ui.exportRangeMode.value = "all";
     ui.exportRange.classList.add("hidden");
     ui.exportPageNumbers.checked = currentNote.type === "standalone";
     ui.exportFilename.value = createPdfFilename(currentNote.title, "ai");
-    ui.exportProgress.value = 0; ui.exportStatus.textContent = "AI共有用では暗記マスクをPDFへ描画しません。";
+    ui.exportProgress.value = 0;
+    updateExportPurposeHint();
     ui.downloadPdf.disabled = true;
     ui.cancelPdf.disabled = false;
     const shareSupported = Boolean(navigator.share && navigator.canShare);
     ui.sharePdf.disabled = true; ui.sharePdf.classList.toggle("hidden", !shareSupported);
     ui.exportDialog.showModal();
+  }
+
+  function updateExportPurposeHint() {
+    if (!ui.exportStatus) return;
+    if (ui.exportPurpose.value === "ai") {
+      ui.exportStatus.textContent = "AI共有用では暗記マスクをPDFへ描画しません。";
+    } else if (ui.exportPurpose.value === "study") {
+      ui.exportStatus.textContent = "学習用ではすべての暗記マスクをPDFへ描画します。";
+    } else {
+      const hiddenMaskCount = (studyMode ? revealedMaskIds : editingHiddenMaskIds).size;
+      ui.exportStatus.textContent = hiddenMaskCount
+        ? `画面どおりでは、現在非表示の暗記マスク${hiddenMaskCount}件もその状態でPDFへ反映します。`
+        : "画面どおりでは、現在の暗記マスク表示をPDFへ反映します。";
+    }
   }
 
   async function openExportFromList(noteId) {
@@ -3348,7 +4428,11 @@ export function createStudyNotes(dependencies) {
         ),
         resolveBackgroundBlob,
         resolveAssetBlob: (assetId, sourceNoteId) => resolveAssetBlob(assetId, sourceNoteId || currentNote.id),
-        revealedMaskIds,
+        revealedMaskIds: pdfScreenHiddenMaskIds(ui.exportPurpose.value, {
+          studyMode,
+          revealedMaskIds,
+          editingHiddenMaskIds
+        }),
         signal: exportController.signal,
         onProgress: progress => {
           ui.exportProgress.value = progress.percent;
@@ -3449,22 +4533,25 @@ export function createStudyNotes(dependencies) {
   }
 
   function setMarkupMode(active) {
+    if (active !== true && textEditorSession && !textEditorSession.finish()) return;
     markupMode = active === true;
     ui.editorView.classList.toggle("markup-inactive", !markupMode);
     ui.toolbar.classList.toggle("hidden", !markupMode);
     ui.markupDone.setAttribute("aria-label", markupMode ? "マークアップを完了" : "マークアップを開始");
     ui.markupDone.title = markupMode ? "マークアップを完了" : "マークアップを開始";
     ui.markupDone.textContent = markupMode ? "✓" : "✎";
+    syncDrawingInputLayer();
     if (!markupMode) {
-      closeToolSettings();
+      cancelActiveInteraction("close");
+      cancelCropEditor({ restore: true });
+      closeTransientUi();
       selectedIds = [];
       renderPage();
     }
   }
 
   async function finishMarkup() {
-    closeToolSettings();
-    closeSavePopover();
+    closeTransientUi();
     if (!markupMode) {
       setMarkupMode(true);
       return;
@@ -3527,8 +4614,10 @@ export function createStudyNotes(dependencies) {
   }
 
   async function returnToNoteList() {
-    closeToolSettings();
-    closeSavePopover();
+    if (textEditorSession && !textEditorSession.finish()) return;
+    cancelActiveInteraction("close");
+    cancelCropEditor({ restore: true });
+    closeTransientUi();
     if (currentNote && !await flushAllWithDecision("ノート一覧へ戻る操作")) return;
     editorLease?.release();
     if (dedicatedEditor) {
@@ -3539,8 +4628,10 @@ export function createStudyNotes(dependencies) {
   }
 
   async function closeEditor() {
-    closeToolSettings();
-    closeSavePopover();
+    if (textEditorSession && !textEditorSession.finish()) return;
+    cancelActiveInteraction("close");
+    cancelCropEditor({ restore: true });
+    closeTransientUi();
     if (currentNote && !await flushAllWithDecision("ノートを閉じる操作")) return;
     editorLease?.release();
     currentNote = null; pages = []; currentContent = null; selectedIds = []; history.clear();
@@ -3553,13 +4644,18 @@ export function createStudyNotes(dependencies) {
   }
 
   function resetForUserChange() {
+    textEditorSession?.finish({ cancel: true, force: true });
+    cancelActiveInteraction("close");
+    cancelCropEditor({ restore: false });
+    closeTransientUi();
     userSessionGeneration += 1;
     createController?.abort(); exportController?.abort(); saveCoordinator.reset();
+    pendingLocalSavePromises.clear();
     pendingAssetRecoveryPromises.clear(); pendingRecoveryPromises.clear(); pendingRecoverySweeps.clear();
     editorLease?.dispose(); editorLease = null;
     currentNote = null; pages = []; currentContent = null; notes = []; orphanedDrafts = []; contentCache.clear(); assetCache.clear();
-    selectedIds = []; activeTouchPointerIds.clear(); pageZoomGestureActive = false; activeGesture = null;
-    closeToolSettings(); closeSavePopover(); markupMode = true; localRecoverySuppressed = false; explicitReadOnlyMode = false;
+    selectedIds = []; activeTouchPointerIds.clear(); swipeGesture = null; activeGesture = null;
+    markupMode = true; localRecoverySuppressed = false; explicitReadOnlyMode = false;
     history.clear(); resetPageRender(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
     ui.list.replaceChildren(); show("list"); setListStatus("ログイン後にノートを読み込みます。");
     if (dedicatedEditor) {
@@ -3568,30 +4664,82 @@ export function createStudyNotes(dependencies) {
     }
   }
 
+  function positionTransientPanel(panel) {
+    if (!panel || panel.classList.contains("hidden")) return;
+    const viewport = globalThis.visualViewport;
+    const view = {
+      left: Number(viewport?.offsetLeft || 0),
+      top: Number(viewport?.offsetTop || 0),
+      width: Number(viewport?.width || globalThis.innerWidth || 0),
+      height: Number(viewport?.height || globalThis.innerHeight || 0)
+    };
+    const compactLayout = matchMedia("(orientation: portrait), (max-width: 760px)").matches;
+    panel.style.maxWidth = `${Math.max(280, Math.min(420, view.width - 32))}px`;
+    panel.style.maxHeight = `${transientPanelMaxHeight(view.height, { compactLayout })}px`;
+    if (compactLayout) {
+      ["left", "right", "top", "bottom", "transform"].forEach(property => panel.style[property] = "");
+      return;
+    }
+    const toolbar = ui.toolbar.getBoundingClientRect();
+    const width = panel.offsetWidth;
+    const height = panel.offsetHeight;
+    const margin = 16;
+    const clampPosition = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
+    let left = toolbar.right + 12;
+    let top = toolbar.top + toolbar.height / 2 - height / 2;
+    if (toolSettings.toolbarDock === "right") left = toolbar.left - width - 12;
+    if (toolSettings.toolbarDock === "top") {
+      left = toolbar.left + toolbar.width / 2 - width / 2;
+      top = toolbar.bottom + 12;
+    }
+    if (toolSettings.toolbarDock === "bottom") {
+      left = toolbar.left + toolbar.width / 2 - width / 2;
+      top = toolbar.top - height - 12;
+    }
+    panel.style.left = `${clampPosition(left, view.left + margin, view.left + view.width - width - margin)}px`;
+    panel.style.top = `${clampPosition(top, view.top + 70, view.top + view.height - height - margin)}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+    panel.style.transform = "none";
+  }
+
   function showToolSettings(tool = currentTool) {
     if (tool === "eraser-object") tool = toolSettings.eraserMode === "pixel" ? "eraser-pixel" : "eraser-object";
-    if (TOOL_LABELS[tool]) currentTool = tool;
-    ui.settingsTitle.textContent = currentTool === "pen" ? "ペン設定" : currentTool === "highlighter" ? "蛍光ペン設定" : currentTool.startsWith("eraser") ? "消しゴム設定" : "ツール設定";
-    applyToolSettingsToUi();
-    ui.settings.classList.remove("hidden");
-    ui.settings.setAttribute("aria-hidden", "false");
-    ui.toolbar.querySelectorAll("[data-note-tool]").forEach(button => {
-      button.setAttribute("aria-expanded", String(button.dataset.noteTool === tool || (button.dataset.noteTool === "eraser-object" && tool === "eraser-pixel")));
+    const selectedText = currentTool === "select" && selectedElements().some(element => element.type === "text");
+    const panelTool = tool === "input" ? "input" : selectedText ? "text" : tool;
+    const type = panelTool === "input" ? "input-settings" : settingsTransientType(panelTool);
+    if (!type) return;
+    if (TOOL_LABELS[tool] && tool !== "select") currentTool = tool;
+    const titles = {
+      pen: "ペン設定", highlighter: "蛍光ペン設定",
+      "eraser-object": "消しゴム設定", "eraser-pixel": "消しゴム設定",
+      shape: "図形設定", text: "テキスト設定", input: "入力設定"
+    };
+    ui.settingsTitle.textContent = titles[panelTool] || "ツール設定";
+    ui.settingSections.forEach(section => {
+      const tools = String(section.dataset.settingTools || "").split(/\s+/);
+      section.classList.toggle("hidden", !tools.includes(panelTool));
     });
+    applyToolSettingsToUi();
+    if (selectedText) syncSelectedTextControls();
+    setTransientUi(type, { ownerTool: panelTool });
+    positionTransientPanel(ui.settings);
   }
 
   function closeToolSettings() {
-    if (!ui.settings) return;
-    ui.settings.classList.add("hidden");
-    ui.settings.setAttribute("aria-hidden", "true");
-    ui.toolbar?.querySelectorAll("[data-note-tool]").forEach(button => button.setAttribute("aria-expanded", "false"));
+    if (transientUiIsSettings(transientUi)) closeTransientUi();
   }
 
   function handleToolButton(tool) {
     const normalized = tool === "eraser-object" && toolSettings.eraserMode === "pixel" ? "eraser-pixel" : tool;
-    if (currentTool === normalized && ["pen", "highlighter", "eraser-object", "eraser-pixel"].includes(currentTool)) {
-      if (ui.settings.classList.contains("hidden")) showToolSettings(currentTool);
+    if (currentTool === normalized && ["pen", "highlighter", "eraser-object", "eraser-pixel", "shape", "text"].includes(currentTool)) {
+      if (!transientUiIsSettings(transientUi)) showToolSettings(currentTool);
       else closeToolSettings();
+      return;
+    }
+    if (currentTool === normalized && currentTool === "image") {
+      if (transientUi.type === "image-source-menu") closeTransientUi();
+      else showImageMenu();
       return;
     }
     setTool(tool);
@@ -3602,6 +4750,7 @@ export function createStudyNotes(dependencies) {
     if (action === "select-all") {
       selectedIds = currentContent?.elements?.map(element => element.id) || [];
       setTool("select");
+      showSelectionContext();
       return;
     }
     if (action === "colors") { showToolSettings(); return; }
@@ -3643,13 +4792,20 @@ export function createStudyNotes(dependencies) {
   }
 
   function bindEvents() {
+    bindDrawingInputLayer();
     ui.noteModeBtn.addEventListener("click", () => { activateSection("note"); show(currentNote ? "editor" : "list"); void refreshNotes(); });
     ui.newNoteBtn.addEventListener("click", () => { show("create"); ui.materialPicker.classList.add("hidden"); });
-    ui.cancelCreate.addEventListener("click", () => show("list"));
+    ui.cancelCreate.addEventListener("click", () => {
+      if (dedicatedEditorCreateMode) globalThis.location.replace(noteListUrl().toString());
+      else show("list");
+    });
     ui.createView.querySelectorAll("[data-create-note]").forEach(button => button.addEventListener("click", () => {
       const type = button.dataset.createNote;
       if (type === "material") renderMaterialPicker();
-      else if (type === "pdf") ui.pdfInput.click();
+      else if (type === "pdf") {
+        if (dedicatedEditorCreateMode === "pdf") ui.pdfInput.click();
+        else openPdfCreationSurface();
+      }
       else {
         let reservedWindow;
         try { reservedWindow = reserveEditorTab(); }
@@ -3660,10 +4816,11 @@ export function createStudyNotes(dependencies) {
     ui.pdfInput.addEventListener("change", () => {
       const file = ui.pdfInput.files?.[0];
       if (!file) return;
-      let reservedWindow;
-      try { reservedWindow = reserveEditorTab(); }
-      catch (error) { reportError(error); return; }
-      createPdfNote(file, reservedWindow).catch(error => { reservedWindow.close?.(); reportError(error); });
+      if (dedicatedEditorCreateMode === "pdf") {
+        createPdfNote(file).catch(reportError);
+        return;
+      }
+      createPdfNote(file).catch(reportError);
     });
     ui.cancelCreateProgress.addEventListener("click", () => createController?.abort());
     ui.closeNote.addEventListener("click", () => returnToNoteList().catch(reportError));
@@ -3759,8 +4916,43 @@ export function createStudyNotes(dependencies) {
       ["pointerup", "pointercancel", "pointerleave"].forEach(type => button.addEventListener(type, () => clearTimeout(longPress)));
       button.addEventListener("click", event => { if (longPressed) { event.preventDefault(); return; } handleToolButton(button.dataset.noteTool); });
     });
-    ui.styleBtn.addEventListener("click", () => ui.settings.classList.contains("hidden") ? showToolSettings() : closeToolSettings());
+    ui.styleBtn.addEventListener("click", () => transientUiIsSettings(transientUi) ? closeToolSettings() : showToolSettings());
     ui.settingsDone.addEventListener("click", closeToolSettings);
+    ui.inputSettings?.addEventListener("click", () => {
+      if (transientUi.type === "input-settings") closeTransientUi();
+      else showToolSettings("input");
+    });
+    ui.maskVisibility?.addEventListener("click", () => {
+      closeTransientUi();
+      const masks = currentPageMasks();
+      const hideMasks = !masks.some(mask => editingHiddenMaskIds.has(maskVisibilityKey(mask)));
+      masks.forEach(mask => {
+        const visibilityKey = maskVisibilityKey(mask);
+        if (hideMasks) editingHiddenMaskIds.add(visibilityKey);
+        else editingHiddenMaskIds.delete(visibilityKey);
+      });
+      if (currentContent) renderPage();
+    });
+    ui.maskSelectMode?.addEventListener("click", () => {
+      setTool("mask");
+      maskMultiSelect = !maskMultiSelect;
+      ui.maskSelectMode.setAttribute("aria-pressed", String(maskMultiSelect));
+      if (!maskMultiSelect) {
+        selectedIds = [];
+        closeTransientUi();
+      }
+      renderPage();
+    });
+    ui.imageSourceDone?.addEventListener("click", closeTransientUi);
+    ui.imageClipboard?.addEventListener("click", () => {
+      closeTransientUi();
+      pasteFromClipboard().catch(error => {
+        console.warn("クリップボード画像を直接読み取れませんでした。", error);
+        showPasteFallback();
+      });
+    });
+    ui.imagePhoto?.addEventListener("click", () => { closeTransientUi(); ui.photoInput.click(); });
+    ui.imageFile?.addEventListener("click", () => { closeTransientUi(); ui.fileInput.click(); });
     ui.backgroundBtn.addEventListener("click", () => changeBackground().catch(reportError));
     ui.color.addEventListener("input", () => {
       persistToolSettings(currentTool === "highlighter" ? { highlighterColor: ui.color.value } : { penColor: ui.color.value });
@@ -3785,8 +4977,21 @@ export function createStudyNotes(dependencies) {
       else if (currentTool.startsWith("eraser")) persistToolSettings({ eraserSize: value });
       else persistToolSettings({ penWidth: value });
     });
-    [ui.color, ui.opacity, ui.fontFamily, ui.fontSize, ui.fontBold, ui.fontItalic, ui.textAlign, ui.lineHeight]
-      .forEach(control => control.addEventListener("change", applySelectedTextStyle));
+    const persistSelectedTextDefaults = () => {
+      persistToolSettings({
+        textFontFamily: ui.fontFamily.value,
+        textFontSize: Number(ui.fontSize.value),
+        textBold: ui.fontBold.checked,
+        textItalic: ui.fontItalic.checked,
+        textAlign: ui.textAlign.value,
+        textLineHeight: Number(ui.lineHeight.value),
+        textColor: ui.textColor.value,
+        textOpacity: Number(ui.textOpacity.value)
+      });
+      applySelectedTextStyle();
+    };
+    [ui.textColor, ui.textOpacity, ui.fontFamily, ui.fontSize, ui.fontBold, ui.fontItalic, ui.textAlign, ui.lineHeight]
+      .forEach(control => control.addEventListener("change", persistSelectedTextDefaults));
     ui.eraserMode.addEventListener("change", () => {
       persistToolSettings({ eraserMode: ui.eraserMode.value });
       if (currentTool.startsWith("eraser")) {
@@ -3795,61 +5000,210 @@ export function createStudyNotes(dependencies) {
       }
     });
     ui.eraserSize.addEventListener("input", () => persistToolSettings({ eraserSize: Number(ui.eraserSize.value) }));
+    ui.eraserPresets?.addEventListener("click", event => {
+      const value = Number(event.target.closest("button[data-width]")?.dataset.width);
+      if (value) persistToolSettings({ eraserSize: value });
+    });
+    ui.shapeType.addEventListener("change", () => persistToolSettings({ shapeType: ui.shapeType.value }));
+    ui.shapeStrokeColor.addEventListener("input", () => persistToolSettings({ shapeStrokeColor: ui.shapeStrokeColor.value }));
+    ui.shapeStrokeWidth.addEventListener("input", () => persistToolSettings({ shapeStrokeWidth: Number(ui.shapeStrokeWidth.value) }));
+    ui.shapeStrokeOpacity.addEventListener("input", () => persistToolSettings({ shapeStrokeOpacity: Number(ui.shapeStrokeOpacity.value) }));
+    ui.lineStyle.addEventListener("change", () => persistToolSettings({ shapeLineStyle: ui.lineStyle.value }));
+    ui.fillColor.addEventListener("input", () => persistToolSettings({ shapeFillColor: ui.fillColor.value }));
+    ui.fillOpacity.addEventListener("input", () => persistToolSettings({ shapeFillOpacity: Number(ui.fillOpacity.value) }));
     ui.pencilMode.addEventListener("change", () => persistToolSettings({ pencilMode: ui.pencilMode.checked }));
+    ui.fingerDraw.addEventListener("change", () => persistToolSettings({ fingerDraw: ui.fingerDraw.checked }));
     ui.straightenEnabled.addEventListener("change", () => persistToolSettings({ straightenEnabled: ui.straightenEnabled.checked }));
     ui.toolbarAutoHide.addEventListener("change", () => persistToolSettings({ toolbarAutoHide: ui.toolbarAutoHide.checked }));
     ui.toolbarDock.addEventListener("change", () => persistToolSettings({ toolbarDock: ui.toolbarDock.value }));
     ui.quickSwitchAction.addEventListener("change", () => persistToolSettings({ quickSwitchAction: ui.quickSwitchAction.value }));
+    ui.pageNavigation?.addEventListener("change", () => persistToolSettings({ pageNavigation: ui.pageNavigation.value }));
     ui.quickSwitch.addEventListener("click", quickSwitchTool);
     ui.toolbarCollapse.addEventListener("click", () => ui.toolbar.classList.toggle("collapsed"));
+    ui.localEnvironmentToggle?.addEventListener("click", () => {
+      if (transientUi.type === "local-environment-popover") closeTransientUi();
+      else setTransientUi("local-environment-popover");
+    });
+    ui.localEnvironmentDone?.addEventListener("click", closeTransientUi);
+    ui.moreMenu?.addEventListener("toggle", () => {
+      if (syncingTransientUi) return;
+      if (ui.moreMenu.open) setTransientUi("more-menu");
+      else if (transientUi.type === "more-menu") closeTransientUi();
+    });
+    let suppressedComposingOutsidePointer = null;
+    const outsideComposingEditor = target => {
+      const editor = textEditorSession?.editor;
+      return textEditorSession?.isComposing === true && editor?.isConnected && !editor.contains(target);
+    };
+    document.addEventListener("pointerdown", event => {
+      if (!outsideComposingEditor(event.target)) return;
+      suppressedComposingOutsidePointer = { target: event.target, expiresAt: Date.now() + 1_000 };
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, { capture: true });
+    document.addEventListener("click", event => {
+      const blocked = suppressedComposingOutsidePointer;
+      const blockedTarget = blocked?.target;
+      const matchesBlockedPointer = blocked?.expiresAt >= Date.now() && blockedTarget && (
+        blockedTarget === event.target || blockedTarget.contains?.(event.target) || event.target?.contains?.(blockedTarget)
+      );
+      if (!outsideComposingEditor(event.target) && !matchesBlockedPointer) return;
+      suppressedComposingOutsidePointer = null;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, { capture: true });
     document.addEventListener("pointerdown", event => {
       const target = event.target;
-      if (!ui.settings.classList.contains("hidden") && !ui.settings.contains(target) && !ui.toolbar.contains(target)) {
-        closeToolSettings();
-      }
-      if (!ui.savePopover.classList.contains("hidden") && !ui.savePopover.contains(target) && !ui.saveStatus.contains(target)) {
-        closeSavePopover();
+      if (transientUi.type === "closed") return;
+      const inside = transientUiIsSettings(transientUi)
+        ? ui.settings.contains(target) || ui.toolbar.contains(target)
+        : transientUi.type === "image-source-menu"
+          ? ui.imageSourceMenu?.contains(target) || ui.toolbar.contains(target)
+          : transientUi.type === "save-status-popover"
+            ? ui.savePopover.contains(target) || ui.saveStatus.contains(target)
+            : transientUi.type === "local-environment-popover"
+              ? ui.localEnvironmentDetails?.contains(target) || ui.localEnvironmentToggle?.contains(target)
+              : transientUi.type === "more-menu"
+                ? ui.moreMenu?.contains(target)
+              : transientUi.type === "selection-context-menu"
+                ? ui.selectionActions?.contains(target)
+                : transientUi.type === "paste-fallback"
+                  ? ui.pasteFallback.contains(target)
+                  : transientUi.type === "crop-editor"
+                  ? ui.stage.contains(target) || Boolean(target?.closest?.("[data-crop-overlay]"))
+                  : false;
+      if (!inside) closeTransientUi();
+    }, { capture: true });
+    document.addEventListener("click", event => {
+      if (!cropSession || event.target?.closest?.("[data-crop-overlay]")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      showEditorNotice("トリミング編集中です。適用またはキャンセルしてから操作してください。");
+      syncTransientUi();
+    }, { capture: true });
+    const allowNativeTextInteraction = target => isTextEditingTarget(target);
+    ui.editorView.addEventListener("selectstart", event => {
+      if (!allowNativeTextInteraction(event.target)) event.preventDefault();
+    }, { capture: true });
+    ui.editorView.addEventListener("dragstart", event => {
+      if (!allowNativeTextInteraction(event.target)) event.preventDefault();
+    }, { capture: true });
+    ui.editorView.addEventListener("contextmenu", event => {
+      if (!allowNativeTextInteraction(event.target) && ["pen", "highlighter", "eraser-object", "eraser-pixel", "shape", "mask"].includes(currentTool)) {
+        event.preventDefault();
       }
     }, { capture: true });
+    const dismissTransientForViewportChange = () => {
+      cancelActiveInteraction("pagezoomstart");
+      cancelCropEditor({ restore: true });
+      closeTransientUi();
+      if (currentContent) renderPage();
+    };
+    ui.editorView.addEventListener("gesturestart", event => {
+      dismissTransientForViewportChange();
+      event.preventDefault();
+    }, { passive: false });
+    ["gesturechange", "gestureend"].forEach(type => {
+      ui.editorView.addEventListener(type, event => {
+        closeTransientUi();
+        event.preventDefault();
+      }, { passive: false });
+    });
+    globalThis.addEventListener("orientationchange", dismissTransientForViewportChange);
+    const repositionTransientForViewportChange = () => {
+      if (transientUi.type === "closed") return;
+      requestAnimationFrame(() => positionTransientUi());
+    };
+    globalThis.visualViewport?.addEventListener?.("resize", repositionTransientForViewportChange);
+    globalThis.visualViewport?.addEventListener?.("scroll", repositionTransientForViewportChange);
     bindToolbarDrag();
     ui.viewport.addEventListener("pointerdown", event => {
-      if (event.pointerType === "touch" && !inputGuard.isPalmCandidate(event)) activeTouchPointerIds.add(event.pointerId);
+      if (event.pointerType !== "touch" || inputGuard.isPalmCandidate(event)) return;
+      activeTouchPointerIds.add(event.pointerId);
+      if (swipeGesture) swipeGesture.blocked = true;
+      if (
+        activeTouchPointerIds.size !== 1 || toolSettings.pageNavigation !== "swipe" ||
+        !currentNote || !currentContent || pageSwitching || textEditorSession || cropSession ||
+        activeGesture || zoomController?.isPinchGestureActive || zoomController?.isPinching
+      ) {
+        return;
+      }
+      const rect = ui.stage.getBoundingClientRect();
+      swipeGesture = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        endX: event.clientX,
+        endY: event.clientY,
+        startedAt: Number(event.timeStamp || performance.now()),
+        startedAtEdge: event.clientX - rect.left <= 36 || rect.right - event.clientX <= 36,
+        blocked: false
+      };
+    }, { capture: true });
+    ui.viewport.addEventListener("pointermove", event => {
+      if (event.pointerType !== "touch" || swipeGesture?.pointerId !== event.pointerId) return;
+      if (activeTouchPointerIds.size > 1 || zoomController?.isPinchGestureActive || zoomController?.isPinching) {
+        swipeGesture.blocked = true;
+      }
+      swipeGesture.endX = event.clientX;
+      swipeGesture.endY = event.clientY;
     }, { capture: true });
     const finishTrackedTouch = event => {
       if (event.pointerType !== "touch") return;
+      const swipe = swipeGesture?.pointerId === event.pointerId ? swipeGesture : null;
+      if (swipe) {
+        swipe.endX = event.clientX;
+        swipe.endY = event.clientY;
+        const direction = event.type === "pointercancel" ? null : resolvePageSwipe({
+          ...swipe,
+          elapsedMs: Number(event.timeStamp || performance.now()) - swipe.startedAt,
+          zoom: zoomController?.zoom || 1,
+          atLeftEdge: ui.viewport.scrollLeft <= 2,
+          atRightEdge: ui.viewport.scrollLeft + ui.viewport.clientWidth >= ui.viewport.scrollWidth - 2,
+          fingerDraw: toolSettings.fingerDraw && currentTool !== "pan" && !studyMode,
+          blocked: swipe.blocked || activeTouchPointerIds.size > 1 ||
+            Boolean(zoomController?.isPinchGestureActive || zoomController?.isPinching) ||
+            Boolean(activeGesture && (activeGesture.pointerId !== event.pointerId || activeGesture.type !== "pan"))
+        });
+        if (direction) {
+          const nextIndex = direction === "next" ? currentPageIndex + 1 : currentPageIndex - 1;
+          queueMicrotask(() => void switchPage(nextIndex, { localOnly: true, direction }).catch(reportError));
+        }
+      }
+      swipeGesture = null;
       activeTouchPointerIds.delete(event.pointerId);
-      if (!activeTouchPointerIds.size) pageZoomGestureActive = false;
     };
     ui.viewport.addEventListener("pointerup", finishTrackedTouch, { capture: true });
     ui.viewport.addEventListener("pointercancel", finishTrackedTouch, { capture: true });
     ui.stage.addEventListener("pointerdown", beginPointer); ui.stage.addEventListener("pointermove", movePointer);
     ui.stage.addEventListener("pointerup", endPointer); ui.stage.addEventListener("pointercancel", endPointer);
+    // WebKit can retarget the synthetic click which follows a pointer sequence
+    // after renderPage() has replaced the SVG node.  Keep selection usable by
+    // resolving the click against the persisted page geometry as a fallback.
+    // A completed drag already has the item selected, so it is intentionally a
+    // no-op here and does not create a second history entry.
     ui.stage.addEventListener("click", event => {
-      const action = event.target?.closest?.("[data-crop-action]")?.dataset.cropAction;
-      if (!action || !cropSession) return;
-      const image = currentContent.elements.find(element => element.id === cropSession.elementId);
-      if (action === "reset" && image) {
-        Object.assign(image, resetImageCrop(image));
-        cropSession.draft = { crop: clone(image.crop), bounds: clone(image.bounds) };
-        renderPage();
-        return;
-      }
-      const before = cropSession.before;
-      if (action === "cancel") currentContent = clone(before);
-      cropSession = null;
-      if (action === "apply") commitChange(before, "画像トリミング");
-      else renderPage();
-    });
-    ui.viewport.addEventListener("pagezoomstart", () => {
-      pageZoomGestureActive = true;
-      if (activeGesture?.type === "pan") {
-        ui.viewport.scrollLeft = activeGesture.scrollLeft;
-        ui.viewport.scrollTop = activeGesture.scrollTop;
-      }
-      if (activeGesture?.before) currentContent = clone(activeGesture.before);
-      activeGesture = null;
-      ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
+      if (currentTool !== "select" || studyMode || textEditorSession || cropSession || activeGesture) return;
+      const point = gesturePoint(event, ui.stage.getBoundingClientRect());
+      const elementId = targetElementId(event) || hitTestElementId(point);
+      if (!elementId || selectedIds.includes(elementId)) return;
+      const target = currentContent?.elements?.find(element => element.id === elementId);
+      if (!target || target.locked) return;
+      selectedIds = event.shiftKey ? [...selectedIds, elementId] : [elementId];
+      showSelectionContext();
       renderPage();
+    });
+    ui.stage.addEventListener("pointermove", event => {
+      if (!activeGesture && currentTool === "eraser-pixel") updatePixelEraserCursor(event);
+    });
+    ui.stage.addEventListener("pointerleave", hidePixelEraserCursor);
+    ui.viewport.addEventListener("pagezoomstart", () => {
+      if (swipeGesture) swipeGesture.blocked = true;
+      dismissTransientForViewportChange();
+    });
+    ui.stage.addEventListener("lostpointercapture", event => {
+      drawingDiagnostics.lostpointercapture += 1;
+      if (activeGesture?.pointerId === event.pointerId) finishPointerGesture("lostpointercapture", event);
     });
     ui.stage.addEventListener("dblclick", event => {
       const id = targetElementId(event); const element = currentContent?.elements.find(item => item.id === id);
@@ -3865,10 +5219,10 @@ export function createStudyNotes(dependencies) {
     const resize = document.createElement("button"); resize.type = "button"; resize.textContent = "サイズ"; resize.dataset.selectionAction = "resize"; resize.addEventListener("click", () => { try { selectionAction("resize"); } catch (error) { reportError(error); } }); ui.selectionActions.insertBefore(resize, ui.selectionActions.lastElementChild);
     [["自由回転", "rotate"], ["縦横比", "aspect"], ["透明度", "opacity"]].forEach(([label, action]) => {
       const button = document.createElement("button"); button.type = "button"; button.textContent = label;
+      button.dataset.selectionAction = action;
       button.addEventListener("click", () => { try { selectionAction(action); } catch (error) { reportError(error); } });
       ui.selectionActions.insertBefore(button, ui.selectionActions.lastElementChild);
     });
-    const weak = document.createElement("button"); weak.type = "button"; weak.textContent = "苦手色"; weak.addEventListener("click", () => selectionAction("weak")); ui.selectionActions.insertBefore(weak, ui.selectionActions.lastElementChild);
     ui.editorView.querySelectorAll("[data-study-action]").forEach(button => button.addEventListener("click", () => {
       const action = button.dataset.studyAction;
       if (action === "previous") switchPage(Math.max(0, currentPageIndex - 1)).catch(reportError);
@@ -3876,7 +5230,9 @@ export function createStudyNotes(dependencies) {
       if (action === "hide-all") { revealedMaskIds.clear(); renderPage(); }
       if (action === "show-all") {
         const page = pages[currentPageIndex];
-        [...getMaterialPageMasks(currentMaterial(), page.background?.materialPage), ...currentContent.noteMasks].forEach(mask => revealedMaskIds.add(mask.id)); renderPage();
+        [...getMaterialPageMasks(currentMaterial(), page.background?.materialPage), ...currentContent.noteMasks]
+          .forEach(mask => revealedMaskIds.add(maskVisibilityKey(mask)));
+        renderPage();
       }
     }));
     ui.editorView.querySelectorAll("[data-note-action]").forEach(button => button.addEventListener("click", () => {
@@ -3885,13 +5241,20 @@ export function createStudyNotes(dependencies) {
       if (action === "rename") renameNote().catch(reportError);
       if (action === "duplicate") duplicateNote(currentNote.id).catch(reportError);
       if (action === "delete") deleteNote().catch(reportError);
+      if (action === "reset-view") {
+        closeTransientUi();
+        zoomController?.reset?.();
+        ui.viewport.scrollLeft = 0;
+        ui.viewport.scrollTop = 0;
+        globalThis.scrollTo?.(0, 0);
+      }
     }));
     [ui.photoInput, ui.fileInput].forEach(input => input.addEventListener("change", () => {
       const file = input.files?.[0]; input.value = ""; if (file) addImageBlob(file).catch(reportError);
     }));
     document.addEventListener("paste", event => {
       if (!currentNote || ui.editorView.classList.contains("hidden")) return;
-      if (event.target === ui.pasteFallback) ui.pasteFallback.classList.add("hidden");
+      if (event.target === ui.pasteFallback) closeTransientUi();
       else if (isTextEditingTarget(event.target)) return;
       const file = imageFileFromPasteEvent(event);
       if (!file) return;
@@ -3900,11 +5263,17 @@ export function createStudyNotes(dependencies) {
     });
     document.addEventListener("keydown", event => {
       if (event.key === "Escape" && !ui.editorView.classList.contains("hidden")) {
-        closeToolSettings(); closeSavePopover(); selectedIds = []; ui.pasteFallback.classList.add("hidden");
+        if (cropSession) {
+          event.preventDefault();
+          syncTransientUi();
+          return;
+        }
+        cancelActiveInteraction("tool-change"); closeTransientUi(); selectedIds = [];
         if (currentNote) renderPage();
         return;
       }
       if (!currentNote || ui.editorView.classList.contains("hidden") || isTextEditingTarget(event.target)) return;
+      if (cropSession) return;
       const command = event.metaKey || event.ctrlKey;
       if (command && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); }
       else if (command && event.key.toLowerCase() === "c" && selectedIds.length) { event.preventDefault(); copySelection(); }
@@ -3922,7 +5291,10 @@ export function createStudyNotes(dependencies) {
       else if (action === "copy-diagnostics") void copyDiagnostics().catch(reportError);
       else if (action === "download-diagnostics") void downloadDiagnostics().catch(reportError);
     });
-    ui.exportPurpose.addEventListener("change", () => { ui.exportFilename.value = createPdfFilename(currentNote?.title, ui.exportPurpose.value); });
+    ui.exportPurpose.addEventListener("change", () => {
+      ui.exportFilename.value = createPdfFilename(currentNote?.title, ui.exportPurpose.value);
+      updateExportPurposeHint();
+    });
     ui.exportRangeMode.addEventListener("change", () => ui.exportRange.classList.toggle("hidden", ui.exportRangeMode.value !== "custom"));
     ui.createPdf.addEventListener("click", () => createPdfExport().catch(reportError));
     ui.downloadPdf.addEventListener("click", () => {
@@ -3938,9 +5310,16 @@ export function createStudyNotes(dependencies) {
       sharePdfBlob(generatedPdf.blob, generatedPdf.filename, currentNote.title).catch(reportError);
     });
     ui.cancelPdf.addEventListener("click", () => exportController?.abort());
-    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && currentNote && !readOnlyEditor) void saveCoordinator.flushAll(); });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "hidden" || !currentNote || readOnlyEditor) return;
+      textEditorSession?.finish({ force: true });
+      void saveCoordinator.flushAll();
+    });
     window.addEventListener("pagehide", () => {
-      if (currentNote && !readOnlyEditor) void saveCoordinator.flushAll();
+      if (currentNote && !readOnlyEditor) {
+        textEditorSession?.finish({ force: true });
+        void saveCoordinator.flushAll();
+      }
       editorLease?.release();
     });
     window.addEventListener("pageshow", event => {
@@ -3950,7 +5329,7 @@ export function createStudyNotes(dependencies) {
         setEditorStartupState("fatal-error", { detail: "ログイン状態を確認できません。ノート一覧へ戻ってログインしてください。" });
         return;
       }
-      closeToolSettings();
+      closeTransientUi();
       setEditorStartupState("acquiring-editor-lock", { detail: "復帰した編集セッションを確認中" });
       void establishEditorLease(currentNote.id, session, { forceReadOnly: explicitReadOnlyMode })
         .then(() => setEditorStartupState("ready"))
@@ -3972,9 +5351,9 @@ export function createStudyNotes(dependencies) {
 
   bindEvents();
   setSaveState("saved");
-  closeToolSettings();
-  show(dedicatedEditor ? "editor" : "list");
-  if (dedicatedEditor) setEditorStartupState("initializing");
+  closeTransientUi();
+  show(dedicatedEditorCreateMode ? "create" : dedicatedEditor ? "editor" : "list");
+  if (dedicatedEditor && !dedicatedEditorCreateMode) setEditorStartupState("initializing");
 
   return {
     refresh: refreshNotes,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { layoutTextLines, visibleTextLines } from "../../js/core/note-text-layout.js";
+import { ensureTextElementHeight, layoutTextBox, layoutTextLines, visibleTextLines } from "../../js/core/note-text-layout.js";
 
 test("日本語テキストを計測幅に合わせて折り返し、明示改行を保持する", () => {
   assert.deepEqual(
@@ -16,4 +16,35 @@ test("テキストboxの高さを超える行はSVGとCanvas共通で切り詰�
     lineHeight: 1,
     measureText: value => value.length
   }), ["12", "34"]);
+});
+
+test("3行テキストの必要高さを共通レイアウトから算出する", () => {
+  const layout = layoutTextBox("1行目\n2行目\n3行目", {
+    maxWidth: 20,
+    lineHeight: 1.4,
+    measureText: value => Array.from(value).length
+  });
+  assert.deepEqual(layout.lines, ["1行目", "2行目", "3行目"]);
+  assert.ok(Math.abs(layout.requiredHeight - 4.2) < 1e-9);
+});
+
+test("改行を含む旧テキストは表示に必要な最小高さへ補正する", () => {
+  const original = {
+    id: "text-1", type: "text", text: "一\n二\n三",
+    bounds: { x: .1, y: .1, width: .4, height: .02 },
+    style: { fontSizeRatio: .02, lineHeight: 1.25 }
+  };
+  const element = ensureTextElementHeight(original, { pageHeight: 1000, measureText: value => value.length * 10 });
+  assert.equal(element.autoHeight, true);
+  assert.ok(element.bounds.height >= .075);
+  assert.equal(original.bounds.height, .02, "保存済みboundsを暗黙に変更しない");
+});
+
+test("自動高さはページ下端を越えず、既存の過大な高さもclampする", () => {
+  const element = ensureTextElementHeight({
+    id: "text-bottom", type: "text", text: "一\n二\n三\n四",
+    bounds: { x: .1, y: .94, width: .4, height: .2 },
+    style: { fontSizeRatio: .03, lineHeight: 1.25 }
+  }, { pageHeight: 1000, measureText: value => value.length * 10 });
+  assert.ok(Math.abs(element.bounds.height - .06) < 1e-9);
 });

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   createNoteEditorDiagnosticSnapshot,
   rebaseRecoveredNoteContent,
+  reorderNoteMasks,
   resolveNoteEditorTabId,
   sanitizeDiagnosticUrlParameters,
   saveStatePresentation,
@@ -77,6 +78,9 @@ test("復元コピーはnote/page/revision/writer系列と要素IDを新しく�
 
 test("保存状態表示は固定アイコンと説明へ正規化する", () => {
   assert.equal(saveStatePresentation("saving").icon, "◌");
+  assert.equal(saveStatePresentation("saving").shortLabel, "保存中");
+  assert.equal(saveStatePresentation("saved").shortLabel, "保存済み");
+  assert.ok([...saveStatePresentation("recoverable-error").shortLabel].length > 4);
   assert.match(saveStatePresentation("recoverable-error").label, /端末内/);
   assert.match(saveStatePresentation("local-storage-error").label, /端末内への保存に失敗/);
   assert.equal(saveStatePresentation("unknown").label, "待機中");
@@ -86,6 +90,17 @@ test("クラウド版を明示した場合は端末内下書きと画像を自�
   assert.equal(shouldRecoverLocalNoteState(), true);
   assert.equal(shouldRecoverLocalNoteState({ readOnly: true }), false);
   assert.equal(shouldRecoverLocalNoteState({ preferCloud: true }), false);
+});
+
+test("前面・背面変更はnoteMasks内だけを安定して並べ替え、教材マスク順を変えない", () => {
+  const materialMasks = [{ id: "material-a" }, { id: "material-b" }];
+  const noteMasks = [{ id: "note-a" }, { id: "note-b" }, { id: "note-c" }];
+  const front = reorderNoteMasks(noteMasks, ["note-a", "note-c"], "front");
+  const back = reorderNoteMasks(noteMasks, ["note-c"], "back");
+  assert.deepEqual(front.map(mask => mask.id), ["note-b", "note-a", "note-c"]);
+  assert.deepEqual(back.map(mask => mask.id), ["note-c", "note-a", "note-b"]);
+  assert.deepEqual(materialMasks.map(mask => mask.id), ["material-a", "material-b"]);
+  assert.deepEqual([...materialMasks, ...front].map(mask => mask.id), ["material-a", "material-b", "note-b", "note-a", "note-c"]);
 });
 
 test("診断情報は許可項目だけを残し本文・token・passwordを含めない", () => {

@@ -2,7 +2,20 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta id="appViewportMeta" name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <script>
+    (() => {
+      const params = new URLSearchParams(location.search);
+      if (params.get("noteEditor") !== "1") return;
+      document.documentElement.classList.add("note-editor-dedicated");
+      // Safari gesture events do not cover input-focus auto zoom or every browser zoom entry point.
+      // Limit page zoom only on the dedicated editor route; the canvas keeps its own 0.8–5x zoom.
+      document.getElementById("appViewportMeta")?.setAttribute(
+        "content",
+        "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+      );
+    })();
+  </script>
   <title>Dental QA Ultimate</title>
   <link rel="stylesheet" href="./css/app.css">
   <link rel="stylesheet" href="./css/study-notes.css">
@@ -18,10 +31,14 @@
     </div>
     <div class="sub" id="appVersionLabel">学習操作改善版 v10.61</div>
     <div class="banner" id="cloudStatus">Firebase接続を確認中です...</div>
-    <div class="local-environment-banner hidden" id="localEnvironmentBanner" role="status">
-      <strong>LOCAL / FIREBASE EMULATOR</strong>
-      <span id="localEnvironmentStatus">Auth: 確認中 / Firestore: 確認中 / Storage: 確認中</span>
-      <span id="localSecureContextNotice" class="hidden">このローカルHTTP接続ではブラウザの安全制限により、クリップボード直接読取／共有機能を利用できない場合があります。長押しペースト、Cmd + V、写真・ファイル選択、PDFをダウンロードして共有する方法を使用してください。</span>
+    <div class="local-environment-banner hidden" id="localEnvironmentBanner">
+      <button id="localEnvironmentToggle" class="local-environment-chip" type="button" aria-expanded="false" aria-controls="localEnvironmentDetails" title="ローカル環境の接続状態">LOCAL</button>
+      <div id="localEnvironmentDetails" class="local-environment-details hidden" role="status">
+        <strong>LOCAL / FIREBASE EMULATOR</strong>
+        <span id="localEnvironmentStatus">Auth: 確認中 / Firestore: 確認中 / Storage: 確認中</span>
+        <span id="localSecureContextNotice" class="hidden">HTTP LAN環境ではClipboard API／Web Share APIを利用できない場合があります。長押しペースト、Cmd + V、写真・ファイル選択、PDFダウンロードを使用してください。</span>
+        <button id="localEnvironmentDone" type="button">完了</button>
+      </div>
     </div>
   </div>
 
@@ -329,30 +346,26 @@
             <button class="note-icon-button" id="notePagesBtn" type="button" aria-label="ページ一覧を隠す" aria-controls="notePageSidebar" aria-expanded="true">▤</button>
             <button class="note-icon-button" id="noteUndoBtn" type="button" aria-label="元に戻す" title="元に戻す">↶</button>
             <button class="note-icon-button" id="noteRedoBtn" type="button" aria-label="やり直す" title="やり直す">↷</button>
-            <button class="btn soft" id="toggleNoteStudyBtn" type="button">暗記モード</button>
+            <button class="note-icon-button note-mode-toggle" id="toggleNoteStudyBtn" type="button" aria-label="暗記モード" title="暗記モード">
+              <svg class="note-mode-icon note-mode-icon-brain" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4a3 3 0 0 0-3 3v1a3 3 0 0 0-2 5 3 3 0 0 0 3 4h2m6-13a3 3 0 0 1 3 3v1a3 3 0 0 1 2 5 3 3 0 0 1-3 4h-2M9 4v16m6-16v16M9 9H7m8 0h2M9 15H7m8 0h2M9 20a3 3 0 0 0 3-3V7a3 3 0 0 0-3-3m6 16a3 3 0 0 1-3-3"/></svg>
+              <svg class="note-mode-icon note-mode-icon-edit hidden" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20l4.5-1 10-10-3.5-3.5-10 10zM13.5 7l3.5 3.5M4 20h6"/></svg>
+              <span class="sr-only">暗記モード</span>
+            </button>
             <div class="note-save-status-shell">
-              <button id="noteSaveStatus" class="note-save-status" type="button" data-state="saved" aria-label="保存済み" title="保存済み" aria-expanded="false" aria-controls="noteSavePopover"><span id="noteSaveStatusIcon" aria-hidden="true">✓</span><span id="noteSaveStatusButtonText" class="sr-only">保存済み</span></button>
+              <button id="noteSaveStatus" class="note-save-status" type="button" data-state="saved" aria-label="保存済み" title="保存済み" aria-expanded="false" aria-controls="noteSavePopover"><span id="noteSaveStatusIcon" class="sr-only" aria-hidden="true">✓</span><span id="noteSaveStatusButtonText" class="note-save-status-label">保存済み</span></button>
               <span id="noteSaveStatusLive" class="sr-only" role="status" aria-live="polite">保存済み</span>
-              <div id="noteSavePopover" class="note-save-popover hidden">
-                <strong id="noteSaveStatusText">保存済み</strong>
-                <p id="noteSaveStatusDetail">クラウドへ保存されています。</p>
-                <div class="note-save-actions">
-                  <button class="btn soft hidden" id="noteRetrySaveBtn" type="button">保存を再試行</button>
-                  <button class="btn soft hidden" id="noteRestoreLocalDraftBtn" type="button">端末内の下書きから復元</button>
-                  <button class="btn soft hidden" id="noteContinueEditingBtn" type="button">編集を続ける</button>
-                  <button class="btn soft" id="noteSaveDiagnosticsBtn" type="button">診断情報を見る</button>
-                  <button class="btn soft" id="noteSaveListBtn" type="button">ノート一覧へ戻る</button>
-                </div>
-              </div>
             </div>
             <button class="note-icon-button" id="noteMarkupDoneBtn" type="button" aria-label="マークアップを完了" title="マークアップを完了">✓</button>
-            <details class="note-more-menu"><summary aria-label="その他メニュー">•••</summary><div>
+            <div id="noteEditorLocalSlot" class="note-editor-local-slot" aria-label="ローカル環境"></div>
+            <details id="noteMoreMenu" class="note-more-menu"><summary aria-label="その他メニュー">•••</summary><div>
               <button type="button" data-note-action="export">PDFを書き出す</button>
+              <button type="button" data-note-action="reset-view">表示をリセット</button>
               <button type="button" data-note-action="rename">ノート名を変更</button>
               <button type="button" data-note-action="duplicate">ノートを複製</button>
               <button type="button" data-note-action="delete">ノートを削除</button>
             </div></details>
           </header>
+          <div id="noteEditorNotice" class="note-editor-notice hidden" role="status" aria-live="polite"></div>
 
           <div id="noteEditorLockBanner" class="note-editor-alert hidden" role="alert">
             <strong id="noteEditorLockMessage">このノートは別のタブで編集中です。</strong>
@@ -386,9 +399,13 @@
                 <span id="noteMaskCounts"></span>
               </div>
               <div id="noteViewport" class="note-viewport">
-                <div id="notePageStage" class="note-page-stage" tabindex="0" aria-label="編集ページ"></div>
+                <div id="notePageStage" class="note-page-stage" tabindex="0" aria-label="編集ページ">
+                  <div class="note-layer note-drawing-input-layer" data-layer="drawing-input" aria-hidden="true"></div>
+                  <div id="notePixelEraserCursor" class="note-pixel-eraser-cursor hidden" aria-hidden="true"></div>
+                </div>
               </div>
-              <div id="noteSelectionActions" class="note-selection-actions hidden">
+              <div id="noteSelectionActions" class="note-selection-actions hidden" data-transient-ui="selection-context-menu">
+                <strong id="noteSelectionActionsTitle">選択項目を編集</strong>
                 <button type="button" data-selection-action="duplicate">複製</button>
                 <button type="button" data-selection-action="front">前面</button>
                 <button type="button" data-selection-action="back">背面</button>
@@ -396,6 +413,10 @@
                 <button type="button" data-selection-action="rotate-right">右90°</button>
                 <button type="button" data-selection-action="lock">固定/解除</button>
                 <button type="button" data-selection-action="crop">トリミング</button>
+                <button type="button" data-selection-action="select-page-masks">このページの全選択</button>
+                <button type="button" data-selection-action="clear-selection">選択解除</button>
+                <button type="button" data-selection-action="weak-on">苦手にする</button>
+                <button type="button" data-selection-action="weak-off">苦手解除</button>
                 <button type="button" data-selection-action="delete">削除</button>
               </div>
             </main>
@@ -412,37 +433,72 @@
             <button type="button" data-note-tool="text" aria-label="テキスト" title="テキスト"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M8 19h8"/></svg><span class="sr-only">テキスト</span></button>
             <button type="button" data-note-tool="image" aria-label="画像" title="画像"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="2"/><path d="M4 17l5-5 4 4 2-2 5 4"/></svg><span class="sr-only">画像</span></button>
             <button type="button" data-note-tool="mask" aria-label="暗記マスク" title="暗記マスク"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h10M7 14h6"/></svg><span class="sr-only">暗記マスク</span></button>
+            <button type="button" id="noteMaskSelectModeBtn" aria-label="マスクを複数選択" title="マスクを複数選択" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="8" height="7" rx="1"/><rect x="13" y="13" width="8" height="7" rx="1"/><path d="M7 15v4h4M17 5v4h-4"/></svg><span class="sr-only">マスクを複数選択</span></button>
+            <button type="button" id="noteMaskVisibilityBtn" aria-label="編集時の暗記マスクを非表示" title="編集時の暗記マスク表示を切り替え" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span class="sr-only">マスク表示</span></button>
             <button type="button" id="noteQuickSwitchBtn" aria-label="クイック切替" title="Apple Pencilダブルタップの代替: クイック切替"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h11l-3-3M17 17H6l3 3M18 7l2 2-2 2M6 17l-2-2 2-2"/></svg><span class="sr-only">クイック切替</span></button>
             <button type="button" id="noteStyleBtn" aria-label="色・線設定" title="色・線設定"><i id="noteCurrentColor"></i><span class="sr-only">設定</span></button>
+            <button type="button" id="noteInputSettingsBtn" aria-label="入力設定" title="入力設定"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7L10.5 2h-3l-.7 2.3-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7L-1 10.5v3l2.3.7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2.3h3l.7-2.3 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7z" transform="translate(2 0) scale(.83)"/></svg><span class="sr-only">入力設定</span></button>
             <button type="button" id="noteBackgroundBtn" aria-label="ページ背景設定" title="ページ背景設定"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M7 8h10M7 12h10M7 16h10"/></svg><span class="sr-only">背景</span></button>
             <button type="button" id="noteToolbarCollapseBtn" aria-label="ツールパレットを折りたたむ" title="ツールパレットを折りたたむ"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span class="sr-only">折りたたむ</span></button>
           </div>
-          <div id="noteToolSettings" class="note-tool-settings hidden">
+          <div id="noteToolSettings" class="note-tool-settings hidden" data-transient-ui="tool-settings" role="dialog" aria-modal="false" aria-hidden="true">
             <div class="note-tool-settings-heading"><strong id="noteToolSettingsTitle">ツール設定</strong><button id="noteToolSettingsDoneBtn" type="button" aria-label="ツール設定を閉じる">完了</button></div>
-            <div id="noteColorPresets" class="note-color-presets" aria-label="色候補"></div>
-            <label>その他の色 <input id="noteColorInput" type="color" value="#111111"></label>
-            <div id="noteWidthPresets" class="note-width-presets" aria-label="太さプリセット"></div>
-            <label>太さ <input id="noteWidthInput" type="range" min="1" max="100" value="25"></label>
-            <label>透明度 <input id="noteOpacityInput" type="range" min="5" max="100" value="100"></label>
-            <label>消しゴム <select id="noteEraserMode"><option value="object">オブジェクト</option><option value="pixel">ピクセル</option></select></label>
-            <label>消しゴムサイズ <input id="noteEraserSize" type="range" min="1" max="100" value="30"></label>
-            <label>図形 <select id="noteShapeType"><option value="line">直線</option><option value="arrow">矢印</option><option value="rectangle">四角形</option><option value="rounded-rectangle">角丸四角形</option><option value="ellipse">円・楕円</option><option value="triangle">三角形</option><option value="star">星</option></select></label>
-            <label>線種 <select id="noteLineStyle"><option value="solid">実線</option><option value="dashed">破線</option><option value="dotted">点線</option></select></label>
-            <label>塗り <input id="noteFillColor" type="color" value="#ff0000"></label>
-            <label>塗り透明度 <input id="noteFillOpacity" type="range" min="0" max="100" value="0"></label>
-            <label>文字 <select id="noteFontFamily"><option value="system-sans">システムゴシック</option><option value="system-serif">システム明朝</option><option value="monospace">等幅</option></select></label>
-            <label>文字サイズ <input id="noteFontSize" type="range" min="10" max="80" value="25"></label>
-            <label><input id="noteFontBold" type="checkbox"> 太字</label>
-            <label><input id="noteFontItalic" type="checkbox"> 斜体</label>
-            <label>揃え <select id="noteTextAlign"><option value="left">左</option><option value="center">中央</option><option value="right">右</option></select></label>
-            <label>行間 <select id="noteLineHeight"><option value="1">狭い</option><option value="1.25" selected>標準</option><option value="1.5">広い</option><option value="2">2行</option></select></label>
-            <label><input id="noteFingerDraw" type="checkbox" checked> 指で描画する</label>
-            <label><input id="notePencilMode" type="checkbox"> Apple Pencilモード</label>
-            <label><input id="noteStraightenEnabled" type="checkbox" checked> 終点長押しで直線化</label>
-            <label><input id="noteToolbarAutoHide" type="checkbox"> 描画中はツールパレットを自動でしまう</label>
-            <label>パレット位置 <select id="noteToolbarDock"><option value="top">上</option><option value="right">右</option><option value="bottom">下</option><option value="left">左</option></select></label>
-            <label>クイック切替 <select id="noteQuickSwitchAction"><option value="eraser">現在ツール ↔ 消しゴム</option><option value="previous">現在ツール ↔ 前回ツール</option><option value="select">現在ツール ↔ 選択</option><option value="select-all">すべて選択</option><option value="colors">カラーパレット表示</option></select></label>
-            <p class="note-pencil-doubletap-notice">SafariのWebアプリでは、Apple Pencil本体のダブルタップを取得できません。画面上のクイック切替ボタンを使用してください。</p>
+            <div class="note-tool-settings-scroll">
+              <section class="note-setting-section" data-setting-tools="pen highlighter">
+                <h4>色</h4>
+                <div id="noteColorPresets" class="note-color-presets" aria-label="色候補"></div>
+                <label class="tool-setting-label">その他の色 <input id="noteColorInput" type="color" value="#111111"></label>
+                <h4>太さ</h4>
+                <div id="noteWidthPresets" class="note-width-presets" aria-label="太さプリセット"></div>
+                <label class="tool-setting-label">詳細 <input id="noteWidthInput" type="range" min="1" max="100" value="25"><output id="noteWidthValue">25</output></label>
+                <label class="tool-setting-label">透明度 <input id="noteOpacityInput" type="range" min="5" max="100" value="100"><output id="noteOpacityValue">100%</output></label>
+                <label class="tool-setting-toggle"><input id="noteStraightenEnabled" type="checkbox" checked><span>終点長押しで直線化</span></label>
+              </section>
+              <section class="note-setting-section hidden" data-setting-tools="eraser-object eraser-pixel">
+                <h4>種類</h4>
+                <label class="tool-setting-label">消しゴム <select id="noteEraserMode"><option value="object">オブジェクト</option><option value="pixel">ピクセル</option></select></label>
+                <h4>サイズ</h4>
+                <div id="noteEraserPresets" class="note-width-presets" aria-label="消しゴムサイズ"></div>
+                <label class="tool-setting-label">詳細 <input id="noteEraserSize" type="range" min="1" max="100" value="30"><output id="noteEraserSizeValue">30</output></label>
+              </section>
+              <section class="note-setting-section hidden" data-setting-tools="shape">
+                <h4>図形</h4>
+                <label class="tool-setting-label">種類 <select id="noteShapeType"><option value="line">直線</option><option value="arrow">矢印</option><option value="rectangle">四角形</option><option value="rounded-rectangle">角丸四角形</option><option value="ellipse">円・楕円</option><option value="triangle">三角形</option><option value="star">星</option></select></label>
+                <h4>枠線</h4>
+                <label class="tool-setting-label">色 <input id="noteShapeStrokeColor" type="color" value="#111111"></label>
+                <label class="tool-setting-label">太さ <input id="noteShapeStrokeWidth" type="range" min="1" max="100" value="25"><output id="noteShapeStrokeWidthValue">25</output></label>
+                <label class="tool-setting-label">透明度 <input id="noteShapeStrokeOpacity" type="range" min="5" max="100" value="100"><output id="noteShapeStrokeOpacityValue">100%</output></label>
+                <label class="tool-setting-label">線種 <select id="noteLineStyle"><option value="solid">実線</option><option value="dashed">破線</option><option value="dotted">点線</option></select></label>
+                <h4>塗り</h4>
+                <label class="tool-setting-label">色 <input id="noteFillColor" type="color" value="#ff0000"></label>
+                <label class="tool-setting-label">透明度 <input id="noteFillOpacity" type="range" min="0" max="100" value="0"><output id="noteFillOpacityValue">0%</output></label>
+              </section>
+              <section class="note-setting-section hidden" data-setting-tools="text">
+                <h4>文字</h4>
+                <label class="tool-setting-label">フォント <select id="noteFontFamily"><option value="system-sans">システムゴシック</option><option value="system-serif">システム明朝</option><option value="monospace">等幅</option></select></label>
+                <label class="tool-setting-label">文字サイズ <input id="noteFontSize" type="range" min="10" max="80" value="25"><output id="noteFontSizeValue">25</output></label>
+                <label class="tool-setting-label">文字色 <input id="noteTextColor" type="color" value="#111111"></label>
+                <label class="tool-setting-label">透明度 <input id="noteTextOpacity" type="range" min="5" max="100" value="100"><output id="noteTextOpacityValue">100%</output></label>
+                <div class="note-setting-button-row"><label><input id="noteFontBold" type="checkbox"> 太字</label><label><input id="noteFontItalic" type="checkbox"> 斜体</label></div>
+                <label class="tool-setting-label">揃え <select id="noteTextAlign"><option value="left">左</option><option value="center">中央</option><option value="right">右</option></select></label>
+                <label class="tool-setting-label">行間 <select id="noteLineHeight"><option value="1">狭い</option><option value="1.25" selected>標準</option><option value="1.5">広い</option><option value="2">2行</option></select></label>
+              </section>
+              <section class="note-setting-section hidden" data-setting-tools="input">
+                <label class="tool-setting-toggle"><input id="notePencilMode" type="checkbox"><span>Apple Pencilモード</span></label>
+                <label class="tool-setting-toggle"><input id="noteFingerDraw" type="checkbox" checked><span>指で描画する</span></label>
+                <label class="tool-setting-toggle"><input id="noteToolbarAutoHide" type="checkbox"><span>描画時にパレットを自動でしまう</span></label>
+                <label class="tool-setting-label">ページ移動 <select id="notePageNavigation"><option value="swipe">左右スワイプ</option><option value="buttons">ボタンのみ</option></select></label>
+                <label class="tool-setting-label">パレット位置 <select id="noteToolbarDock"><option value="top">上</option><option value="right">右</option><option value="bottom">下</option><option value="left">左</option></select></label>
+                <label class="tool-setting-label">クイック切替 <select id="noteQuickSwitchAction"><option value="eraser">現在ツール ↔ 消しゴム</option><option value="previous">現在ツール ↔ 前回ツール</option><option value="select">現在ツール ↔ 選択</option><option value="select-all">すべて選択</option><option value="colors">カラーパレット表示</option></select></label>
+                <p class="note-pencil-doubletap-notice">SafariのWebアプリではApple Pencil本体のダブルタップを取得できません。画面上のクイック切替を使用してください。</p>
+              </section>
+            </div>
+          </div>
+          <div id="noteImageSourceMenu" class="note-image-source-menu hidden" data-transient-ui="image-source-menu" role="dialog" aria-modal="false" aria-labelledby="noteImageSourceTitle">
+            <div class="note-tool-settings-heading"><strong id="noteImageSourceTitle">画像を追加</strong><button id="noteImageSourceDone" type="button">完了</button></div>
+            <button type="button" data-image-source="clipboard">クリップボードから貼り付け</button>
+            <button type="button" data-image-source="photo">写真から選択</button>
+            <button type="button" data-image-source="file">ファイルから選択</button>
           </div>
           <input id="noteImagePhotoInput" class="hidden" type="file" accept="image/*">
           <input id="noteImageFileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp">
@@ -617,6 +673,18 @@
         <div id="pdfEditPreview" class="pdf-edit-preview" style="margin-top:12px;"></div>
       </div>
     </div>
+  </div>
+</div>
+
+<div id="noteSavePopover" class="note-save-popover hidden" role="dialog" aria-modal="false" aria-label="保存状態の詳細">
+  <strong id="noteSaveStatusText">保存済み</strong>
+  <p id="noteSaveStatusDetail">クラウドへ保存されています。</p>
+  <div class="note-save-actions">
+    <button class="btn soft hidden" id="noteRetrySaveBtn" type="button">保存を再試行</button>
+    <button class="btn soft hidden" id="noteRestoreLocalDraftBtn" type="button">端末内の下書きから復元</button>
+    <button class="btn soft hidden" id="noteContinueEditingBtn" type="button">編集を続ける</button>
+    <button class="btn soft" id="noteSaveDiagnosticsBtn" type="button">診断情報を見る</button>
+    <button class="btn soft" id="noteSaveListBtn" type="button">ノート一覧へ戻る</button>
   </div>
 </div>
 

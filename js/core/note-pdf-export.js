@@ -65,6 +65,21 @@ export function getPdfPageLayout(width, height, pageNumbers = false) {
   };
 }
 
+export function pdfMaskMode(purpose) {
+  if (purpose === "ai") return "none";
+  if (purpose === "study") return "all";
+  return "screen";
+}
+
+export function pdfScreenHiddenMaskIds(purpose, {
+  studyMode = false,
+  revealedMaskIds = new Set(),
+  editingHiddenMaskIds = new Set()
+} = {}) {
+  if (purpose !== "screen") return new Set();
+  return new Set(studyMode ? revealedMaskIds : editingHiddenMaskIds);
+}
+
 export async function exportNotePdf({
   note,
   pages,
@@ -106,7 +121,7 @@ export async function exportNotePdf({
       resolveAssetBlob,
       width,
       height,
-      maskMode: purpose === "ai" ? "none" : purpose === "study" ? "all" : "screen",
+      maskMode: pdfMaskMode(purpose),
       revealedMaskIds,
       signal
     });

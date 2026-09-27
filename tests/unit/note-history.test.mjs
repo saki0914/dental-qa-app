@@ -21,3 +21,14 @@ test("履歴は指定上限を超えて保持しない", () => {
   history.push(0, 1); history.push(1, 2); history.push(2, 3);
   assert.deepEqual(history.sizes(), { undo: 2, redo: 0 });
 });
+
+test("高速描画用のimmutable履歴はpush時に大きなsnapshotを複製しない", () => {
+  let clones = 0;
+  const history = createNoteHistory({ clone: value => { clones += 1; return structuredClone(value); } });
+  const before = Object.freeze({ content: Object.freeze({ elements: [] }) });
+  const after = Object.freeze({ content: Object.freeze({ elements: [Object.freeze({ id: "stroke-1" })] }) });
+  assert.equal(history.pushImmutable(before, after, "ペン追加"), true);
+  assert.equal(clones, 0);
+  assert.deepEqual(history.undo(after), before);
+  assert.ok(clones >= 2);
+});

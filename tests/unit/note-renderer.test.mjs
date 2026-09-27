@@ -104,8 +104,8 @@ test("AI共有用ではマスクを除外し学習用では教材・ノートマ
   t.after(() => { globalThis.document = previousDocument; });
   const base = {
     page: { background: { type: "blank" } },
-    content: { elements: [], noteMasks: [{ id: "note", x: .1, y: .1, width: .2, height: .1, weak: false }] },
-    materialMasks: [{ id: "material", x: .4, y: .4, width: .2, height: .1, weak: true }],
+    content: { elements: [], noteMasks: [{ id: "same", x: .1, y: .1, width: .2, height: .1, weak: false }] },
+    materialMasks: [{ id: "same", x: .4, y: .4, width: .2, height: .1, weak: true }],
     resolveBackgroundBlob: async () => { throw new Error("不要"); },
     resolveAssetBlob: async () => { throw new Error("不要"); },
     width: 100,
@@ -118,8 +118,9 @@ test("AI共有用ではマスクを除外し学習用では教材・ノートマ
   await renderNotePageToCanvas({ ...base, maskMode: "all" });
   assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#ef4444", "#111827"]);
   harness.fills.length = 0;
-  await renderNotePageToCanvas({ ...base, maskMode: "screen", revealedMaskIds: new Set(["material"]) });
-  assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#111827"], "画面どおりは表示中マスクだけ除外する");
+  await renderNotePageToCanvas({ ...base, maskMode: "screen", revealedMaskIds: new Set(["material:same"]) });
+  assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#111827"], "同じ永続IDでも教材だけを除外し、ノートマスクは教材の後に描く");
+  assert.deepEqual(harness.strokes, ["rgba(185,28,28,.28)"], "画面どおりPDFでは表示済み教材マスクの薄い枠だけを残す");
 });
 
 test("日本語の明示改行・折り返しと中央・右寄せをCanvas PDF描画へ反映する", async t => {

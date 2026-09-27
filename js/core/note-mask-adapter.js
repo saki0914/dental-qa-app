@@ -11,6 +11,10 @@ export function normalizeMaterialMask(mask) {
   };
 }
 
+export function maskVisibilityKey(mask, source = mask?.readOnly === true || mask?.source === "material" ? "material" : "note") {
+  return `${source === "material" ? "material" : "note"}:${String(mask?.id || "")}`;
+}
+
 export function getMaterialPageMasks(material, pageNumber) {
   return (Array.isArray(material?.masks) ? material.masks : [])
     .filter(mask => Number(mask.page) === Number(pageNumber))

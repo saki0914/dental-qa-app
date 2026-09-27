@@ -5,6 +5,9 @@ const baseURL = "http://127.0.0.1:3000";
 export default defineConfig({
   testDir: "./tests/e2e",
   fullyParallel: true,
+  // CIではブラウザとFirebase Emulatorへ高負荷の認証付きシナリオを並列投入すると
+  // 起動・応答timeoutが発生するため、全体回帰を直列化して資源使用量を安定させる。
+  workers: process.env.CI ? 1 : undefined,
   timeout: 30_000,
   expect: {
     timeout: 5_000

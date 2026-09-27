@@ -14,18 +14,18 @@ export const NOTE_EDITOR_STARTUP_STATES = Object.freeze([
 ]);
 
 export const NOTE_SAVE_PRESENTATION = Object.freeze({
-  idle: { icon: "✓", label: "待機中" },
-  editing: { icon: "•", label: "編集中" },
-  "dirty-local": { icon: "▣", label: "この端末内に保存済み" },
-  "local-saved": { icon: "▣", label: "この端末内に保存済み" },
-  saving: { icon: "◌", label: "クラウドへ保存中" },
-  saved: { icon: "✓", label: "保存済み" },
-  offline: { icon: "▣", label: "オフライン。この端末内に保存済み" },
-  "offline-local": { icon: "▣", label: "オフライン。この端末内に保存済み" },
-  error: { icon: "!", label: "クラウドへ保存できませんでした。この端末内には保存されています" },
-  "recoverable-error": { icon: "!", label: "クラウドへ保存できませんでした。この端末内には保存されています" },
-  "local-storage-error": { icon: "!", label: "端末内への保存に失敗しました。編集内容は画面内にだけ残っています" },
-  conflict: { icon: "⇄", label: "このページに競合があります" }
+  idle: { icon: "✓", shortLabel: "待機中", label: "待機中" },
+  editing: { icon: "•", shortLabel: "編集中", label: "編集中" },
+  "dirty-local": { icon: "▣", shortLabel: "端末保存", label: "この端末内に保存済み" },
+  "local-saved": { icon: "▣", shortLabel: "端末保存", label: "この端末内に保存済み" },
+  saving: { icon: "◌", shortLabel: "保存中", label: "クラウドへ保存中" },
+  saved: { icon: "✓", shortLabel: "保存済み", label: "保存済み" },
+  offline: { icon: "▣", shortLabel: "オフライン", label: "オフライン。この端末内に保存済み" },
+  "offline-local": { icon: "▣", shortLabel: "オフライン", label: "オフライン。この端末内に保存済み" },
+  error: { icon: "!", shortLabel: "保存エラー", label: "クラウドへ保存できませんでした。この端末内には保存されています" },
+  "recoverable-error": { icon: "!", shortLabel: "保存エラー", label: "クラウドへ保存できませんでした。この端末内には保存されています" },
+  "local-storage-error": { icon: "!", shortLabel: "端末エラー", label: "端末内への保存に失敗しました。編集内容は画面内にだけ残っています" },
+  conflict: { icon: "⇄", shortLabel: "競合あり", label: "このページに競合があります" }
 });
 
 const TAB_STORAGE_PREFIX = "dentalQaNoteEditorTab:";
@@ -98,6 +98,14 @@ export function shouldRecoverLocalNoteState({ readOnly = false, preferCloud = fa
   return readOnly !== true && preferCloud !== true;
 }
 
+export function reorderNoteMasks(noteMasks = [], selectedIds = [], edge = "front") {
+  const selected = new Set((selectedIds || []).map(String));
+  const masks = Array.isArray(noteMasks) ? noteMasks : [];
+  const moving = masks.filter(mask => selected.has(String(mask?.id || "")));
+  const rest = masks.filter(mask => !selected.has(String(mask?.id || "")));
+  return edge === "back" ? [...moving, ...rest] : [...rest, ...moving];
+}
+
 export function createNoteEditorDiagnosticSnapshot(value = {}) {
   const allowed = [
     "capturedAt", "noteId", "pageId", "noteType", "editorTabId",
@@ -105,7 +113,7 @@ export function createNoteEditorDiagnosticSnapshot(value = {}) {
     "localDraftRevision", "saveState", "lockOwner", "lockAgeMs",
     "pendingSaves", "pendingAssets", "conflicts", "lastSaveSucceededAt",
     "lastError", "emulator", "urlParameters", "userAgent", "viewport",
-    "zoom", "pageRect", "startupState"
+    "zoom", "pageRect", "startupState", "drawing"
   ];
   return allowed.reduce((result, key) => {
     if (value[key] !== undefined) result[key] = structuredClone(value[key]);
@@ -117,6 +125,8 @@ const SAFE_DIAGNOSTIC_URL_PARAMETERS = new Set([
   "firebaseEmulator",
   "emulatorHost",
   "noteEditor",
+  "create",
+  "creationSessionId",
   "noteId",
   "editorTabId",
   "study"

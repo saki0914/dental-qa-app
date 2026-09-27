@@ -51,7 +51,10 @@ export function createPageZoomController({
   let zoom = 1;
   let lastFitZoom = 1;
   let pinch = null;
+  let pinchSource = null;
   let pinchGestureActive = false;
+  let zoomFrame = 0;
+  let pendingZoom = null;
   const touches = new Map();
   const clampZoom = value => clampPageZoom(value, min, max);
 
@@ -81,30 +84,76 @@ export function createPageZoomController({
     onChange(zoom);
   }
 
+  function flushScheduledZoom() {
+    if (zoomFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(zoomFrame);
+    zoomFrame = 0;
+    const pending = pendingZoom;
+    pendingZoom = null;
+    if (!pending) return;
+    setZoom(pending.value, pending.anchor);
+    viewport.scrollLeft -= pending.panX || 0;
+    viewport.scrollTop -= pending.panY || 0;
+  }
+
+  function scheduleZoom(value, anchor, panX = 0, panY = 0) {
+    pendingZoom = { value, anchor, panX, panY };
+    if (typeof requestAnimationFrame !== "function") {
+      flushScheduledZoom();
+      return;
+    }
+    if (zoomFrame) return;
+    zoomFrame = requestAnimationFrame(() => {
+      zoomFrame = 0;
+      flushScheduledZoom();
+    });
+  }
+
   function wheel(event) {
     if (!(event.ctrlKey || event.metaKey)) return;
     event.preventDefault();
     setZoom(zoom * Math.exp(-event.deltaY * 0.002), captureAnchor(event.clientX, event.clientY));
   }
+  function startPageZoomGesture(source) {
+    if (pinchSource && pinchSource !== source) return false;
+    const alreadyActive = pinchGestureActive;
+    pinchSource = source;
+    pinchGestureActive = true;
+    if (!alreadyActive) viewport.dispatchEvent(new CustomEvent("pagezoomstart"));
+    return true;
+  }
+  function endPageZoomGesture(source) {
+    if (!pinchGestureActive || pinchSource !== source) return;
+    pinchSource = null;
+    pinchGestureActive = false;
+    viewport.dispatchEvent(new CustomEvent("pagezoomend"));
+  }
   function gestureStart(event) {
     event.preventDefault();
+    // Safari can emit GestureEvents after the two PointerEvents have already
+    // claimed this contact sequence. The first source keeps ownership until
+    // that sequence ends so the same physical pinch is never applied twice.
+    if (!startPageZoomGesture("native")) return;
     pinch = { zoom, anchor: captureAnchor(event.clientX, event.clientY) };
   }
   function gestureChange(event) {
-    if (!pinch) return;
     event.preventDefault();
-    setZoom(pinch.zoom * event.scale, pinch.anchor);
+    if (pinchSource !== "native" || !pinch) return;
+    scheduleZoom(pinch.zoom * event.scale, pinch.anchor);
   }
-  function gestureEnd() { pinch = null; }
+  function gestureEnd() {
+    if (pinchSource !== "native") return;
+    flushScheduledZoom();
+    pinch = null;
+    endPageZoomGesture("native");
+  }
   function pointerDown(event) {
     if (event.pointerType !== "touch") return;
     if (!shouldTrackTouch(event)) return;
     touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (touches.size !== 2) return;
+    if (!startPageZoomGesture("pointer")) return;
     const [a, b] = [...touches.values()];
     const midpoint = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-    pinchGestureActive = true;
-    viewport.dispatchEvent(new CustomEvent("pagezoomstart"));
     pinch = {
       zoom,
       distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
@@ -117,19 +166,25 @@ export function createPageZoomController({
   function pointerMove(event) {
     if (event.pointerType !== "touch" || !touches.has(event.pointerId)) return;
     touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (touches.size !== 2 || !pinch) return;
+    if (pinchSource !== "pointer" || touches.size !== 2 || !pinch) return;
     event.preventDefault();
     const [a, b] = [...touches.values()];
     const midpoint = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     const distance = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
-    setZoom(pinch.zoom * distance / pinch.distance, pinch.anchor);
-    viewport.scrollLeft -= midpoint.x - pinch.midpoint.x;
-    viewport.scrollTop -= midpoint.y - pinch.midpoint.y;
+    scheduleZoom(
+      pinch.zoom * distance / pinch.distance,
+      pinch.anchor,
+      midpoint.x - pinch.midpoint.x,
+      midpoint.y - pinch.midpoint.y
+    );
   }
   function pointerUp(event) {
     touches.delete(event.pointerId);
-    if (touches.size < 2) pinch = null;
-    if (touches.size === 0) pinchGestureActive = false;
+    if (pinchSource === "pointer" && touches.size < 2) {
+      flushScheduledZoom();
+      pinch = null;
+    }
+    if (pinchSource === "pointer" && touches.size === 0) endPageZoomGesture("pointer");
   }
   function doubleClick(event) {
     const rect = content.getBoundingClientRect();
@@ -139,6 +194,18 @@ export function createPageZoomController({
     } else {
       setZoom(lastFitZoom || 1, captureAnchor(event.clientX, event.clientY));
     }
+  }
+
+  function reset() {
+    setZoom(1, {
+      x: 0,
+      y: 0,
+      viewportX: 0,
+      viewportY: 0
+    });
+    viewport.scrollLeft = 0;
+    viewport.scrollTop = 0;
+    lastFitZoom = 1;
   }
 
   viewport.addEventListener("wheel", wheel, { passive: false });
@@ -154,11 +221,17 @@ export function createPageZoomController({
   return {
     get zoom() { return zoom; },
     get touchCount() { return touches.size; },
-    get isPinching() { return Boolean(pinch && touches.size >= 2); },
+    get isPinching() { return Boolean(pinchSource === "pointer" && pinch && touches.size >= 2); },
     get isPinchGestureActive() { return pinchGestureActive; },
+    get pinchSource() { return pinchSource; },
     setZoom,
+    flushScheduledZoom,
+    reset,
     captureAnchor,
     destroy() {
+      if (zoomFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(zoomFrame);
+      zoomFrame = 0;
+      pendingZoom = null;
       viewport.removeEventListener("wheel", wheel);
       viewport.removeEventListener("gesturestart", gestureStart);
       viewport.removeEventListener("gesturechange", gestureChange);

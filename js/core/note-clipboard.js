@@ -2,7 +2,7 @@ const MIME_PRIORITY = ["image/png", "image/webp", "image/jpeg"];
 
 export function isTextEditingTarget(target) {
   if (!target?.closest) return false;
-  return Boolean(target.closest("input, textarea, [contenteditable='true'], [contenteditable='']"));
+  return Boolean(target.closest("input, textarea, [contenteditable='true'], [contenteditable=''], [data-note-text-editor='true']"));
 }
 
 export function chooseClipboardImage(items = []) {

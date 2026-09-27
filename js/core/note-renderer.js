@@ -1,7 +1,8 @@
 import { assertNonEmptyBlob, canvasToVerifiedBlob } from "./file-validator.js";
 import { lineEndpoints } from "./note-geometry.js";
 import { drawStrokeSegments } from "./note-stroke.js";
-import { visibleTextLines } from "./note-text-layout.js";
+import { layoutTextBox } from "./note-text-layout.js";
+import { maskVisibilityKey } from "./note-mask-adapter.js";
 
 function loadImage(blob) {
   assertNonEmptyBlob(blob, "描画画像");
@@ -140,9 +141,6 @@ function drawText(context, element, width, height) {
   const fontSize = Math.max(8, Number(style.fontSizeRatio || 0.025) * height);
   const family = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
   context.save();
-  context.translate(x + boxWidth / 2, y + bounds.height * height / 2);
-  context.rotate(Number(element.rotation || 0) * Math.PI / 180);
-  context.translate(-boxWidth / 2, -bounds.height * height / 2);
   context.globalAlpha = Number(style.opacity ?? 1);
   context.fillStyle = style.color || "#111111";
   context.font = `${style.fontStyle || "normal"} ${style.fontWeight || "normal"} ${fontSize}px ${family}`;
@@ -150,22 +148,26 @@ function drawText(context, element, width, height) {
   context.textAlign = style.textAlign || "left";
   const anchorX = style.textAlign === "center" ? boxWidth / 2 : style.textAlign === "right" ? boxWidth : 0;
   const lineHeight = fontSize * Number(style.lineHeight || 1.25);
-  context.beginPath();
-  context.rect(0, 0, boxWidth, bounds.height * height);
-  context.clip();
-  visibleTextLines(element.text, {
+  const layout = layoutTextBox(element.text, {
     maxWidth: boxWidth,
-    maxHeight: bounds.height * height,
     lineHeight,
     measureText: value => context.measureText(value).width
-  }).forEach((line, index) => context.fillText(line, anchorX, index * lineHeight, boxWidth));
+  });
+  const boxHeight = Math.max(bounds.height * height, layout.requiredHeight);
+  context.translate(x + boxWidth / 2, y + boxHeight / 2);
+  context.rotate(Number(element.rotation || 0) * Math.PI / 180);
+  context.translate(-boxWidth / 2, -boxHeight / 2);
+  context.beginPath();
+  context.rect(0, 0, boxWidth, boxHeight);
+  context.clip();
+  layout.lines.forEach((line, index) => context.fillText(line, anchorX, index * lineHeight, boxWidth));
   context.restore();
 }
 
-function shouldDrawMask(mask, options) {
+function shouldDrawMask(mask, source, options) {
   if (options.maskMode === "none") return false;
   if (options.maskMode === "all") return true;
-  return options.revealedMaskIds?.has(mask.id) !== true;
+  return options.revealedMaskIds?.has(maskVisibilityKey(mask, source)) !== true;
 }
 
 export async function renderNotePageToCanvas({
@@ -227,11 +229,26 @@ export async function renderNotePageToCanvas({
     }
   }
 
-  const masks = [...materialMasks, ...(content.noteMasks || [])];
-  masks.filter(mask => shouldDrawMask(mask, { maskMode, revealedMaskIds })).forEach(mask => {
+  const masks = [
+    ...materialMasks.map(mask => ({ mask, source: "material" })),
+    ...(content.noteMasks || []).map(mask => ({ mask, source: "note" }))
+  ];
+  masks.filter(({ mask, source }) => shouldDrawMask(mask, source, { maskMode, revealedMaskIds })).forEach(({ mask }) => {
     context.fillStyle = mask.weak ? "#ef4444" : "#111827";
     context.fillRect(mask.x * canvas.width, mask.y * canvas.height, mask.width * canvas.width, mask.height * canvas.height);
   });
+  if (maskMode === "screen") {
+    masks.filter(({ mask, source }) => revealedMaskIds?.has(maskVisibilityKey(mask, source))).forEach(({ mask }) => {
+      context.save();
+      context.strokeStyle = mask.weak ? "rgba(185,28,28,.28)" : "rgba(71,85,105,.24)";
+      context.lineWidth = Math.max(1, canvas.width * .001);
+      context.setLineDash([Math.max(3, canvas.width * .004), Math.max(3, canvas.width * .003)]);
+      context.beginPath();
+      context.rect(mask.x * canvas.width, mask.y * canvas.height, mask.width * canvas.width, mask.height * canvas.height);
+      context.stroke();
+      context.restore();
+    });
+  }
   if (pageNumber != null) {
     const size = Math.max(16, canvas.width * 0.012);
     context.font = `${size}px sans-serif`;
