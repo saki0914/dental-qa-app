@@ -834,16 +834,9 @@ test("@authenticated 固定線幅・ツール再タップ設定・長押し直�
     pointerId: 1303, pointerType: "pen", button: 0,
     clientX: box.x + box.width * .62, clientY: box.y + box.height * .5
   });
+  await expect(stage.locator('path.note-element[data-element-id]')).toHaveCount(3);
   const straightPath = stage.locator('path.note-element[data-element-id]').last();
   await expect(straightPath).toBeVisible();
-  await page.locator("#noteSaveStatus").click();
-  const diagnosticDownload = page.waitForEvent("download");
-  await page.locator("#noteSaveDiagnosticsBtn").click();
-  const diagnosticStream = await (await diagnosticDownload).createReadStream();
-  const diagnosticChunks = [];
-  for await (const chunk of diagnosticStream) diagnosticChunks.push(chunk);
-  console.log("straighten diagnostics", JSON.parse(Buffer.concat(diagnosticChunks).toString()).drawing);
-  console.log("stroke paths", await stage.locator('path.note-element[data-element-id]').evaluateAll(nodes => nodes.map(node => ({ id: node.dataset.elementId, d: node.getAttribute("d"), stroke: node.getAttribute("stroke") }))));
   expect((await straightPath.getAttribute("d")).match(/L/g) || []).toHaveLength(1);
 
   await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 30_000 });
