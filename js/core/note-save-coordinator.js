@@ -10,6 +10,23 @@ export function createNoteSaveCoordinator({
 }) {
   const states = new Map();
 
+  function mergeIdentity(current = {}, incoming = {}, { allowRevisionAdvance = false } = {}) {
+    const merged = { ...current, ...incoming };
+    const currentRevision = Number(current.expectedRevision);
+    const incomingRevision = Number(incoming.expectedRevision);
+    const hasCurrentRevision = Number.isInteger(currentRevision) && currentRevision >= 0;
+    const hasIncomingRevision = Number.isInteger(incomingRevision) && incomingRevision >= 0;
+    if (hasCurrentRevision || hasIncomingRevision) {
+      merged.expectedRevision = hasCurrentRevision
+        ? allowRevisionAdvance && hasIncomingRevision
+          ? Math.max(currentRevision, incomingRevision)
+          : currentRevision
+        : incomingRevision;
+      merged.baseRevision = merged.expectedRevision;
+    }
+    return merged;
+  }
+
   function isStateStillValid(state, { generation, identity = state?.identity, requireDirty = false } = {}) {
     return Boolean(
       state &&
@@ -44,10 +61,13 @@ export function createNoteSaveCoordinator({
       latest: null,
       latestMutation: null,
       lastError: null,
+      conflicted: false,
       disposed: false
     });
     const state = states.get(key);
-    state.identity = { ...state.identity, ...identity };
+    state.identity = mergeIdentity(state.identity, identity, {
+      allowRevisionAdvance: !state.dirty && !state.running && !state.localWrite && !state.conflicted
+    });
     return state;
   }
 
@@ -78,10 +98,15 @@ export function createNoteSaveCoordinator({
     if (state.running) return state.running;
     if (state.localWrite) await state.localWrite;
     if (!isStateStillValid(state, { identity, requireDirty: true })) return null;
-    state.identity = { ...state.identity, ...identity };
-    const activeIdentity = { ...state.identity };
-    const generation = state.generation;
+    state.identity = mergeIdentity(state.identity, identity);
     const localMutation = { ...state.latestMutation };
+    const activeIdentity = {
+      ...state.identity,
+      baseRevision: Number(state.identity.expectedRevision),
+      clientMutationId: localMutation.mutationId,
+      mutationCreatedAt: localMutation.updatedAt
+    };
+    const generation = state.generation;
     const content = structuredClone(state.latest);
     state.dirty = false;
     onStatus(globalThis.navigator?.onLine === false ? "offline" : "saving", activeIdentity);
@@ -93,8 +118,18 @@ export function createNoteSaveCoordinator({
           () => isStateStillValid(state, { generation, identity: activeIdentity })
         );
         if (!isStateStillValid(state, { identity: activeIdentity })) return result;
+        // A newer edit may have advanced `generation` while this request was in
+        // flight.  The successful cloud revision is still the only valid base
+        // for the next queued save, so advance it before checking generation.
+        if (Number.isInteger(result?.revision) && result.revision >= 0) {
+          state.identity = mergeIdentity(state.identity, {
+            expectedRevision: result.revision,
+            baseRevision: result.revision
+          }, { allowRevisionAdvance: true });
+        }
         if (isStateStillValid(state, { generation, identity: activeIdentity })) {
           state.lastError = null;
+          state.conflicted = false;
           const deleted = await localStore.deleteSavePairIfUnchanged(state.key, {
             draft: localMutation,
             pending: localMutation
@@ -103,7 +138,6 @@ export function createNoteSaveCoordinator({
             onStatus(deleted ? "saved" : "local-saved", activeIdentity, result);
           }
         } else if (state.latest && Number.isInteger(result?.revision) && result.revision >= 0) {
-          state.identity = { ...state.identity, expectedRevision: result.revision };
           const latestGeneration = state.generation;
           const expectedMutationId = state.latestMutation?.mutationId;
           const refreshedMutation = expectedMutationId
@@ -124,15 +158,18 @@ export function createNoteSaveCoordinator({
           state.lastError = error;
           state.dirty = true;
           if (error?.name === "NoteConflictError") {
-            await localStore.put("conflicts", {
+            state.dirty = false;
+            state.conflicted = true;
+            const conflict = {
               key: state.key,
               ...activeIdentity,
               content,
               error: error.message,
               updatedAt: new Date().toISOString()
-            });
+            };
+            await localStore.put("conflicts", conflict);
             if (isStateStillValid(state, { generation, identity: activeIdentity })) {
-              onStatus("conflict", activeIdentity, error);
+              onStatus("conflict", activeIdentity, error, conflict);
             }
           } else {
             onStatus(globalThis.navigator?.onLine === false ? "offline" : "error", activeIdentity, error);
@@ -158,6 +195,7 @@ export function createNoteSaveCoordinator({
       throw error;
     }
     const state = stateFor(identity);
+    if (state.conflicted) throw state.lastError || Object.assign(new Error("このページには未解決の競合があります。"), { name: "NoteConflictError" });
     state.latest = structuredClone(content);
     state.dirty = true;
     state.generation += 1;
@@ -166,33 +204,58 @@ export function createNoteSaveCoordinator({
     state.latestMutation = { mutationId };
     clearTimeout(state.timer);
     state.timer = null;
-    const localWrite = saveLocal(identity, content, mutationId);
+    const effectiveIdentity = { ...state.identity };
+    const localWrite = saveLocal(effectiveIdentity, content, mutationId);
     state.localWrite = localWrite;
     try {
       const persistedMutation = await localWrite;
-      if (persistedMutation && isStateStillValid(state, { generation, identity }) &&
+      if (persistedMutation && isStateStillValid(state, { generation, identity: effectiveIdentity }) &&
           state.latestMutation?.mutationId === mutationId) {
         state.latestMutation = persistedMutation;
       }
     } finally {
       if (state.localWrite === localWrite) state.localWrite = null;
     }
-    if (!isStateStillValid(state, { generation, identity, requireDirty: true })) return;
-    onStatus("local-saved", identity);
-    onStatus("editing", identity);
+    if (!isStateStillValid(state, { generation, identity: effectiveIdentity, requireDirty: true })) return;
+    onStatus("local-saved", effectiveIdentity);
+    onStatus("editing", effectiveIdentity);
     const timer = setTimeout(() => {
       if (state.timer === timer) state.timer = null;
-      if (!isStateStillValid(state, { generation, identity, requireDirty: true })) return;
-      void execute(identity, state).catch(() => {});
+      if (!isStateStillValid(state, { generation, identity: effectiveIdentity, requireDirty: true })) return;
+      void execute(effectiveIdentity, state).catch(() => {});
     }, debounceMs);
-    if (isStateStillValid(state, { generation, identity, requireDirty: true })) state.timer = timer;
+    if (isStateStillValid(state, { generation, identity: effectiveIdentity, requireDirty: true })) state.timer = timer;
     else clearTimeout(timer);
+  }
+
+  async function recover(identity, content, { mutationId, updatedAt } = {}) {
+    if (!isSessionCurrent(identity)) {
+      const error = new Error("ログインセッションが切り替わったため、下書き復旧を中断しました。");
+      error.name = "NoteSessionChangedError";
+      throw error;
+    }
+    const key = noteLocalKey(identity.uid, identity.noteId, identity.pageId);
+    const existing = states.get(key);
+    if (existing && (existing.running || existing.localWrite || existing.dirty || existing.conflicted)) {
+      return { skipped: true };
+    }
+    const state = stateFor(identity);
+    state.latest = structuredClone(content);
+    state.dirty = true;
+    state.generation += 1;
+    state.latestMutation = {
+      mutationId: mutationId || randomId(),
+      updatedAt: updatedAt || new Date().toISOString()
+    };
+    onStatus("local-saved", state.identity);
+    return execute(state.identity, state);
   }
 
   async function flush(identity) {
     const state = stateFor(identity);
     clearTimeout(state.timer);
     state.timer = null;
+    if (state.conflicted) return null;
     if (!state.dirty && !state.running) return null;
     if (state.running) await state.running.catch(() => {});
     if (!state.dirty) return null;
@@ -203,6 +266,7 @@ export function createNoteSaveCoordinator({
     const results = [];
     for (const state of states.values()) {
       clearTimeout(state.timer);
+      if (state.conflicted) continue;
       if (state.running) await state.running.catch(() => {});
       if (state.dirty && state.latest) {
         results.push(await execute(state.identity, state).catch(error => error));
@@ -222,14 +286,15 @@ export function createNoteSaveCoordinator({
 
   return {
     schedule,
+    recover,
     flush,
     flushAll,
     discard,
     isDirty: identity => stateFor(identity).dirty,
-    hasPending: () => [...states.values()].some(state => state.dirty || state.running || state.lastError),
+    hasPending: () => [...states.values()].some(state => state.dirty || state.running || state.lastError || state.conflicted),
     getState(identity) {
       const state = stateFor(identity);
-      return { dirty: state.dirty, running: Boolean(state.running), error: state.lastError };
+      return { dirty: state.dirty, running: Boolean(state.running), error: state.lastError, conflicted: state.conflicted };
     },
     reset() {
       states.forEach(invalidateState);

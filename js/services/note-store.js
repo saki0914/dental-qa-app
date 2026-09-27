@@ -35,6 +35,7 @@ import {
 } from "../core/note-material-mutation.js";
 import { randomId } from "../core/id.js";
 import { normalizeNoteLineElements } from "../core/note-geometry.js";
+import { createNotePageSaveQueue } from "../core/note-page-save-queue.js";
 
 export class NoteConflictError extends Error {
   constructor(message, cloudRevision) {
@@ -58,6 +59,14 @@ export class NoteSessionChangedError extends Error {
   }
 }
 
+class NoteSameWriterRebaseError extends Error {
+  constructor(cloudRevision) {
+    super("同じ編集セッションの先行保存へ追従します。");
+    this.name = "NoteSameWriterRebaseError";
+    this.cloudRevision = cloudRevision;
+  }
+}
+
 const nowIso = () => new Date().toISOString();
 const hashText = async text => {
   const bytes = new TextEncoder().encode(text);
@@ -75,10 +84,12 @@ const CREATION_BATCH_SIZE = 400;
 const MAX_PENDING_STORAGE_PATHS = 1000;
 const NOTE_CREATION_WAIT_TIMEOUT_MS = 15_000;
 const NOTE_CREATION_POLL_INTERVAL_MS = 250;
+const MAX_SAME_WRITER_REBASE_ATTEMPTS = 1;
 const isReadyNote = note => !note?.status || note.status === "ready";
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = async () => {} }) {
+  const pageSaveQueue = createNotePageSaveQueue();
   function requireExpectedUid(expectedUid) {
     if (typeof expectedUid !== "string" || !expectedUid.trim()) {
       throw new TypeError("ノート操作にはexpectedUidが必要です。");
@@ -610,18 +621,44 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     return normalizeNoteLineElements(parsed, page.size);
   }
 
-  async function savePageContent({ noteId, pageId, expectedRevision, expectedUid }, content) {
+  async function persistPageContentAttempt({
+    noteId,
+    pageId,
+    expectedRevision,
+    expectedUid,
+    clientInstanceId = "",
+    editorTabId = "",
+    writerSessionId = "",
+    clientMutationId = randomId(),
+    mutationCreatedAt = "",
+    baseRevision = expectedRevision
+  }, content) {
     const { uid, db, storage } = writeContext(expectedUid);
-    const saveId = randomId();
+    const mutationId = String(clientMutationId || randomId());
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(mutationId)) {
+      throw new TypeError("ページ保存のmutationIdが不正です。");
+    }
+    const saveId = mutationId;
     const currentRevision = Number(expectedRevision);
     if (!Number.isInteger(currentRevision) || currentRevision < 0) {
       throw new TypeError("ページ内容の保存前リビジョンが不正です。");
     }
+    if (Number(baseRevision) !== currentRevision) {
+      throw new TypeError("ページ保存の基準リビジョンが一致しません。");
+    }
     const nextRevision = currentRevision + 1;
-    const payload = { ...content, schemaVersion: 1, noteId, pageId, revision: nextRevision, savedAt: nowIso() };
+    const writer = {
+      clientInstanceId: String(clientInstanceId || ""),
+      editorTabId: String(editorTabId || ""),
+      writerSessionId: String(writerSessionId || ""),
+      clientMutationId: mutationId,
+      baseRevision: currentRevision
+    };
+    const savedAt = mutationCreatedAt || nowIso();
+    const payload = { ...content, ...writer, schemaVersion: 1, noteId, pageId, revision: nextRevision, savedAt };
     const { json, blob } = serializeValidatedJson(payload, { noteId, pageId });
-    const path = `users/${uid}/notes/${noteId}/pages/${pageId}/revisions/${saveId}.json`;
     const contentHash = await hashText(json);
+    const path = `users/${uid}/notes/${noteId}/pages/${pageId}/revisions/${saveId}-${contentHash.slice(0, 16)}.json`;
     context(expectedUid);
     await journalStoragePath(noteId, path, expectedUid);
     let uploaded = false;
@@ -631,6 +668,7 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
       await uploadBytes(storageRef(storage, path), blob, { contentType: "application/json" });
       uploaded = true;
       context(expectedUid);
+      let idempotentResult = null;
       await runTransaction(db, async transaction => {
         const reference = pageRef(db, uid, noteId, pageId);
         const noteReference = noteRef(db, uid, noteId);
@@ -640,11 +678,32 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
         ]);
         context(expectedUid);
         const cloudRevision = Number(snapshot.data()?.contentRevision || 0);
-        if (!snapshot.exists() || snapshot.data()?.deletedAt || cloudRevision !== currentRevision) {
-          throw new NoteConflictError("別の端末でこのページが更新されています。", cloudRevision);
-        }
+        const cloudMutationId = String(snapshot.data()?.lastClientMutationId || "");
         if (!noteSnapshot.exists() || noteSnapshot.data()?.deletedAt || noteSnapshot.data()?.status === "failed") {
           throw new NoteConflictError("このノートは削除済みか、作成に失敗しているため保存できません。", cloudRevision);
+        }
+        if (snapshot.exists() && !snapshot.data()?.deletedAt &&
+            cloudRevision === currentRevision + 1 && cloudMutationId === writer.clientMutationId &&
+            snapshot.data()?.contentHash === contentHash) {
+          idempotentResult = {
+            revision: cloudRevision,
+            contentPath: snapshot.data()?.contentPath || path,
+            contentHash: snapshot.data()?.contentHash || contentHash,
+            idempotent: true
+          };
+          transaction.update(noteReference, {
+            ...(noteSnapshot.data()?.status === "creating" ? {} : { pendingStoragePaths: arrayRemove(path) }),
+            updatedAt: serverTimestamp()
+          });
+          return;
+        }
+        if (snapshot.exists() && !snapshot.data()?.deletedAt &&
+            cloudRevision > currentRevision && writer.writerSessionId &&
+            snapshot.data()?.lastWriterSessionId === writer.writerSessionId) {
+          throw new NoteSameWriterRebaseError(cloudRevision);
+        }
+        if (!snapshot.exists() || snapshot.data()?.deletedAt || cloudRevision !== currentRevision) {
+          throw new NoteConflictError("別の端末でこのページが更新されています。", cloudRevision);
         }
         context(expectedUid);
         transaction.update(reference, {
@@ -652,6 +711,11 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
           contentPath: path,
           contentHash,
           noteMaskCount: payload.noteMasks.length,
+          lastClientInstanceId: writer.clientInstanceId,
+          lastEditorTabId: writer.editorTabId,
+          lastWriterSessionId: writer.writerSessionId,
+          lastClientMutationId: writer.clientMutationId,
+          lastBaseRevision: currentRevision,
           updatedAt: serverTimestamp()
         });
         const maskDelta = payload.noteMasks.length - Number(snapshot.data()?.noteMaskCount || 0);
@@ -661,6 +725,7 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
           updatedAt: serverTimestamp()
         });
       });
+      if (idempotentResult) return idempotentResult;
       return { revision: nextRevision, contentPath: path, contentHash };
     } catch (error) {
       if (!uploaded) {
@@ -684,6 +749,42 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
       throw error;
     }
   }
+
+  async function persistPageContent(options, content) {
+    let attempt = 0;
+    let activeOptions = { ...options };
+    while (true) {
+      try {
+        return await persistPageContentAttempt(activeOptions, content);
+      } catch (error) {
+        if (error?.name !== "NoteSameWriterRebaseError" ||
+            attempt >= MAX_SAME_WRITER_REBASE_ATTEMPTS ||
+            !Number.isInteger(error.cloudRevision) || error.cloudRevision < 0) {
+          if (error?.name === "NoteSameWriterRebaseError") {
+            throw new NoteConflictError("同じ編集セッションの保存が連続したため、自動追従を停止しました。", error.cloudRevision);
+          }
+          throw error;
+        }
+        attempt += 1;
+        activeOptions = {
+          ...activeOptions,
+          expectedRevision: error.cloudRevision,
+          baseRevision: error.cloudRevision
+        };
+      }
+    }
+  }
+
+  async function enqueuePageContentSave(options, content) {
+    const expectedUid = requireExpectedUid(options?.expectedUid);
+    const noteId = String(options?.noteId || "");
+    const pageId = String(options?.pageId || "");
+    if (!noteId || !pageId) throw new TypeError("ページ保存先が不足しています。");
+    const key = `${expectedUid}|${noteId}|${pageId}`;
+    return pageSaveQueue.enqueue(key, () => persistPageContent(options, content));
+  }
+
+  const savePageContent = enqueuePageContentSave;
 
   async function uploadAsset(noteId, blob, { assetId = randomId(), filename = "original.png", expectedUid } = {}) {
     requireExpectedUid(expectedUid);
@@ -955,7 +1056,7 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
   return {
     listNotes, getNote, listNotesByMaterial, listPages, createNote, createCreatingNote, finalizeCreatingNote,
     finalizeNoteCreation, abortCreatingNote, cleanupStuckCreatingNotes, markCreationFailed,
-    uploadSourcePage, deleteStoragePaths, loadPageContent, savePageContent, uploadAsset, getAsset,
+    uploadSourcePage, deleteStoragePaths, loadPageContent, savePageContent, enqueuePageContentSave, uploadAsset, getAsset,
     getStorageBlob, cleanupStoragePath, updatePageOrder, createPage, deletePage, updatePage, updateNote,
     deleteMaterialLinkedNotes, restoreNote, deleteNote
   };

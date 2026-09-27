@@ -40,6 +40,15 @@ function storeSwitchingUserAfterFinalTransaction() {
   });
 }
 
+function storeWithPageData(pageDataForTransaction) {
+  resetFirebaseStubs({ pageDataForTransaction });
+  return createNoteStore({
+    getDb: () => ({ name: "db" }),
+    getStorage: () => ({ name: "storage" }),
+    getUser: () => ({ uid: "alice" })
+  });
+}
+
 test("savePageContentはFirestore commit直後のユーザー切替を保存成功として返す", async () => {
   const store = storeSwitchingUserAfterFinalTransaction();
   const result = await store.savePageContent({
@@ -66,4 +75,54 @@ test("uploadAssetはFirestore commit直後のユーザー切替を保存成功�
 
   assert.equal(result.assetId, "asset-1");
   assert.equal(result.storagePath, "users/alice/notes/note-1/assets/asset-1/original.png");
+});
+
+test("savePageContentは同じwriterSessionの先行revisionへ1回だけ追従する", async () => {
+  const store = storeWithPageData(transactionCall => transactionCall >= 2
+    ? { contentRevision: 1, lastWriterSessionId: "writer-1" }
+    : {});
+  const result = await store.savePageContent({
+    noteId: "note-1",
+    pageId: "page-1",
+    expectedRevision: 0,
+    expectedUid: "alice",
+    writerSessionId: "writer-1",
+    clientMutationId: "mutation-1"
+  }, { elements: [], noteMasks: [] });
+
+  assert.equal(result.revision, 2);
+});
+
+test("savePageContentは別writerSessionの先行revisionへ追従しない", async () => {
+  const store = storeWithPageData(transactionCall => transactionCall >= 2
+    ? { contentRevision: 1, lastWriterSessionId: "writer-other" }
+    : {});
+  await assert.rejects(store.savePageContent({
+    noteId: "note-1",
+    pageId: "page-1",
+    expectedRevision: 0,
+    expectedUid: "alice",
+    writerSessionId: "writer-1",
+    clientMutationId: "mutation-1"
+  }, { elements: [], noteMasks: [] }), error => (
+    error?.name === "NoteConflictError" && error.cloudRevision === 1
+  ));
+});
+
+test("savePageContentは同じwriterSessionでも2回目のrebaseを競合にする", async () => {
+  const store = storeWithPageData(transactionCall => {
+    if (transactionCall >= 4) return { contentRevision: 2, lastWriterSessionId: "writer-1" };
+    if (transactionCall >= 2) return { contentRevision: 1, lastWriterSessionId: "writer-1" };
+    return {};
+  });
+  await assert.rejects(store.savePageContent({
+    noteId: "note-1",
+    pageId: "page-1",
+    expectedRevision: 0,
+    expectedUid: "alice",
+    writerSessionId: "writer-1",
+    clientMutationId: "mutation-1"
+  }, { elements: [], noteMasks: [] }), error => (
+    error?.name === "NoteConflictError" && error.cloudRevision === 2
+  ));
 });

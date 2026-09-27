@@ -16,3 +16,63 @@
 @media(max-width:760px){.note-create-grid{grid-template-columns:1fr}.note-editor-layout{display:block}.note-mobile-pages-button{display:grid;place-items:center}.note-page-sidebar{position:absolute;z-index:45;left:8px;right:8px;bottom:80px;max-height:38vh;border:1px solid #cbd5e1;border-radius:14px;display:none;box-shadow:0 14px 36px rgba(15,23,42,.24)}.note-page-sidebar.open{display:block}.note-page-list{flex-direction:row;overflow:auto}.note-page-list li{flex:0 0 120px}.note-viewport{height:68vh;padding:18px 10px}.note-page-stage{width:min(92vw,650px)}.note-toolbar{border-radius:16px}.note-toolbar button{flex-basis:48px}.note-editor-header{gap:5px}.note-page-counter{display:none}.note-study-controls{width:calc(100% - 16px);overflow:auto;justify-content:flex-start}.note-title-input{max-width:32vw}}
 @media(prefers-reduced-motion:reduce){.note-page-stage{scroll-behavior:auto}}
 .note-layer[data-layer="masks"]{pointer-events:none}.note-mask.editable,.note-page-stage.study-mode .note-mask{pointer-events:auto}
+
+/* Dedicated Preview-style editor */
+body.note-editor-dedicated{background:#747b86;overflow:hidden}
+body.note-editor-dedicated .wrap{max-width:none;padding:0}
+body.note-editor-dedicated .wrap>.panel:first-child h1,
+body.note-editor-dedicated .wrap>.panel:first-child>.sub,
+body.note-editor-dedicated .wrap>.panel:first-child>#appVersionLabel,
+body.note-editor-dedicated .wrap>.panel:first-child>#cloudStatus,
+body.note-editor-dedicated .tabs,
+body.note-editor-dedicated #tab-pdf>h2,
+body.note-editor-dedicated #tab-pdf>.sub,
+body.note-editor-dedicated .image-memory-mode-switch,
+body.note-editor-dedicated #noteListView,
+body.note-editor-dedicated #noteCreateView,
+body.note-editor-dedicated #pdfStudyView,
+body.note-editor-dedicated #pdfEditView{display:none!important}
+body.note-editor-dedicated .wrap>.panel{margin:0;border:0;border-radius:0;box-shadow:none;padding:0;background:transparent}
+body.note-editor-dedicated .wrap>.panel:first-child{position:fixed;right:8px;bottom:8px;z-index:80;width:min(360px,calc(100% - 16px));pointer-events:none}
+body.note-editor-dedicated .local-environment-banner{margin:0;padding:5px 8px;pointer-events:none;opacity:.92;font-size:.76rem}
+body.note-editor-dedicated .note-editor{margin:0;height:100dvh;background:#747b86}
+body.note-editor-dedicated .note-editor-layout{min-height:calc(100dvh - 62px);height:calc(100dvh - 62px)}
+body.note-editor-dedicated .note-viewport{height:calc(100dvh - 62px);background:#747b86}
+
+.note-editor-alert{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 12px;background:#fff7ed;border:1px solid #fdba74;color:#7c2d12}
+.note-editor-alert.danger{background:#fef2f2;border-color:#fca5a5;color:#991b1b}
+.note-editor-alert button{min-height:40px;border:1px solid currentColor;border-radius:9px;background:#fff;color:inherit;padding:7px 10px}
+.note-editor.is-readonly .note-toolbar,.note-editor.is-readonly .note-selection-actions{opacity:.55;pointer-events:none}
+.note-editor.is-readonly .note-page-actions,.note-editor.is-readonly .note-page-row-actions{opacity:.55;pointer-events:none}
+.note-editor-layout.sidebar-hidden{grid-template-columns:minmax(0,1fr)}
+.note-editor-layout.sidebar-hidden .note-page-sidebar{display:none!important}
+
+.note-icon-button svg,.note-toolbar svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.note-toolbar-drag svg circle{fill:currentColor;stroke:none}
+.note-toolbar{position:fixed;margin:0;max-width:calc(100vw - 24px);max-height:calc(100dvh - 90px);transition:inset .16s ease,transform .16s ease}
+.note-toolbar.dock-bottom{left:50%;bottom:calc(10px + env(safe-area-inset-bottom));transform:translateX(-50%)}
+.note-toolbar.dock-top{left:50%;top:72px;bottom:auto;transform:translateX(-50%)}
+.note-toolbar.dock-left{left:10px;top:50%;bottom:auto;transform:translateY(-50%);flex-direction:column;overflow-y:auto;overflow-x:hidden}
+.note-toolbar.dock-right{right:10px;left:auto;top:50%;bottom:auto;transform:translateY(-50%);flex-direction:column;overflow-y:auto;overflow-x:hidden}
+.note-toolbar button{position:relative;flex:0 0 48px;width:48px;min-height:48px}
+.note-toolbar button span.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.note-toolbar #noteEraserBadge{position:absolute;right:2px;bottom:2px;min-width:16px;height:16px;border-radius:8px;background:#334155;color:#fff;font:10px/16px sans-serif}
+.note-toolbar.collapsed button:not(.note-toolbar-drag):not(#noteToolbarCollapseBtn){display:none}
+.note-toolbar.dragging{opacity:.76;transition:none}
+.note-tool-settings{position:fixed;bottom:calc(80px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);margin:0;max-height:min(54vh,460px);overflow:auto;align-items:center}
+.note-tool-settings.dock-top{top:132px;bottom:auto}.note-tool-settings.dock-left{left:78px;top:50%;bottom:auto;transform:translateY(-50%)}.note-tool-settings.dock-right{right:78px;left:auto;top:50%;bottom:auto;transform:translateY(-50%)}
+.note-color-presets,.note-width-presets{display:flex;gap:6px;align-items:center}
+.note-color-presets button{width:44px;height:44px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 0 1px #64748b}
+.note-color-presets button.active{box-shadow:0 0 0 3px #2563eb}
+.note-width-presets button{min-width:44px;min-height:44px;border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:4px}
+.note-width-presets button.active{border:3px solid #2563eb;background:#eff6ff}
+.note-pencil-doubletap-notice{flex-basis:100%;margin:0;padding:8px;border-radius:8px;background:#f1f5f9;color:#475569;font-size:.78rem}
+.note-workspace{--toolbar-inset-top:0px;--toolbar-inset-right:0px;--toolbar-inset-bottom:72px;--toolbar-inset-left:0px}
+.note-editor[data-toolbar-dock="top"] .note-viewport{padding-top:96px}.note-editor[data-toolbar-dock="bottom"] .note-viewport{padding-bottom:96px}.note-editor[data-toolbar-dock="left"] .note-viewport{padding-left:96px}.note-editor[data-toolbar-dock="right"] .note-viewport{padding-right:96px}
+
+@media(max-width:760px){
+  body.note-editor-dedicated .note-editor-layout{height:calc(100dvh - 58px)}
+  body.note-editor-dedicated .note-viewport{height:calc(100dvh - 58px)}
+  .note-toolbar.dock-top{top:62px}
+  .note-page-sidebar{display:none}.note-page-sidebar.open{display:block}
+}

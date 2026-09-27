@@ -36,6 +36,27 @@ test("ページ実表示領域を基準に0〜1座標へ変換する", () => {
   assert.deepEqual(clientPointToNormalized(150, 250, { left: 50, top: 50, width: 200, height: 400 }), { x: .5, y: .5 });
 });
 
+test("ズーム・画面向き・サイドバー・パレット位置でページrectが変わっても座標誤差を2 CSS px以内に保つ", () => {
+  const zooms = [.8, 1, 2, 5];
+  const layouts = [
+    { left: 18, top: 96, width: 620, height: 877 },
+    { left: 214, top: 64, width: 877, height: 620 },
+    { left: 96, top: 18, width: 620, height: 877 },
+    { left: 18, top: 64, width: 877, height: 620 }
+  ];
+  for (const zoom of zooms) {
+    for (const layout of layouts) {
+      const rect = { ...layout, width: layout.width * zoom, height: layout.height * zoom };
+      const expected = { x: .371, y: .629 };
+      const clientX = rect.left + rect.width * expected.x;
+      const clientY = rect.top + rect.height * expected.y;
+      const actual = clientPointToNormalized(clientX, clientY, rect);
+      assert.ok(Math.abs((actual.x - expected.x) * rect.width) <= 2);
+      assert.ok(Math.abs((actual.y - expected.y) * rect.height) <= 2);
+    }
+  }
+});
+
 test("ドラッグ方向に依存せず正規化矩形を作る", () => {
   assert.deepEqual(normalizedBoundsFromPoints({ x: .8, y: .7 }, { x: .2, y: .3 }), { x: .2, y: .3, width: .6000000000000001, height: .39999999999999997 });
 });

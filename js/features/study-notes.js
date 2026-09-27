@@ -28,7 +28,11 @@ import {
 } from "../core/note-geometry.js";
 import { randomId } from "../core/id.js";
 import { chooseClipboardImage, imageFileFromPasteEvent, isTextEditingTarget, readClipboardImage } from "../core/note-clipboard.js";
+import { createNoteBackgroundSignature } from "../core/note-background.js";
+import { resolveNoteConflicts } from "../core/note-conflict-resolution.js";
 import { createNoteHistory } from "../core/note-history.js";
+import { createNoteEditorLease, getOrCreateNoteClientInstanceId } from "../core/note-editor-lock.js";
+import { createNoteInputGuard } from "../core/note-input-guard.js";
 import { createNoteLocalStore, noteLocalKey } from "../core/note-local-store.js";
 import { getMaterialPageMasks } from "../core/note-mask-adapter.js";
 import {
@@ -36,6 +40,8 @@ import {
   isMaterialArchiving
 } from "../core/note-material-mutation.js";
 import { createNoteSaveCoordinator } from "../core/note-save-coordinator.js";
+import { canStraightenStroke, straightenedPoints, NOTE_STRAIGHTEN_HOLD_MS, NOTE_STRAIGHTEN_MOVE_PX } from "../core/note-straightener.js";
+import { createNoteToolSettingsStore, normalizeNoteToolSettings } from "../core/note-tool-settings.js";
 import {
   loadSessionBoundBackgroundBlob,
   loadSessionBoundMaterialDimensions
@@ -73,6 +79,14 @@ const TOOL_LABELS = {
 };
 
 const clone = value => structuredClone(value);
+const stableLegacyMutationId = value => {
+  let hash = 2166136261;
+  for (const character of String(value || "")) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `legacy-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+};
 const emptyContent = (noteId, pageId, revision = 0) => ({
   schemaVersion: 1, noteId, pageId, revision, elements: [], noteMasks: [], savedAt: ""
 });
@@ -119,6 +133,10 @@ export function createStudyNotes(dependencies) {
     activateSection = () => {}
   } = dependencies;
   const byId = id => document.getElementById(id);
+  const routeParams = new URLSearchParams(globalThis.location?.search || "");
+  const dedicatedEditorNoteId = routeParams.get("noteEditor") === "1" ? routeParams.get("noteId") || "" : "";
+  const dedicatedEditor = Boolean(dedicatedEditorNoteId);
+  if (dedicatedEditor) document.body.classList.add("note-editor-dedicated");
   const ui = {
     noteModeBtn: byId("noteModeBtn"), noteView: byId("noteView"), listView: byId("noteListView"),
     createView: byId("noteCreateView"), editorView: byId("noteEditorView"), list: byId("noteList"),
@@ -130,11 +148,20 @@ export function createStudyNotes(dependencies) {
     undo: byId("noteUndoBtn"), redo: byId("noteRedoBtn"), studyToggle: byId("toggleNoteStudyBtn"),
     saveStatus: byId("noteSaveStatus"), pageSidebar: byId("notePageSidebar"), pageList: byId("notePageList"),
     retrySave: byId("noteRetrySaveBtn"),
+    editorLayout: byId("noteEditorView")?.querySelector(".note-editor-layout"),
+    lockBanner: byId("noteEditorLockBanner"), lockMessage: byId("noteEditorLockMessage"),
+    lockReadOnly: byId("noteEditorReadOnlyBtn"), lockTakeover: byId("noteEditorTakeoverBtn"), lockReturn: byId("noteEditorReturnBtn"),
+    conflictBanner: byId("notePageConflictBanner"),
     viewport: byId("noteViewport"), stage: byId("notePageStage"), studyControls: byId("noteStudyControls"),
     maskCounts: byId("noteMaskCounts"), selectionActions: byId("noteSelectionActions"),
     toolbar: byId("noteEditorView")?.querySelector(".note-toolbar"), settings: byId("noteToolSettings"),
     color: byId("noteColorInput"), width: byId("noteWidthInput"), opacity: byId("noteOpacityInput"),
     eraserMode: byId("noteEraserMode"), shapeType: byId("noteShapeType"), fingerDraw: byId("noteFingerDraw"),
+    eraserSize: byId("noteEraserSize"), pencilMode: byId("notePencilMode"), straightenEnabled: byId("noteStraightenEnabled"),
+    toolbarDock: byId("noteToolbarDock"), quickSwitchAction: byId("noteQuickSwitchAction"),
+    quickSwitch: byId("noteQuickSwitchBtn"), toolbarDrag: byId("noteToolbarDragHandle"), toolbarCollapse: byId("noteToolbarCollapseBtn"),
+    eraserBadge: byId("noteEraserBadge"), settingsTitle: byId("noteToolSettingsTitle"),
+    colorPresets: byId("noteColorPresets"), widthPresets: byId("noteWidthPresets"),
     lineStyle: byId("noteLineStyle"), fillColor: byId("noteFillColor"), fillOpacity: byId("noteFillOpacity"),
     fontFamily: byId("noteFontFamily"), fontSize: byId("noteFontSize"), fontBold: byId("noteFontBold"),
     fontItalic: byId("noteFontItalic"), textAlign: byId("noteTextAlign"), lineHeight: byId("noteLineHeight"),
@@ -165,6 +192,8 @@ export function createStudyNotes(dependencies) {
   let selectedIds = [];
   let activeGesture = null;
   let renderToken = 0;
+  let backgroundRenderToken = 0;
+  let renderedBackgroundSignature = "";
   let objectUrls = [];
   let zoomController = null;
   let createController = null;
@@ -177,6 +206,18 @@ export function createStudyNotes(dependencies) {
   let assetCache = new Map();
   let contentCache = new Map();
   let hasSeenPen = false;
+  let toolSettingsStore = null;
+  let toolSettings = normalizeNoteToolSettings();
+  let previousTool = "pen";
+  let editorLease = null;
+  let readOnlyEditor = !dedicatedEditor;
+  let clientInstanceId = "";
+  let editorTabId = routeParams.get("editorTabId") || randomId();
+  let conflictPageIds = new Set();
+  const activeTouchPointerIds = new Set();
+  let pageZoomGestureActive = false;
+  let routeOpened = false;
+  const inputGuard = createNoteInputGuard();
   const pendingAssetRecoveryPromises = new Map();
   const pendingRecoveryPromises = new Map();
   const pendingRecoverySweeps = new Map();
@@ -198,6 +239,202 @@ export function createStudyNotes(dependencies) {
     return session;
   }
 
+  function initializeEditorPreferences(session = captureUserSession()) {
+    if (!session) return;
+    if (!clientInstanceId) clientInstanceId = getOrCreateNoteClientInstanceId(globalThis.localStorage, session.uid);
+    if (!toolSettingsStore || !toolSettingsStore.key.includes(`:${session.uid}`)) {
+      toolSettingsStore = createNoteToolSettingsStore({ uid: session.uid });
+      toolSettings = toolSettingsStore.load();
+    }
+    applyToolSettingsToUi();
+    if (dedicatedEditor && !routeParams.get("editorTabId")) {
+      const url = new URL(globalThis.location.href);
+      url.searchParams.set("editorTabId", editorTabId);
+      globalThis.history?.replaceState?.(null, "", url);
+    }
+  }
+
+  function selectedToolSettings() {
+    if (currentTool === "highlighter") return {
+      color: toolSettings.highlighterColor,
+      width: toolSettings.highlighterWidth,
+      opacity: toolSettings.highlighterOpacity
+    };
+    if (currentTool.startsWith("eraser")) return {
+      color: toolSettings.penColor,
+      width: toolSettings.eraserSize,
+      opacity: 100
+    };
+    return { color: toolSettings.penColor, width: toolSettings.penWidth, opacity: toolSettings.penOpacity };
+  }
+
+  function applyToolbarDock(dock = toolSettings.toolbarDock) {
+    const value = ["top", "right", "bottom", "left"].includes(dock) ? dock : "bottom";
+    toolSettings.toolbarDock = value;
+    ui.toolbar.dataset.dock = value;
+    ui.toolbar.classList.remove("dock-top", "dock-right", "dock-bottom", "dock-left");
+    ui.toolbar.classList.add(`dock-${value}`);
+    ui.settings.classList.remove("dock-top", "dock-right", "dock-bottom", "dock-left");
+    ui.settings.classList.add(`dock-${value}`);
+    ui.editorView.dataset.toolbarDock = value;
+    if (ui.toolbarDock) ui.toolbarDock.value = value;
+  }
+
+  function renderToolPresets() {
+    const isHighlighter = currentTool === "highlighter";
+    const colors = isHighlighter
+      ? ["#fff200", "#8cff66", "#6ce5ff", "#ff8bc8", "#ffad5a", "#b89cff", "#ffffff", "#ffd6e7"]
+      : ["#111111", "#ef4444", "#2563eb", "#16a34a", "#eab308", "#f97316", "#9333ea", "#ffffff"];
+    const selected = selectedToolSettings();
+    ui.colorPresets?.replaceChildren(...colors.map(value => {
+      const button = document.createElement("button");
+      button.type = "button"; button.style.background = value; button.dataset.color = value;
+      button.classList.toggle("active", value.toLowerCase() === selected.color.toLowerCase());
+      button.setAttribute("aria-label", `${value}を選択`); button.title = `${value}を選択`;
+      return button;
+    }));
+    const widths = currentTool === "highlighter"
+      ? [["細い", 18], ["標準", 36], ["太い", 58], ["極太", 82]]
+      : currentTool.startsWith("eraser")
+        ? [["小", 14], ["中", 30], ["大", 60]]
+        : [["極細", 8], ["細い", 16], ["標準", 25], ["太い", 45], ["極太", 72]];
+    ui.widthPresets?.replaceChildren(...widths.map(([label, value]) => {
+      const button = document.createElement("button"); button.type = "button";
+      button.textContent = label; button.dataset.width = String(value);
+      button.classList.toggle("active", Number(selected.width) === value);
+      return button;
+    }));
+  }
+
+  function applyToolSettingsToUi() {
+    const selected = selectedToolSettings();
+    ui.color.value = selected.color;
+    ui.width.value = String(selected.width);
+    ui.opacity.value = String(selected.opacity);
+    ui.currentColor.style.background = selected.color;
+    ui.eraserMode.value = toolSettings.eraserMode;
+    if (ui.eraserSize) ui.eraserSize.value = String(toolSettings.eraserSize);
+    if (ui.pencilMode) ui.pencilMode.checked = toolSettings.pencilMode;
+    if (ui.straightenEnabled) ui.straightenEnabled.checked = toolSettings.straightenEnabled;
+    if (ui.quickSwitchAction) ui.quickSwitchAction.value = toolSettings.quickSwitchAction;
+    if (ui.eraserBadge) ui.eraserBadge.textContent = toolSettings.eraserMode === "pixel" ? "P" : "O";
+    ui.editorLayout?.classList.toggle("sidebar-hidden", toolSettings.sidebarVisible === false);
+    ui.pageSidebar.classList.toggle("open", toolSettings.sidebarVisible !== false);
+    ui.pagesButton.setAttribute("aria-expanded", String(toolSettings.sidebarVisible !== false));
+    ui.pagesButton.setAttribute("aria-label", toolSettings.sidebarVisible === false ? "ページ一覧を表示" : "ページ一覧を隠す");
+    applyToolbarDock();
+    renderToolPresets();
+  }
+
+  function persistToolSettings(patch = {}) {
+    toolSettings = toolSettingsStore?.save({ ...toolSettings, ...patch }) || normalizeNoteToolSettings({ ...toolSettings, ...patch });
+    applyToolSettingsToUi();
+  }
+
+  function setEditorReadOnly(value, message = "") {
+    readOnlyEditor = value === true;
+    ui.editorView.classList.toggle("is-readonly", readOnlyEditor);
+    ui.title.readOnly = readOnlyEditor;
+    ui.editorView.querySelectorAll([
+      "[data-page-action]",
+      ".note-page-row-actions button",
+      '[data-note-action="rename"]',
+      '[data-note-action="duplicate"]',
+      '[data-note-action="delete"]'
+    ].join(",")).forEach(button => { button.disabled = readOnlyEditor; });
+    ui.backgroundBtn.disabled = readOnlyEditor || conflictPageIds.has(pages[currentPageIndex]?.pageId);
+    ui.lockBanner.classList.toggle("hidden", !message);
+    if (message) ui.lockMessage.textContent = message;
+  }
+
+  function hasWriterOwnership() {
+    return !dedicatedEditor || editorLease?.isWriter() === true;
+  }
+
+  function isEditableNow(page = pages[currentPageIndex]) {
+    return Boolean(
+      currentNote &&
+      currentContent &&
+      !studyMode &&
+      !readOnlyEditor &&
+      hasWriterOwnership() &&
+      !conflictPageIds.has(page?.pageId)
+    );
+  }
+
+  function canMutateCurrentNote(note = currentNote, { page = null, allowConflict = true } = {}) {
+    if (!note) return false;
+    if (!dedicatedEditor || currentNote?.id !== note.id) return true;
+    if (readOnlyEditor || !hasWriterOwnership()) {
+      setEditorReadOnly(true, "このタブは読み取り専用です。編集を引き継ぐと操作できます。");
+      return false;
+    }
+    if (!allowConflict && conflictPageIds.has((page || pages[currentPageIndex])?.pageId)) {
+      explainBlockedEdit(page || pages[currentPageIndex]);
+      return false;
+    }
+    return true;
+  }
+
+  function explainBlockedEdit(page = pages[currentPageIndex]) {
+    if (conflictPageIds.has(page?.pageId)) {
+      ui.conflictBanner.classList.remove("hidden");
+      return;
+    }
+    if (readOnlyEditor) {
+      setEditorReadOnly(true, "このタブは読み取り専用です。編集を引き継ぐと操作できます。");
+    }
+  }
+
+  async function establishEditorLease(noteId, session) {
+    editorLease?.dispose();
+    editorLease = null;
+    if (!dedicatedEditor) {
+      setEditorReadOnly(true, "ノート一覧画面は保存を行いません。編集は専用タブで開いてください。");
+      return { acquired: false };
+    }
+    initializeEditorPreferences(session);
+    editorLease = createNoteEditorLease({
+      uid: session.uid,
+      noteId,
+      editorTabId,
+      clientInstanceId,
+      onOwnershipLost: () => setEditorReadOnly(true, "編集権が別のタブへ移りました。このタブは読み取り専用です。")
+    });
+    const result = await editorLease.claim();
+    if (result.acquired) setEditorReadOnly(false);
+    else setEditorReadOnly(true, "このノートは別のタブで編集中です。");
+    return result;
+  }
+
+  function editorUrl(noteId, { study = false } = {}) {
+    const url = new URL(globalThis.location.href);
+    url.searchParams.set("noteEditor", "1");
+    url.searchParams.set("noteId", noteId);
+    url.searchParams.set("editorTabId", randomId());
+    if (study) url.searchParams.set("study", "1"); else url.searchParams.delete("study");
+    return url;
+  }
+
+  function reserveEditorTab() {
+    const opened = globalThis.open?.("about:blank", "_blank");
+    if (!opened) throw new Error("ノート編集タブを開けませんでした。ポップアップを許可して再試行してください。");
+    try {
+      opened.document.title = "ノートを準備しています";
+      opened.document.body.textContent = "ノートを準備しています…";
+      opened.opener = null;
+    } catch {}
+    return opened;
+  }
+
+  function openEditorTab(noteId, options = {}, reservedWindow = null) {
+    const opened = reservedWindow || globalThis.open?.(editorUrl(noteId, options).toString(), "_blank");
+    if (!opened) throw new Error("ノート編集タブを開けませんでした。ポップアップを許可して再試行してください。");
+    if (reservedWindow) opened.location.replace(editorUrl(noteId, options).toString());
+    try { opened.opener = null; } catch {}
+    return opened;
+  }
+
   const recoveryKey = (session, noteId = "all") => `${session.uid}|${session.generation}|${noteId}`;
 
   const saveCoordinator = createNoteSaveCoordinator({
@@ -205,29 +442,43 @@ export function createStudyNotes(dependencies) {
     debounceMs: 850,
     isSessionCurrent: identity => (
       getCurrentUser()?.uid === identity.uid &&
-      userSessionGeneration === identity.sessionGeneration
+      userSessionGeneration === identity.sessionGeneration &&
+      (!identity.writerSessionId || editorLease?.isWriter() === true)
     ),
     persist: async (identity, content, isActive) => {
       const page = currentNote?.id === identity.noteId
         ? pages.find(item => item.pageId === identity.pageId)
         : null;
-      const expectedRevision = Number(page?.contentRevision ?? identity.expectedRevision);
+      // The coordinator owns the serial save baseline.  `page.contentRevision`
+      // is presentation state and can legitimately lag while a newer edit is
+      // queued behind an in-flight save.
+      const expectedRevision = Number(identity.expectedRevision);
       if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
         throw new Error("保存対象ページのリビジョンが見つかりません。");
       }
-      const result = await noteStore.savePageContent({
+      const result = await noteStore.enqueuePageContentSave({
         noteId: identity.noteId,
         pageId: identity.pageId,
         expectedRevision,
-        expectedUid: identity.uid
+        expectedUid: identity.uid,
+        clientInstanceId: identity.clientInstanceId,
+        editorTabId: identity.editorTabId,
+        writerSessionId: identity.writerSessionId,
+        clientMutationId: identity.clientMutationId,
+        mutationCreatedAt: identity.mutationCreatedAt,
+        baseRevision: identity.baseRevision
       }, content);
-      if (!isActive()) return result;
-      if (page) {
+      // A successful older generation must still advance the page baseline;
+      // otherwise the next queued generation reuses a stale revision and
+      // conflicts with its own predecessor.
+      if (page && result.revision >= Number(page.contentRevision || 0)) {
         page.contentRevision = result.revision;
         page.contentPath = result.contentPath;
         page.contentHash = result.contentHash;
+        page.lastClientMutationId = identity.clientMutationId;
       }
       content.revision = result.revision;
+      if (!isActive()) return result;
       if (currentNote?.id === identity.noteId) {
         if (pages[currentPageIndex]?.pageId === identity.pageId && currentContent) {
           currentContent.revision = result.revision;
@@ -239,7 +490,7 @@ export function createStudyNotes(dependencies) {
       }
       return result;
     },
-    onStatus: (status, identity, detail) => {
+    onStatus: (status, identity, detail, conflictRecord) => {
       if (!currentNote || identity.noteId !== currentNote.id || identity.pageId !== pages[currentPageIndex]?.pageId) return;
       const labels = {
         editing: "編集中", "local-saved": "端末内へ保存済み", saving: "クラウドへ保存中",
@@ -248,19 +499,48 @@ export function createStudyNotes(dependencies) {
       ui.saveStatus.textContent = labels[status] || status;
       ui.saveStatus.dataset.state = status;
       ui.retrySave.classList.toggle("hidden", !["error", "offline"].includes(status));
-      if (status === "conflict") currentNote.hasConflict = true;
+      if (status === "conflict") {
+        currentNote.hasConflict = true;
+        conflictPageIds.add(identity.pageId);
+        ui.backgroundBtn.disabled = pages[currentPageIndex]?.pageId === identity.pageId;
+        ui.conflictBanner.classList.toggle("hidden", pages[currentPageIndex]?.pageId !== identity.pageId);
+        renderPageList();
+        const applyConflict = conflict => {
+          if (!conflict || currentNote?.id !== identity.noteId) return;
+          currentNote.conflicts = [
+            ...(currentNote.conflicts || []).filter(item => item.key !== conflict.key),
+            conflict
+          ];
+        };
+        if (conflictRecord) applyConflict(conflictRecord);
+        else void loadConflictRecord(identity.noteId, identity.pageId, identity.uid)
+          .then(applyConflict)
+          .catch(error => console.error("競合情報を画面へ反映できませんでした。", error));
+      }
       if (detail instanceof Error) console.error(detail);
     }
   });
 
   function identity(page = pages[currentPageIndex]) {
+    const editorIdentity = editorLease?.getIdentity?.() || {};
     return {
       uid: getCurrentUser()?.uid,
       noteId: currentNote?.id,
       pageId: page?.pageId,
       expectedRevision: Number(page?.contentRevision || 0),
-      sessionGeneration: userSessionGeneration
+      sessionGeneration: userSessionGeneration,
+      clientInstanceId,
+      editorTabId,
+      writerSessionId: editorIdentity.writerSessionId || ""
     };
+  }
+
+  async function loadConflictRecord(noteId, pageId, uid = getCurrentUser()?.uid) {
+    if (!uid || !noteId || !pageId) return null;
+    const conflict = await localStore.get("conflicts", noteLocalKey(uid, noteId, pageId));
+    return conflict?.uid === uid && conflict.noteId === noteId && conflict.pageId === pageId
+      ? conflict
+      : null;
   }
 
   async function queueCleanupRecord({ uid = getCurrentUser()?.uid, noteId = "", path, kind = "storage", error }) {
@@ -313,6 +593,7 @@ export function createStudyNotes(dependencies) {
   }
 
   async function flushWithDecision(page = pages[currentPageIndex], actionLabel = "操作") {
+    if (!isEditableNow(page)) return true;
     while (true) {
       try {
         await saveCoordinator.flush(identity(page));
@@ -350,6 +631,14 @@ export function createStudyNotes(dependencies) {
     objectUrls = [];
   }
 
+  function resetPageRender() {
+    renderToken += 1;
+    backgroundRenderToken += 1;
+    renderedBackgroundSignature = "";
+    releaseObjectUrls();
+    ui.stage.replaceChildren();
+  }
+
   function show(view) {
     ui.listView.classList.toggle("hidden", view !== "list");
     ui.createView.classList.toggle("hidden", view !== "create");
@@ -363,6 +652,7 @@ export function createStudyNotes(dependencies) {
   async function refreshNotes() {
     const session = captureUserSession();
     if (!session) return;
+    initializeEditorPreferences(session);
     setListStatus("ノートを読み込んでいます...");
     try {
       const loadedNotes = await noteStore.listNotes({ expectedUid: session.uid });
@@ -400,9 +690,15 @@ export function createStudyNotes(dependencies) {
       setListStatus(notes.length
         ? `${notes.length}件のノートがあります。${unsyncedCount ? ` 端末内に未同期の変更が${unsyncedCount}ページあります。` : ""}${orphanedDrafts.length ? ` 一覧にないノートの下書きが${orphanedDrafts.length}件あります。` : ""}`
         : orphanedDrafts.length ? `一覧にないノートの下書きが${orphanedDrafts.length}件あります。復元できます。` : "ノートはまだありません。");
-      void recoverAllPendingWork(session).catch(error => {
-        if (error?.name !== "NoteSessionChangedError") console.warn("未送信ノートの自動再送を継続できませんでした。", error);
-      });
+      if (dedicatedEditor && !routeOpened) {
+        routeOpened = true;
+        await openNote(dedicatedEditorNoteId, { study: routeParams.get("study") === "1", inline: true });
+      }
+      if (!readOnlyEditor || !dedicatedEditor) {
+        void recoverAllPendingWork(session).catch(error => {
+          if (error?.name !== "NoteSessionChangedError") console.warn("未送信ノートの自動再送を継続できませんでした。", error);
+        });
+      }
     } catch (error) {
       if (error?.name === "NoteSessionChangedError") return;
       console.error(error);
@@ -428,7 +724,19 @@ export function createStudyNotes(dependencies) {
       const restore = document.createElement("button");
       restore.type = "button";
       restore.textContent = "新規ノートとして復元";
-      restore.addEventListener("click", () => restoreOrphanedDrafts(group).catch(reportError));
+      restore.addEventListener("click", () => {
+        let reservedWindow;
+        try { reservedWindow = reserveEditorTab(); }
+        catch (error) { reportError(error); return; }
+        if (!confirm(`${group.items.length}ページ分の端末内下書きを、新しいノートとして復元しますか？`)) {
+          reservedWindow.close?.();
+          return;
+        }
+        restoreOrphanedDrafts(group, reservedWindow).catch(error => {
+          reservedWindow?.close?.();
+          reportError(error);
+        });
+      });
       actions.append(restore);
       card.append(title, meta, actions);
       ui.list.append(card);
@@ -450,8 +758,8 @@ export function createStudyNotes(dependencies) {
       meta.textContent = `${noteTypeLabel(note)} / ${note.pageCount || 0}ページ / ノートマスク ${note.noteMaskCount || 0}件${note.type === "material-linked" ? ` / 教材マスク ${materialMaskCount}件` : ""} / 最終編集 ${updatedLabel} / ${saveState}${note.pendingSaveCount ? ` / 下書き再送待ち ${note.pendingSaveCount}件` : ""}${note.pendingAssetCount ? ` / 画像再送待ち ${note.pendingAssetCount}件` : ""}`;
       const actions = document.createElement("div"); actions.className = "note-card-actions";
       [
-        ["編集", () => openNote(note.id)],
-        ["暗記", () => openNote(note.id, { study: true })],
+        ["編集", () => openEditorTab(note.id)],
+        ["暗記", () => openEditorTab(note.id, { study: true })],
         ["PDF", () => openExportFromList(note.id)],
         ["名前変更", () => renameNote(note)],
         ["複製", () => duplicateNote(note.id)],
@@ -462,6 +770,13 @@ export function createStudyNotes(dependencies) {
         button.addEventListener("click", () => Promise.resolve(action()).catch(reportError)); actions.append(button);
       });
       card.append(preview, title, meta, actions); ui.list.append(card);
+      preview.tabIndex = 0;
+      preview.setAttribute("role", "button");
+      preview.setAttribute("aria-label", `${note.title || "無題ノート"}を編集`);
+      preview.addEventListener("click", () => openEditorTab(note.id));
+      preview.addEventListener("keydown", event => {
+        if (["Enter", " "].includes(event.key)) { event.preventDefault(); openEditorTab(note.id); }
+      });
       void hydrateNoteCardThumbnail(note, preview).catch(error => {
         preview.classList.remove("loading");
         preview.classList.add("fallback");
@@ -574,7 +889,7 @@ export function createStudyNotes(dependencies) {
     }
   }
 
-  async function createStandalone(kind) {
+  async function createStandalone(kind, reservedWindow = null) {
     const session = captureUserSession();
     assertUserSession(session);
     const title = ui.newTitle.value.trim() || "新しい学習ノート";
@@ -585,7 +900,7 @@ export function createStudyNotes(dependencies) {
     assertUserSession(session);
     await refreshNotes();
     assertUserSession(session);
-    await openNote(noteId);
+    openEditorTab(noteId, {}, reservedWindow);
   }
 
   function renderMaterialPicker() {
@@ -599,13 +914,19 @@ export function createStudyNotes(dependencies) {
       const archiving = isMaterialArchiving(material);
       button.textContent = `${material.title || "無題教材"}（${material.pages?.length || 0}枚）${archiving ? " — 差し替え・削除処理中" : ""}`;
       button.disabled = archiving;
-      button.addEventListener("click", () => openMaterialNote(material.id).catch(reportError));
+      button.addEventListener("click", () => {
+        let reservedWindow;
+        try { reservedWindow = reserveEditorTab(); }
+        catch (error) { reportError(error); return; }
+        openMaterialNote(material.id, reservedWindow).catch(error => { reservedWindow.close?.(); reportError(error); });
+      });
       ui.materialPicker.append(button);
     });
     ui.materialPicker.classList.remove("hidden");
   }
 
-  async function openMaterialNote(materialId) {
+  async function openMaterialNote(materialId, reservedWindow = null) {
+    if (!reservedWindow && !dedicatedEditor) reservedWindow = reserveEditorTab();
     const session = captureUserSession();
     assertUserSession(session);
     const material = getMaterials().find(item => item.id === materialId);
@@ -674,10 +995,10 @@ export function createStudyNotes(dependencies) {
       await refreshNotes();
     }
     activateSection("note");
-    await openNote(note.id);
+    openEditorTab(note.id, {}, reservedWindow);
   }
 
-  async function createPdfNote(file) {
+  async function createPdfNote(file, reservedWindow = null) {
     if (!file) return;
     const session = captureUserSession();
     assertUserSession(session);
@@ -714,7 +1035,7 @@ export function createStudyNotes(dependencies) {
       await noteStore.finalizeCreatingNote(noteId, notePages, session.uid);
       assertUserSession(session);
       await refreshNotes();
-      await openNote(noteId);
+      openEditorTab(noteId, {}, reservedWindow);
     } catch (error) {
       await compensateCreationFailure(noteId, {
         pageIds: notePages.map(page => page.pageId),
@@ -722,6 +1043,7 @@ export function createStudyNotes(dependencies) {
         phase: error?.name === "AbortError" ? "cancelled" : "pdf-import",
         expectedUid: session.uid
       }, error);
+      reservedWindow?.close?.();
       if (error?.name !== "AbortError") throw new Error(`PDFノートは作成されていません。${error.message || error}`);
       setListStatus("PDFノートの作成をキャンセルしました。");
     } finally {
@@ -747,7 +1069,11 @@ export function createStudyNotes(dependencies) {
     return content;
   }
 
-  async function openNote(noteId, { study = false } = {}) {
+  async function openNote(noteId, { study = false, inline = false } = {}) {
+    if (!dedicatedEditor && !inline) {
+      openEditorTab(noteId, { study });
+      return;
+    }
     const session = captureUserSession();
     assertUserSession(session);
     if (currentNote && !await flushWithDecision(pages[currentPageIndex], "別のノートを開く操作")) return;
@@ -758,17 +1084,21 @@ export function createStudyNotes(dependencies) {
     pages = await noteStore.listPages(noteId, { expectedUid: session.uid });
     assertUserSession(session);
     if (!pages.length) throw new Error("ノートにページがありません。");
+    await establishEditorLease(noteId, session);
     currentPageIndex = 0;
-    ui.pageSidebar.classList.remove("open");
-    ui.pagesButton.setAttribute("aria-expanded", "false");
+    applyToolSettingsToUi();
     contentCache = new Map(); assetCache = new Map(); selectedIds = []; revealedMaskIds = new Set();
-    await recoverPendingAssets(noteId);
-    await recoverPendingSaves(noteId, pages);
+    if (!readOnlyEditor) {
+      await recoverPendingAssets(noteId);
+      await recoverPendingSaves(noteId, pages);
+    }
     pages = await noteStore.listPages(noteId, { expectedUid: session.uid });
     assertUserSession(session);
     const localConflicts = await localStore.listForUser("conflicts", session.uid);
     assertUserSession(session);
-    currentNote.hasConflict = localConflicts.some(conflict => conflict.noteId === noteId);
+    conflictPageIds = new Set(localConflicts.filter(conflict => conflict.noteId === noteId).map(conflict => conflict.pageId));
+    currentNote.conflicts = localConflicts.filter(conflict => conflict.noteId === noteId);
+    currentNote.hasConflict = conflictPageIds.size > 0;
     history.clear();
     ui.title.value = currentNote.title || "無題ノート";
     show("editor");
@@ -792,6 +1122,7 @@ export function createStudyNotes(dependencies) {
       ui.saveStatus.textContent = "競合あり";
       ui.saveStatus.dataset.state = "conflict";
     }
+    ui.conflictBanner.classList.toggle("hidden", !conflictPageIds.has(pages[currentPageIndex]?.pageId));
     setStudyMode(study);
   }
 
@@ -800,6 +1131,7 @@ export function createStudyNotes(dependencies) {
     if (!page) return;
     selectedIds = [];
     currentContent = await pageContent(page);
+    ui.conflictBanner.classList.toggle("hidden", !conflictPageIds.has(page.pageId));
     renderPageList();
     renderPage();
   }
@@ -817,6 +1149,7 @@ export function createStudyNotes(dependencies) {
       const actions = document.createElement("div"); actions.className = "note-page-row-actions";
       [["↑", "up"], ["↓", "down"], ["複製", "duplicate"], ["削除", "delete"]].forEach(([label, action]) => {
         const button = document.createElement("button"); button.type = "button"; button.textContent = label; button.title = `${index + 1}ページ ${label}`;
+        button.disabled = readOnlyEditor || !hasWriterOwnership() || conflictPageIds.has(page.pageId);
         button.addEventListener("click", () => pageAction(action, index).catch(reportError)); actions.append(button);
       });
       item.append(open, actions); ui.pageList.append(item);
@@ -924,8 +1257,6 @@ export function createStudyNotes(dependencies) {
     currentPageIndex = index;
     history.clear();
     await loadCurrentPage();
-    ui.pageSidebar.classList.remove("open");
-    ui.pagesButton.setAttribute("aria-expanded", "false");
   }
 
   function currentMaterial() {
@@ -959,13 +1290,25 @@ export function createStudyNotes(dependencies) {
     assertUserSession(session);
     const key = `${sourceNoteId}|${assetId}`;
     if (assetCache.has(key)) return assetCache.get(key);
-    const metadata = await noteStore.getAsset(sourceNoteId, assetId, { expectedUid: session.uid });
+    try {
+      const metadata = await noteStore.getAsset(sourceNoteId, assetId, { expectedUid: session.uid });
+      assertUserSession(session);
+      if (metadata?.storagePath) {
+        const blob = await noteStore.getStorageBlob(metadata.storagePath, { expectedUid: session.uid });
+        assertUserSession(session);
+        assetCache.set(key, blob);
+        return blob;
+      }
+    } catch (error) {
+      if (error?.name === "NoteSessionChangedError") throw error;
+    }
+    const pending = (await localStore.listForUser("pendingAssets", session.uid))
+      .filter(item => item.noteId === sourceNoteId && item.assetId === assetId && item.blob instanceof Blob && item.blob.size > 0)
+      .sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))[0];
     assertUserSession(session);
-    if (!metadata?.storagePath) throw new Error(`貼り付け画像 ${assetId} を取得できません。`);
-    const blob = await noteStore.getStorageBlob(metadata.storagePath, { expectedUid: session.uid });
-    assertUserSession(session);
-    assetCache.set(key, blob);
-    return blob;
+    if (!pending) throw new Error(`貼り付け画像 ${assetId} をクラウドまたは端末内下書きから取得できません。`);
+    assetCache.set(key, pending.blob);
+    return pending.blob;
   }
 
   async function recoverPendingAssets(noteId, session = captureUserSession()) {
@@ -1011,38 +1354,78 @@ export function createStudyNotes(dependencies) {
   async function persistRecoveredDraft({ noteId, page, draft, pending, key, expectedRevision, session }) {
     assertUserSession(session);
     const cloudRevision = Number(page.contentRevision || 0);
+    const mutationId = pending?.mutationId || draft?.mutationId || stableLegacyMutationId(
+      `${key}|${pending?.updatedAt || pending?.createdAt || draft?.updatedAt || draft?.createdAt || expectedRevision}`
+    );
+    if (cloudRevision === expectedRevision + 1 && page.lastClientMutationId === mutationId) {
+      const restored = normalizeNoteLineElements(draft.content, page.size);
+      restored.revision = cloudRevision;
+      if (currentNote?.id === noteId) contentCache.set(page.pageId, restored);
+      await localStore.deleteSavePairIfUnchanged(key, { draft, pending });
+      return {
+        revision: cloudRevision,
+        contentPath: page.contentPath,
+        contentHash: page.contentHash,
+        idempotent: true
+      };
+    }
     if (cloudRevision !== expectedRevision) {
       throw new NoteConflictError("別の端末でこのページが更新されています。", cloudRevision);
     }
     const normalizedContent = normalizeNoteLineElements(draft.content, page.size);
-    const saved = await noteStore.savePageContent({
+    const mutationCreatedAt = pending?.updatedAt || pending?.createdAt || draft?.updatedAt || draft?.createdAt || "";
+    const saved = await saveCoordinator.recover({
+      uid: session.uid,
       noteId,
       pageId: page.pageId,
       expectedRevision,
-      expectedUid: session.uid
-    }, normalizedContent);
+      sessionGeneration: session.generation,
+      clientInstanceId: pending?.clientInstanceId || draft?.clientInstanceId || clientInstanceId,
+      editorTabId: pending?.editorTabId || draft?.editorTabId || "",
+      writerSessionId: pending?.writerSessionId || draft?.writerSessionId || ""
+    }, normalizedContent, { mutationId, updatedAt: mutationCreatedAt });
     assertUserSession(session);
-    Object.assign(page, {
-      contentRevision: saved.revision,
-      contentPath: saved.contentPath,
-      contentHash: saved.contentHash
-    });
-    const restored = { ...normalizedContent, revision: saved.revision };
-    if (currentNote?.id === noteId) contentCache.set(page.pageId, restored);
+    if (saved?.skipped) return saved;
+    // Older local drafts did not carry a mutationId. The coordinator cannot
+    // compare-delete those records by its generated mutation, so remove the
+    // exact records we just recovered. A newer draft is preserved by the
+    // compare-and-delete guard.
     await localStore.deleteSavePairIfUnchanged(key, { draft, pending });
     assertUserSession(session);
+    if (saved.revision >= Number(page.contentRevision || 0)) {
+      Object.assign(page, {
+        contentRevision: saved.revision,
+        contentPath: saved.contentPath,
+        contentHash: saved.contentHash,
+        lastClientMutationId: mutationId
+      });
+    }
+    const restored = { ...normalizedContent, revision: saved.revision };
+    if (currentNote?.id === noteId) contentCache.set(page.pageId, restored);
     return saved;
   }
 
   async function recordRecoveredDraftFailure({ error, uid, noteId, pageId, draft, key }) {
     if (error?.name !== "NoteConflictError") return;
-    await localStore.put("conflicts", {
+    const conflict = {
       key, uid, noteId, pageId,
       expectedRevision: Number(draft.expectedRevision ?? draft.content?.revision),
+      clientInstanceId: draft.clientInstanceId || "",
+      editorTabId: draft.editorTabId || "",
+      writerSessionId: draft.writerSessionId || "",
+      clientMutationId: draft.mutationId || "",
       content: clone(draft.content), error: error.message,
       updatedAt: new Date().toISOString()
-    });
-    if (currentNote?.id === noteId) currentNote.hasConflict = true;
+    };
+    await localStore.put("conflicts", conflict);
+    if (currentNote?.id === noteId) {
+      currentNote.hasConflict = true;
+      conflictPageIds.add(pageId);
+      currentNote.conflicts = [
+        ...(currentNote.conflicts || []).filter(item => item.key !== key),
+        conflict
+      ];
+    }
   }
 
   async function recoverPendingSaves(noteId, notePages = pages, session = captureUserSession()) {
@@ -1338,36 +1721,56 @@ export function createStudyNotes(dependencies) {
     ui.stage.append(overlay);
   }
 
+  function clearInteractiveLayers() {
+    const selectors = [".note-elements-layer", '[data-layer="masks"]', "[data-selection-overlay]", "[data-crop-overlay]", "[data-note-draft]"];
+    ui.stage.querySelectorAll(selectors.join(",")).forEach(node => {
+      node.querySelectorAll?.("img[data-note-object-url]").forEach(image => {
+        URL.revokeObjectURL(image.dataset.noteObjectUrl);
+        objectUrls = objectUrls.filter(url => url !== image.dataset.noteObjectUrl);
+      });
+      node.remove();
+    });
+  }
+
   async function renderPage() {
     if (!currentContent || !pages[currentPageIndex]) return;
     const token = ++renderToken;
-    releaseObjectUrls();
-    ui.stage.replaceChildren();
     const page = pages[currentPageIndex];
-    ui.stage.style.aspectRatio = `${page.size?.width || A4_SIZE.width} / ${page.size?.height || A4_SIZE.height}`;
-    ui.stage.classList.toggle("study-mode", studyMode);
+    const backgroundSignature = createNoteBackgroundSignature(page, currentNote?.id);
+    const keepBackground = renderedBackgroundSignature === backgroundSignature &&
+      Boolean(ui.stage.querySelector(".note-paper-layer"));
+    if (keepBackground) clearInteractiveLayers();
+    else {
+      const backgroundToken = ++backgroundRenderToken;
+      renderedBackgroundSignature = backgroundSignature;
+      releaseObjectUrls();
+      ui.stage.replaceChildren();
+      const paper = document.createElement("div");
+      paper.className = `note-layer note-paper-layer ${page.background?.type === "ruled" ? "ruled" : ""}`;
+      paper.style.setProperty("--paper-color", page.background?.paperColor || "#fff");
+      paper.style.setProperty("--rule-spacing", `${Number(page.background?.ruleSpacingRatio || .035) * 100}%`);
+      paper.style.setProperty("--rule-color", page.background?.ruleColor || "#d9dee7");
+      paper.style.setProperty("--rule-opacity", String(page.background?.ruleOpacity ?? .7));
+      paper.style.setProperty("--rule-width", `${Math.max(1, Number(page.background?.ruleWidthRatio || .001) * 1000)}px`);
+      ui.stage.append(paper);
 
-    const paper = document.createElement("div");
-    paper.className = `note-layer note-paper-layer ${page.background?.type === "ruled" ? "ruled" : ""}`;
-    paper.style.setProperty("--paper-color", page.background?.paperColor || "#fff");
-    paper.style.setProperty("--rule-spacing", `${Number(page.background?.ruleSpacingRatio || .035) * 100}%`);
-    paper.style.setProperty("--rule-color", page.background?.ruleColor || "#d9dee7");
-    paper.style.setProperty("--rule-opacity", String(page.background?.ruleOpacity ?? .7));
-    paper.style.setProperty("--rule-width", `${Math.max(1, Number(page.background?.ruleWidthRatio || .001) * 1000)}px`);
-    ui.stage.append(paper);
-
-    if (["pdf-source-page", "material-page"].includes(page.background?.type)) {
-      try {
-        const blob = await resolveBackgroundBlob(page);
-        if (token !== renderToken) return;
-        const url = URL.createObjectURL(blob); objectUrls.push(url);
-        const image = document.createElement("img"); image.className = "note-background-image"; image.alt = "ノート背景"; image.src = url;
-        ui.stage.append(image);
-      } catch (error) {
-        const message = document.createElement("div"); message.className = "note-layer"; message.textContent = `背景画像を表示できません: ${error.message}`;
-        ui.stage.append(message);
+      if (["pdf-source-page", "material-page"].includes(page.background?.type)) {
+        try {
+          const blob = await resolveBackgroundBlob(page);
+          if (backgroundToken !== backgroundRenderToken || backgroundSignature !== renderedBackgroundSignature) return;
+          const url = URL.createObjectURL(blob); objectUrls.push(url);
+          const image = document.createElement("img"); image.className = "note-background-image"; image.alt = "ノート背景"; image.src = url;
+          ui.stage.append(image);
+        } catch (error) {
+          if (backgroundToken !== backgroundRenderToken || backgroundSignature !== renderedBackgroundSignature) return;
+          const message = document.createElement("div"); message.className = "note-layer note-background-error"; message.textContent = `背景画像を表示できません: ${error.message}`;
+          ui.stage.append(message);
+        }
       }
     }
+    if (token !== renderToken) return;
+    ui.stage.style.aspectRatio = `${page.size?.width || A4_SIZE.width} / ${page.size?.height || A4_SIZE.height}`;
+    ui.stage.classList.toggle("study-mode", studyMode);
 
     const elementLayer = document.createElement("div");
     elementLayer.className = "note-layer note-elements-layer";
@@ -1387,7 +1790,7 @@ export function createStudyNotes(dependencies) {
         image.style.left = `${-crop.x / crop.width * 100}%`; image.style.top = `${-crop.y / crop.height * 100}%`;
         resolveAssetBlob(element.assetId, element.assetNoteId || currentNote.id).then(blob => {
           if (token !== renderToken) return;
-          const url = URL.createObjectURL(blob); objectUrls.push(url); image.src = url;
+          const url = URL.createObjectURL(blob); objectUrls.push(url); image.src = url; image.dataset.noteObjectUrl = url;
         }).catch(error => { wrap.title = error.message; });
         wrap.append(image); elementLayer.append(wrap);
         continue;
@@ -1452,13 +1855,24 @@ export function createStudyNotes(dependencies) {
       button.title = maskRotationDisabled ? "マスクを含む選択範囲は回転できません" : "";
     });
     ui.undo.disabled = !history.canUndo(); ui.redo.disabled = !history.canRedo();
+    ui.backgroundBtn.disabled = readOnlyEditor || !hasWriterOwnership() || conflictPageIds.has(page.pageId);
     ui.pageCounter.textContent = `${currentPageIndex + 1} / ${pages.length}`;
     ui.maskCounts.textContent = `教材 ${materialMasks.length} / ノート ${currentContent.noteMasks.length}`;
     syncSelectedTextControls();
-    if (!zoomController) zoomController = createPageZoomController({ viewport: ui.viewport, content: ui.stage });
+    if (!zoomController) zoomController = createPageZoomController({
+      viewport: ui.viewport,
+      content: ui.stage,
+      shouldTrackTouch: event => !inputGuard.isPenActive() && !inputGuard.isPalmCandidate(event)
+    });
   }
 
   function commitChange(before, label) {
+    if (!isEditableNow()) {
+      currentContent = clone(before);
+      renderPage();
+      explainBlockedEdit();
+      return;
+    }
     const after = clone(currentContent);
     if (!history.push(historySnapshot(before), historySnapshot(after), label)) return;
     contentCache.set(pages[currentPageIndex].pageId, clone(after));
@@ -1480,7 +1894,7 @@ export function createStudyNotes(dependencies) {
   }
 
   async function applyHistorySnapshot(snapshot) {
-    if (!snapshot?.content) return;
+    if (!snapshot?.content || !isEditableNow()) { explainBlockedEdit(); return; }
     const session = captureUserSession();
     assertUserSession(session);
     const metadataUpdates = [];
@@ -1512,11 +1926,14 @@ export function createStudyNotes(dependencies) {
 
   function setTool(tool) {
     if (tool === "eraser-object") tool = ui.eraserMode.value === "pixel" ? "eraser-pixel" : "eraser-object";
-    currentTool = TOOL_LABELS[tool] ? tool : "pen";
+    const nextTool = TOOL_LABELS[tool] ? tool : "pen";
+    if (nextTool !== currentTool) previousTool = currentTool;
+    currentTool = nextTool;
     [...ui.toolbar.querySelectorAll("[data-note-tool]")].forEach(button => button.classList.toggle("active", button.dataset.noteTool === tool || (button.dataset.noteTool === "eraser-object" && tool === "eraser-pixel")));
     ui.stage.dataset.tool = currentTool;
     ui.stage.setAttribute("aria-label", `編集ページ: ${TOOL_LABELS[currentTool]}`);
     selectedIds = currentTool === "mask" ? selectedIds.filter(id => currentContent.noteMasks.some(mask => mask.id === id)) : selectedIds.filter(id => currentContent.elements.some(element => element.id === id));
+    applyToolSettingsToUi();
     renderPage();
     if (tool === "image") showImageMenu();
   }
@@ -1572,7 +1989,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function eraseObjectsAt(point, gesture) {
-    const radius = Number(ui.width.value) / 1000 * 2.5;
+    const radius = Number(toolSettings.eraserSize) / 1000 * 2.5;
     const beforeCount = currentContent.elements.length;
     currentContent.elements = currentContent.elements.filter(element => !objectEraserHit(element, point, radius));
     if (currentContent.elements.length !== beforeCount) {
@@ -1581,12 +1998,50 @@ export function createStudyNotes(dependencies) {
     }
   }
 
+  function clearStraightenTimer(gesture) {
+    if (gesture?.straightenTimer) clearTimeout(gesture.straightenTimer);
+    if (gesture) gesture.straightenTimer = null;
+  }
+
+  function armStraightenTimer(gesture, event) {
+    if (!gesture || !["pen", "highlighter"].includes(gesture.type) || !toolSettings.straightenEnabled) return;
+    const nextClient = { x: event.clientX, y: event.clientY };
+    if (!gesture.holdClient || Math.hypot(nextClient.x - gesture.holdClient.x, nextClient.y - gesture.holdClient.y) > NOTE_STRAIGHTEN_MOVE_PX) {
+      gesture.holdClient = nextClient;
+      gesture.holdStartedAt = performance.now();
+      clearStraightenTimer(gesture);
+      gesture.straightenTimer = setTimeout(() => {
+        if (activeGesture !== gesture || gesture.straightened) return;
+        const points = clone(gesture.points);
+        if (!canStraightenStroke({
+          points,
+          elapsedMs: performance.now() - gesture.holdStartedAt,
+          movementPx: 0,
+          enabled: toolSettings.straightenEnabled
+        })) return;
+        gesture.freehandPoints = points;
+        gesture.straightened = true;
+        gesture.points = straightenedPoints(points);
+        drawDraftPath(gesture.points, gesture.type);
+      }, NOTE_STRAIGHTEN_HOLD_MS);
+    }
+  }
+
   function beginPointer(event) {
     if (!currentContent || event.button > 0) return;
     if (event.target?.closest?.("[data-crop-action]")) return;
+    if (!studyMode && !isEditableNow()) { explainBlockedEdit(); return; }
+    inputGuard.notePointerDown(event);
+    const touchCount = event.pointerType === "touch" ? activeTouchPointerIds.size : 0;
+    if (event.pointerType === "touch" && (pageZoomGestureActive || zoomController?.isPinchGestureActive || touchCount >= 2)) {
+      event.preventDefault();
+      return;
+    }
+    if (event.pointerType === "touch" && inputGuard.isPalmCandidate(event)) return;
     if (event.pointerType === "pen") {
       hasSeenPen = true;
       ui.fingerDraw.checked = false;
+      if (!toolSettings.pencilMode) persistToolSettings({ pencilMode: true });
     }
     const point = gesturePoint(event);
     lastTap = point;
@@ -1639,7 +2094,8 @@ export function createStudyNotes(dependencies) {
       event.preventDefault();
       return;
     }
-    const drawWithTouch = event.pointerType !== "touch" || ui.fingerDraw.checked || !hasSeenPen;
+    const guardedTouch = inputGuard.shouldIgnoreTouch(event, { pencilMode: toolSettings.pencilMode, touchCount });
+    const drawWithTouch = event.pointerType !== "touch" || (!guardedTouch && (ui.fingerDraw.checked || !hasSeenPen));
     if (["pen", "highlighter", "shape", "text", "mask", "eraser-object", "eraser-pixel"].includes(currentTool) && !drawWithTouch) {
       activeGesture = { type: "pan", pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
     } else if (currentTool === "pan") {
@@ -1665,11 +2121,12 @@ export function createStudyNotes(dependencies) {
       renderPage();
     } else {
       activeGesture = { type: currentTool === "select" ? "lasso" : currentTool, pointerId: event.pointerId, start: point, points: [{ ...point, pressure: Number(event.pressure || .5) }], end: point, additive: event.shiftKey, before: clone(currentContent) };
-      if (currentTool === "eraser-pixel") activeGesture.radius = Number(ui.width.value) / 1000 * 2.5;
+      if (currentTool === "eraser-pixel") activeGesture.radius = Number(toolSettings.eraserSize) / 1000 * 2.5;
       if (currentTool === "select") drawLasso([point]);
       else if (currentTool === "text") drawSelectionRect(point, point);
     }
     if (event.isTrusted) ui.stage.setPointerCapture?.(event.pointerId);
+    armStraightenTimer(activeGesture, event);
     event.preventDefault();
   }
 
@@ -1718,9 +2175,14 @@ export function createStudyNotes(dependencies) {
       cropSession.draft = { crop: clone(image.crop), bounds: clone(image.bounds) };
       renderPage();
     } else if (["pen", "highlighter", "eraser-pixel"].includes(activeGesture.type)) {
-      const coalesced = event.getCoalescedEvents?.();
-      const events = coalesced?.length ? coalesced : [event];
-      events.forEach(item => activeGesture.points.push({ ...gesturePoint(item), pressure: Number(item.pressure || .5) }));
+      if (activeGesture.straightened) {
+        activeGesture.points = straightenedPoints(activeGesture.freehandPoints, point);
+      } else {
+        const coalesced = event.getCoalescedEvents?.();
+        const events = coalesced?.length ? coalesced : [event];
+        events.forEach(item => activeGesture.points.push({ ...gesturePoint(item), pressure: Number(item.pressure || .5) }));
+        armStraightenTimer(activeGesture, event);
+      }
       drawDraftPath(activeGesture.points, activeGesture.type);
     } else if (activeGesture.type === "eraser-object") {
       eraseObjectsAt(point, activeGesture);
@@ -1750,8 +2212,10 @@ export function createStudyNotes(dependencies) {
   }
 
   function endPointer(event) {
+    inputGuard.notePointerEnd(event);
     if (!activeGesture || activeGesture.pointerId !== event.pointerId) return;
     const gesture = activeGesture;
+    clearStraightenTimer(gesture);
     activeGesture = null;
     ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
     if (event.type === "pointercancel") {
@@ -1778,11 +2242,12 @@ export function createStudyNotes(dependencies) {
       const isHighlighter = gesture.type === "highlighter";
       currentContent.elements.push({
         id: randomId(), type: isHighlighter ? "highlighter" : "stroke", points: gesture.points,
-        pressureEnabled: !isHighlighter,
+        pressureEnabled: false,
+        straightened: gesture.straightened === true,
         style: {
-          color: ui.color.value,
-          widthRatio: Number(ui.width.value) / 10000 * (isHighlighter ? 10 : 1),
-          opacity: isHighlighter ? Math.min(.35, Number(ui.opacity.value) / 100) : Number(ui.opacity.value) / 100
+          color: isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor,
+          widthRatio: Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10000 * (isHighlighter ? 10 : 1),
+          opacity: Number(isHighlighter ? toolSettings.highlighterOpacity : toolSettings.penOpacity) / 100
         },
         zIndex: elementZIndex(currentContent.elements), createdAt: new Date().toISOString()
       });
@@ -1826,10 +2291,11 @@ export function createStudyNotes(dependencies) {
     ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
     const svg = createSvgElement("svg", { viewBox: "0 0 1000 1414", preserveAspectRatio: "none", class: "note-layer", "data-note-draft": "true" });
     svg.style.zIndex = "30";
+    const isHighlighter = type === "highlighter";
     svg.append(createSvgElement("path", {
-      d: pathData(points), class: "note-draft-path", stroke: ui.color.value,
-      "stroke-width": Math.max(1, Number(ui.width.value) / 10 * (type === "highlighter" ? 10 : 1)),
-      "stroke-opacity": type === "highlighter" ? .3 : Number(ui.opacity.value) / 100
+      d: pathData(points), class: "note-draft-path", stroke: isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor,
+      "stroke-width": Math.max(1, Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10 * (isHighlighter ? 10 : 1)),
+      "stroke-opacity": Number(isHighlighter ? toolSettings.highlighterOpacity : toolSettings.penOpacity) / 100
     }));
     ui.stage.append(svg);
   }
@@ -1885,6 +2351,7 @@ export function createStudyNotes(dependencies) {
   }
 
   async function pasteFromClipboard() {
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
     const blob = await readClipboardImage();
     await addImageBlob(blob);
   }
@@ -1911,7 +2378,7 @@ export function createStudyNotes(dependencies) {
   }
 
   async function addImageBlob(inputBlob) {
-    if (!currentNote || !currentContent) return;
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
     const session = captureUserSession();
     assertUserSession(session);
     const initialContext = {
@@ -1924,6 +2391,7 @@ export function createStudyNotes(dependencies) {
     const prepared = await prepareImage(inputBlob);
     assertUserSession(session);
     if (
+      !isEditableNow(initialContext.page) ||
       getCurrentUser()?.uid !== initialContext.uid ||
       currentNote?.id !== initialContext.noteId ||
       pages[currentPageIndex]?.pageId !== initialContext.page?.pageId ||
@@ -1957,9 +2425,20 @@ export function createStudyNotes(dependencies) {
     const draftKey = noteLocalKey(target.uid, target.noteId, target.pageId);
     const draftUpdatedAt = new Date().toISOString();
     const mutationId = randomId();
+    const editorIdentity = editorLease?.getIdentity?.() || {};
+    const saveIdentity = {
+      uid: target.uid,
+      noteId: target.noteId,
+      pageId: target.pageId,
+      expectedRevision: target.expectedRevision,
+      sessionGeneration: session.generation,
+      clientInstanceId,
+      editorTabId,
+      writerSessionId: editorIdentity.writerSessionId || ""
+    };
     await localStore.putSavePair(
-      { key: draftKey, uid: target.uid, noteId: target.noteId, pageId: target.pageId, expectedRevision: target.expectedRevision, content: clone(target.content), mutationId, updatedAt: draftUpdatedAt },
-      { key: draftKey, uid: target.uid, noteId: target.noteId, pageId: target.pageId, expectedRevision: target.expectedRevision, mutationId, updatedAt: draftUpdatedAt }
+      { key: draftKey, ...saveIdentity, content: clone(target.content), mutationId, updatedAt: draftUpdatedAt },
+      { key: draftKey, ...saveIdentity, mutationId, updatedAt: draftUpdatedAt }
     );
     assertUserSession(session);
     if (currentNote?.id === target.noteId && pages[currentPageIndex]?.pageId === target.pageId) {
@@ -1972,13 +2451,7 @@ export function createStudyNotes(dependencies) {
       assertUserSession(session);
       await localStore.deleteIfUnchanged("pendingAssets", pendingKey, pendingAssetCreatedAt);
       assertUserSession(session);
-      await saveCoordinator.schedule({
-        uid: target.uid,
-        noteId: target.noteId,
-        pageId: target.pageId,
-        expectedRevision: target.expectedRevision,
-        sessionGeneration: session.generation
-      }, target.content);
+      await saveCoordinator.schedule(saveIdentity, target.content);
       assertUserSession(session);
     } catch (error) {
       if (error?.name === "NoteSessionChangedError") throw error;
@@ -1992,12 +2465,15 @@ export function createStudyNotes(dependencies) {
 
   async function pageAction(action, index) {
     if (!currentNote) return;
+    const actionPage = pages[index] || pages[currentPageIndex];
+    if (!canMutateCurrentNote(currentNote, { page: actionPage, allowConflict: false })) return;
     const session = captureUserSession();
     assertUserSession(session);
     if (action === "up" || action === "down") {
       const target = action === "up" ? index - 1 : index + 1;
       if (target < 0 || target >= pages.length) return;
       if (!await flushWithDecision(pages[currentPageIndex], "ページ並べ替え")) return;
+      if (!canMutateCurrentNote(currentNote, { page: actionPage, allowConflict: false })) return;
       assertUserSession(session);
       const previousPages = [...pages];
       const currentPageId = pages[currentPageIndex]?.pageId;
@@ -2012,19 +2488,18 @@ export function createStudyNotes(dependencies) {
       }
       currentPageIndex = Math.max(0, pages.findIndex(page => page.pageId === currentPageId));
       renderPageList();
-      ui.pageSidebar.classList.remove("open");
-      ui.pagesButton.setAttribute("aria-expanded", "false");
       return;
     }
     if (action === "duplicate") {
       const sourcePage = pages[index];
       const sourceContent = index === currentPageIndex ? clone(currentContent) : await pageContent(sourcePage);
       assertUserSession(session);
+      if (!canMutateCurrentNote(currentNote, { page: sourcePage, allowConflict: false })) return;
       const duplicate = { ...clone(sourcePage), pageId: randomId(), order: pages.length + 1, contentRevision: 0, contentPath: "", contentHash: "" };
       currentNote.orderRevision = await noteStore.createPage(currentNote.id, duplicate, pages.length + 1, currentNote.orderRevision, session.uid);
       pages.push(duplicate);
       const duplicatedContent = { ...clone(sourceContent), noteId: currentNote.id, pageId: duplicate.pageId, revision: 0, elements: sourceContent.elements.map(element => ({ ...element, id: randomId(), assetNoteId: element.type === "image" ? (element.assetNoteId || currentNote.id) : element.assetNoteId })), noteMasks: sourceContent.noteMasks.map(mask => ({ ...mask, id: randomId() })) };
-      const saved = await noteStore.savePageContent({ noteId: currentNote.id, pageId: duplicate.pageId, expectedRevision: 0, expectedUid: session.uid }, duplicatedContent);
+      const saved = await noteStore.enqueuePageContentSave({ noteId: currentNote.id, pageId: duplicate.pageId, expectedRevision: 0, expectedUid: session.uid }, duplicatedContent);
       Object.assign(duplicate, { contentRevision: saved.revision, contentPath: saved.contentPath, contentHash: saved.contentHash });
       contentCache.set(duplicate.pageId, { ...duplicatedContent, revision: saved.revision });
       currentNote.pageCount = pages.length;
@@ -2036,6 +2511,7 @@ export function createStudyNotes(dependencies) {
       const page = pages[index];
       if (!await flushWithDecision(page, "ページ削除")) return;
       assertUserSession(session);
+      if (!canMutateCurrentNote(currentNote, { page, allowConflict: false })) return;
       const remainingPages = pages.filter((_, pageIndex) => pageIndex !== index);
       currentNote.orderRevision = await noteStore.deletePage(
         currentNote.id,
@@ -2048,16 +2524,16 @@ export function createStudyNotes(dependencies) {
       currentPageIndex = Math.min(currentPageIndex, pages.length - 1);
       currentNote.pageCount = pages.length;
       await loadCurrentPage();
-      ui.pageSidebar.classList.remove("open");
-      ui.pagesButton.setAttribute("aria-expanded", "false");
     }
   }
 
   async function addPage(kind) {
+    if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
     const session = captureUserSession();
     assertUserSession(session);
     if (!await flushWithDecision(pages[currentPageIndex], "ページ追加")) return;
     assertUserSession(session);
+    if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
     const page = kind === "default"
       ? pageFromBackground(currentNote.defaultBackground || DEFAULT_BACKGROUND, pages.length + 1)
       : blankPage(kind, pages.length + 1);
@@ -2065,11 +2541,10 @@ export function createStudyNotes(dependencies) {
     pages.push(page); currentNote.pageCount = pages.length; currentPageIndex = pages.length - 1;
     currentContent = emptyContent(currentNote.id, page.pageId); contentCache.set(page.pageId, clone(currentContent));
     history.clear(); renderPageList(); renderPage();
-    ui.pageSidebar.classList.remove("open");
-    ui.pagesButton.setAttribute("aria-expanded", "false");
   }
 
   async function changeBackground() {
+    if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
     const session = captureUserSession();
     assertUserSession(session);
     const page = pages[currentPageIndex];
@@ -2107,6 +2582,7 @@ export function createStudyNotes(dependencies) {
       background.ruleWidthRatio = widthRatio;
     }
     const targets = scope === "current" ? [page] : scope === "all" ? pages.filter(item => item.pageType === "blank") : [];
+    if (!canMutateCurrentNote(currentNote, { page, allowConflict: false })) return;
     targets.forEach(target => { target.background = clone(background); });
     if (scope !== "current") currentNote.defaultBackground = clone(background);
     await Promise.all([
@@ -2157,6 +2633,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function selectionAction(action) {
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
     const elements = selectedElements();
     const masks = selectedMasks();
     if (!elements.length && !masks.length) return;
@@ -2224,11 +2701,13 @@ export function createStudyNotes(dependencies) {
   }
 
   function copySelection() {
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
     internalClipboard = [...selectedElements(), ...selectedMasks()].map(clone);
   }
 
   function pasteSelection() {
     if (!internalClipboard.length) return;
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
     const before = clone(currentContent); const ids = [];
     internalClipboard.forEach(item => {
       const copy = { ...clone(item), id: randomId() };
@@ -2240,11 +2719,13 @@ export function createStudyNotes(dependencies) {
   }
 
   function undo() {
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
     const restored = history.undo(historySnapshot()); if (!restored) return;
     void applyHistorySnapshot(restored).catch(reportError);
   }
 
   function redo() {
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
     const restored = history.redo(historySnapshot()); if (!restored) return;
     void applyHistorySnapshot(restored).catch(reportError);
   }
@@ -2261,10 +2742,12 @@ export function createStudyNotes(dependencies) {
   }
 
   async function renameNote(note = currentNote) {
+    if (!canMutateCurrentNote(note)) return;
     const session = captureUserSession();
     assertUserSession(session);
     const title = prompt("ノート名", note.title || "無題ノート")?.trim();
     if (!title) return;
+    if (!canMutateCurrentNote(note)) return;
     await noteStore.updateNote(note.id, { title }, session.uid); note.title = title;
     assertUserSession(session);
     if (currentNote?.id === note.id) ui.title.value = title;
@@ -2272,11 +2755,17 @@ export function createStudyNotes(dependencies) {
   }
 
   async function deleteNote(note = currentNote) {
+    if (!canMutateCurrentNote(note)) return;
+    if (dedicatedEditor && currentNote?.id === note.id && conflictPageIds.size) {
+      ui.conflictBanner.classList.remove("hidden");
+      return;
+    }
     const session = captureUserSession();
     assertUserSession(session);
     if (!confirm(`「${note.title || "無題ノート"}」を削除しますか？データは論理削除され、直ちには物理削除されません。`)) return;
     if (currentNote?.id === note.id && !await flushAllWithDecision("ノート削除")) return;
     assertUserSession(session);
+    if (!canMutateCurrentNote(note)) return;
     await noteStore.deleteNote(note.id, session.uid);
     assertUserSession(session);
     if (currentNote?.id === note.id) { currentNote = null; pages = []; currentContent = null; show("list"); }
@@ -2284,12 +2773,15 @@ export function createStudyNotes(dependencies) {
   }
 
   async function duplicateNote(noteId) {
+    const guardedNote = currentNote?.id === noteId ? currentNote : null;
+    if (guardedNote && !canMutateCurrentNote(guardedNote)) return null;
     const session = captureUserSession();
     assertUserSession(session);
     const sourceNote = await noteStore.getNote(noteId, { expectedUid: session.uid });
     assertUserSession(session);
     const sourcePages = await noteStore.listPages(noteId, { expectedUid: session.uid });
     assertUserSession(session);
+    if (guardedNote && !canMutateCurrentNote(guardedNote)) return null;
     const newPages = sourcePages.map((page, index) => ({ ...clone(page), pageId: randomId(), order: index + 1, contentRevision: 0, contentPath: "", contentHash: "" }));
     const newId = await noteStore.createNote({
       title: `${sourceNote.title || "無題ノート"} のコピー`, type: sourceNote.type,
@@ -2305,7 +2797,7 @@ export function createStudyNotes(dependencies) {
         assertUserSession(session);
         sourceContent.elements = sourceContent.elements.map(element => ({ ...element, id: randomId(), assetNoteId: element.type === "image" ? (element.assetNoteId || noteId) : element.assetNoteId }));
         sourceContent.noteMasks = sourceContent.noteMasks.map(mask => ({ ...mask, id: randomId() }));
-        const saved = await noteStore.savePageContent({ noteId: newId, pageId: newPages[index].pageId, expectedRevision: 0, expectedUid: session.uid }, sourceContent);
+        const saved = await noteStore.enqueuePageContentSave({ noteId: newId, pageId: newPages[index].pageId, expectedRevision: 0, expectedUid: session.uid }, sourceContent);
         storagePaths.push(saved.contentPath);
       }
       await noteStore.finalizeNoteCreation(newId, newPages.length, session.uid);
@@ -2356,7 +2848,7 @@ export function createStudyNotes(dependencies) {
         copyContent.elements = (copyContent.elements || []).map(element => element.type === "image"
           ? { ...element, assetNoteId: element.assetNoteId || sourceNoteId }
           : element);
-        const saved = await noteStore.savePageContent({
+        const saved = await noteStore.enqueuePageContentSave({
           noteId: copyId,
           pageId: copyPages[index].pageId,
           expectedRevision: 0,
@@ -2394,9 +2886,8 @@ export function createStudyNotes(dependencies) {
     return copyId;
   }
 
-  async function restoreOrphanedDrafts(group) {
+  async function restoreOrphanedDrafts(group, reservedWindow = null) {
     if (!group?.items?.length) return;
-    if (!confirm(`${group.items.length}ページ分の端末内下書きを、新しいノートとして復元しますか？`)) return;
     const items = group.items.map(({ pending, draft }) => ({
       key: pending.key,
       pageId: pending.pageId,
@@ -2415,19 +2906,17 @@ export function createStudyNotes(dependencies) {
       }
     }
     await refreshNotes();
-    await openNote(copyId);
+    if (!dedicatedEditor) openEditorTab(copyId, {}, reservedWindow);
+    else await openNote(copyId, { inline: true });
   }
 
-  async function resolveConflict(note) {
-    const conflict = note.conflicts?.[0];
-    if (!conflict) return;
-    const useLocal = confirm("ローカル版を競合コピーとして残しますか？\nOK: 競合コピーを作成 / キャンセル: クラウド版を採用");
+  async function resolveConflictRecord(noteId, conflict, useLocal) {
     const [draft, pending] = await Promise.all([
       localStore.get("pageDrafts", conflict.key),
       localStore.get("pendingSaves", conflict.key)
     ]);
     if (useLocal) {
-      await createRecoveredDraftCopy(note.id, [{
+      await createRecoveredDraftCopy(noteId, [{
         key: conflict.key,
         pageId: conflict.pageId,
         content: conflict.content,
@@ -2444,7 +2933,40 @@ export function createStudyNotes(dependencies) {
     });
     contentCache.delete(conflict.pageId);
     await localStore.deleteIfUnchanged("conflicts", conflict.key, conflict.updatedAt || conflict.createdAt);
+  }
+
+  async function resolveConflict(note) {
+    const conflicts = [...(note.conflicts || [])];
+    if (!conflicts.length) return;
+    await resolveNoteConflicts(conflicts, {
+      decide: (_conflict, { index, total }) => confirm(
+        `競合ページ ${index + 1}/${total}のローカル版を競合コピーとして残しますか？\n` +
+        "OK: このページの競合コピーを作成 / キャンセル: このページはクラウド版を採用"
+      ),
+      resolve: (conflict, useLocal) => resolveConflictRecord(note.id, conflict, useLocal)
+    });
     await refreshNotes();
+  }
+
+  async function resolveCurrentPageConflict(useLocal) {
+    const pageId = pages[currentPageIndex]?.pageId;
+    const noteId = currentNote?.id;
+    const uid = getCurrentUser()?.uid;
+    if (!noteId || !pageId || !uid) return;
+    const conflict = currentNote?.conflicts?.find(item => item.pageId === pageId) ||
+      await loadConflictRecord(noteId, pageId, uid);
+    if (!conflict) throw new Error("競合情報を読み込めませんでした。もう一度比較してください。");
+    await resolveConflictRecord(noteId, conflict, useLocal);
+    if (currentNote?.id !== noteId) return;
+    currentNote.conflicts = (currentNote.conflicts || []).filter(item => item.key !== conflict.key);
+    conflictPageIds.delete(pageId);
+    pages = await noteStore.listPages(noteId, { expectedUid: uid });
+    currentPageIndex = Math.max(0, pages.findIndex(page => page.pageId === pageId));
+    currentContent = await pageContent(pages[currentPageIndex]);
+    setEditorReadOnly(!editorLease?.isWriter());
+    ui.conflictBanner.classList.add("hidden");
+    renderPageList();
+    renderPage();
   }
 
   function openExportDialog() {
@@ -2463,7 +2985,7 @@ export function createStudyNotes(dependencies) {
   }
 
   async function openExportFromList(noteId) {
-    await openNote(noteId); openExportDialog();
+    await openNote(noteId, { inline: true }); openExportDialog();
   }
 
   function exportPageIndexes() {
@@ -2576,7 +3098,7 @@ export function createStudyNotes(dependencies) {
     const closeCurrentIfDeleted = noteIds => {
       if (!noteIds?.includes(currentNote?.id)) return;
       currentNote = null; pages = []; currentContent = null; selectedIds = []; history.clear();
-      releaseObjectUrls(); zoomController?.destroy(); zoomController = null;
+      resetPageRender(); zoomController?.destroy(); zoomController = null;
       show("list");
     };
     try {
@@ -2598,8 +3120,13 @@ export function createStudyNotes(dependencies) {
 
   async function closeEditor() {
     if (currentNote && !await flushAllWithDecision("ノートを閉じる操作")) return;
+    editorLease?.release();
     currentNote = null; pages = []; currentContent = null; selectedIds = []; history.clear();
-    releaseObjectUrls(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
+    resetPageRender(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
+    if (dedicatedEditor) {
+      globalThis.close?.();
+      return;
+    }
     show("list"); await refreshNotes();
   }
 
@@ -2607,9 +3134,73 @@ export function createStudyNotes(dependencies) {
     userSessionGeneration += 1;
     createController?.abort(); exportController?.abort(); saveCoordinator.reset();
     pendingAssetRecoveryPromises.clear(); pendingRecoveryPromises.clear(); pendingRecoverySweeps.clear();
+    editorLease?.dispose(); editorLease = null;
     currentNote = null; pages = []; currentContent = null; notes = []; orphanedDrafts = []; contentCache.clear(); assetCache.clear();
-    selectedIds = []; history.clear(); releaseObjectUrls(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
+    selectedIds = []; activeTouchPointerIds.clear(); pageZoomGestureActive = false; activeGesture = null;
+    history.clear(); resetPageRender(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
     ui.list.replaceChildren(); show("list"); setListStatus("ログイン後にノートを読み込みます。");
+  }
+
+  function showToolSettings(tool = currentTool) {
+    if (tool === "eraser-object") tool = toolSettings.eraserMode === "pixel" ? "eraser-pixel" : "eraser-object";
+    if (TOOL_LABELS[tool]) currentTool = tool;
+    ui.settingsTitle.textContent = currentTool === "pen" ? "ペン設定" : currentTool === "highlighter" ? "蛍光ペン設定" : currentTool.startsWith("eraser") ? "消しゴム設定" : "ツール設定";
+    applyToolSettingsToUi();
+    ui.settings.classList.remove("hidden");
+  }
+
+  function handleToolButton(tool) {
+    const normalized = tool === "eraser-object" && toolSettings.eraserMode === "pixel" ? "eraser-pixel" : tool;
+    if (currentTool === normalized && ["pen", "highlighter", "eraser-object", "eraser-pixel"].includes(currentTool)) {
+      showToolSettings(currentTool);
+      return;
+    }
+    setTool(tool);
+  }
+
+  function quickSwitchTool() {
+    const action = toolSettings.quickSwitchAction;
+    if (action === "select-all") {
+      selectedIds = currentContent?.elements?.map(element => element.id) || [];
+      setTool("select");
+      return;
+    }
+    if (action === "colors") { showToolSettings(); return; }
+    if (action === "select") { setTool(currentTool === "select" ? previousTool : "select"); return; }
+    if (action === "previous") { const target = previousTool; previousTool = currentTool; setTool(target); return; }
+    const eraser = toolSettings.eraserMode === "pixel" ? "eraser-pixel" : "eraser-object";
+    setTool(currentTool.startsWith("eraser") ? previousTool || "pen" : eraser);
+  }
+
+  function bindToolbarDrag() {
+    let drag = null;
+    ui.toolbarDrag.addEventListener("pointerdown", event => {
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, lastX: event.clientX, lastY: event.clientY };
+      ui.toolbar.classList.add("dragging");
+      ui.toolbarDrag.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    });
+    ui.toolbarDrag.addEventListener("pointermove", event => {
+      if (!drag || drag.id !== event.pointerId) return;
+      drag.lastX = event.clientX; drag.lastY = event.clientY;
+      ui.toolbar.style.translate = `${event.clientX - drag.x}px ${event.clientY - drag.y}px`;
+    });
+    const finish = event => {
+      if (!drag || drag.id !== event.pointerId) return;
+      const distances = {
+        top: drag.lastY,
+        right: innerWidth - drag.lastX,
+        bottom: innerHeight - drag.lastY,
+        left: drag.lastX
+      };
+      const dock = Object.entries(distances).sort((a, b) => a[1] - b[1])[0][0];
+      ui.toolbar.style.translate = "";
+      ui.toolbar.classList.remove("dragging");
+      drag = null;
+      persistToolSettings({ toolbarDock: dock });
+    };
+    ui.toolbarDrag.addEventListener("pointerup", finish);
+    ui.toolbarDrag.addEventListener("pointercancel", finish);
   }
 
   function bindEvents() {
@@ -2620,19 +3211,51 @@ export function createStudyNotes(dependencies) {
       const type = button.dataset.createNote;
       if (type === "material") renderMaterialPicker();
       else if (type === "pdf") ui.pdfInput.click();
-      else createStandalone(type).catch(reportError);
+      else {
+        let reservedWindow;
+        try { reservedWindow = reserveEditorTab(); }
+        catch (error) { reportError(error); return; }
+        createStandalone(type, reservedWindow).catch(error => { reservedWindow.close?.(); reportError(error); });
+      }
     }));
-    ui.pdfInput.addEventListener("change", () => createPdfNote(ui.pdfInput.files?.[0]).catch(reportError));
+    ui.pdfInput.addEventListener("change", () => {
+      const file = ui.pdfInput.files?.[0];
+      if (!file) return;
+      let reservedWindow;
+      try { reservedWindow = reserveEditorTab(); }
+      catch (error) { reportError(error); return; }
+      createPdfNote(file, reservedWindow).catch(error => { reservedWindow.close?.(); reportError(error); });
+    });
     ui.cancelCreateProgress.addEventListener("click", () => createController?.abort());
     ui.closeNote.addEventListener("click", () => closeEditor().catch(reportError));
-    ui.pagesButton.addEventListener("click", () => {
-      const open = ui.pageSidebar.classList.toggle("open");
-      ui.pagesButton.setAttribute("aria-expanded", String(open));
-      ui.pagesButton.setAttribute("aria-label", open ? "ページ一覧を閉じる" : "ページ一覧を開く");
+    ui.lockReadOnly.addEventListener("click", () => setEditorReadOnly(true, "読み取り専用で開いています。"));
+    ui.lockTakeover.addEventListener("click", async () => {
+      ui.lockTakeover.disabled = true;
+      try {
+        const result = await editorLease?.takeover();
+        if (result?.acquired) setEditorReadOnly(false);
+        else setEditorReadOnly(true, "編集権を取得できませんでした。もう一度お試しください。");
+      } finally {
+        ui.lockTakeover.disabled = false;
+      }
     });
+    ui.lockReturn.addEventListener("click", () => {
+      if (dedicatedEditor) globalThis.close?.();
+      else closeEditor().catch(reportError);
+    });
+    ui.conflictBanner.querySelectorAll("[data-conflict-action]").forEach(button => button.addEventListener("click", () => {
+      const action = button.dataset.conflictAction;
+      if (action === "cloud") resolveCurrentPageConflict(false).catch(reportError);
+      else if (action === "copy") resolveCurrentPageConflict(true).catch(reportError);
+      else if (action === "compare") recoverPendingSaves(currentNote.id, pages).then(loadCurrentPage).catch(reportError);
+      else if (action === "list") dedicatedEditor ? globalThis.close?.() : closeEditor().catch(reportError);
+    }));
+    ui.pagesButton.addEventListener("click", () => persistToolSettings({ sidebarVisible: !toolSettings.sidebarVisible }));
     ui.title.addEventListener("change", async () => {
       const title = ui.title.value.trim(); if (!title || !currentNote || title === currentNote.title) return;
+      if (!canMutateCurrentNote(currentNote)) { ui.title.value = currentNote.title || "無題ノート"; return; }
       const session = captureUserSession(); assertUserSession(session);
+      if (!canMutateCurrentNote(currentNote)) { ui.title.value = currentNote.title || "無題ノート"; return; }
       await noteStore.updateNote(currentNote.id, { title }, session.uid); assertUserSession(session); currentNote.title = title;
     });
     ui.undo.addEventListener("click", undo); ui.redo.addEventListener("click", redo);
@@ -2669,13 +3292,68 @@ export function createStudyNotes(dependencies) {
         .finally(() => { ui.retrySave.disabled = false; });
     });
     ui.studyToggle.addEventListener("click", () => setStudyMode(!studyMode));
-    ui.toolbar.querySelectorAll("[data-note-tool]").forEach(button => button.addEventListener("click", () => setTool(button.dataset.noteTool)));
-    ui.styleBtn.addEventListener("click", () => ui.settings.classList.toggle("hidden"));
+    ui.toolbar.querySelectorAll("[data-note-tool]").forEach(button => {
+      let longPress = null;
+      let longPressed = false;
+      button.addEventListener("pointerdown", event => {
+        longPressed = false;
+        longPress = setTimeout(() => { longPressed = true; setTool(button.dataset.noteTool); showToolSettings(); }, 550);
+        // Toolbar controls must remain operable by touch while Pencil-only drawing is enabled.
+        // Palm/cooldown filtering still applies; Pencil mode itself only gates page interaction.
+        if (inputGuard.shouldIgnoreTouch(event, { pencilMode: false })) clearTimeout(longPress);
+      });
+      ["pointerup", "pointercancel", "pointerleave"].forEach(type => button.addEventListener(type, () => clearTimeout(longPress)));
+      button.addEventListener("click", event => { if (longPressed) { event.preventDefault(); return; } handleToolButton(button.dataset.noteTool); });
+    });
+    ui.styleBtn.addEventListener("click", () => ui.settings.classList.contains("hidden") ? showToolSettings() : ui.settings.classList.add("hidden"));
     ui.backgroundBtn.addEventListener("click", () => changeBackground().catch(reportError));
-    ui.color.addEventListener("input", () => { ui.currentColor.style.background = ui.color.value; });
+    ui.color.addEventListener("input", () => {
+      persistToolSettings(currentTool === "highlighter" ? { highlighterColor: ui.color.value } : { penColor: ui.color.value });
+    });
+    ui.width.addEventListener("input", () => {
+      if (currentTool === "highlighter") persistToolSettings({ highlighterWidth: Number(ui.width.value) });
+      else if (currentTool.startsWith("eraser")) persistToolSettings({ eraserSize: Number(ui.width.value) });
+      else persistToolSettings({ penWidth: Number(ui.width.value) });
+    });
+    ui.opacity.addEventListener("input", () => persistToolSettings(currentTool === "highlighter"
+      ? { highlighterOpacity: Number(ui.opacity.value) }
+      : { penOpacity: Number(ui.opacity.value) }));
+    ui.colorPresets.addEventListener("click", event => {
+      const value = event.target.closest("button[data-color]")?.dataset.color;
+      if (!value) return;
+      persistToolSettings(currentTool === "highlighter" ? { highlighterColor: value } : { penColor: value });
+    });
+    ui.widthPresets.addEventListener("click", event => {
+      const value = Number(event.target.closest("button[data-width]")?.dataset.width);
+      if (!value) return;
+      if (currentTool === "highlighter") persistToolSettings({ highlighterWidth: value });
+      else if (currentTool.startsWith("eraser")) persistToolSettings({ eraserSize: value });
+      else persistToolSettings({ penWidth: value });
+    });
     [ui.color, ui.opacity, ui.fontFamily, ui.fontSize, ui.fontBold, ui.fontItalic, ui.textAlign, ui.lineHeight]
       .forEach(control => control.addEventListener("change", applySelectedTextStyle));
-    ui.eraserMode.addEventListener("change", () => { if (currentTool.startsWith("eraser")) setTool("eraser-object"); });
+    ui.eraserMode.addEventListener("change", () => {
+      persistToolSettings({ eraserMode: ui.eraserMode.value });
+      if (currentTool.startsWith("eraser")) setTool("eraser-object");
+    });
+    ui.eraserSize.addEventListener("input", () => persistToolSettings({ eraserSize: Number(ui.eraserSize.value) }));
+    ui.pencilMode.addEventListener("change", () => persistToolSettings({ pencilMode: ui.pencilMode.checked }));
+    ui.straightenEnabled.addEventListener("change", () => persistToolSettings({ straightenEnabled: ui.straightenEnabled.checked }));
+    ui.toolbarDock.addEventListener("change", () => persistToolSettings({ toolbarDock: ui.toolbarDock.value }));
+    ui.quickSwitchAction.addEventListener("change", () => persistToolSettings({ quickSwitchAction: ui.quickSwitchAction.value }));
+    ui.quickSwitch.addEventListener("click", quickSwitchTool);
+    ui.toolbarCollapse.addEventListener("click", () => ui.toolbar.classList.toggle("collapsed"));
+    bindToolbarDrag();
+    ui.viewport.addEventListener("pointerdown", event => {
+      if (event.pointerType === "touch" && !inputGuard.isPalmCandidate(event)) activeTouchPointerIds.add(event.pointerId);
+    }, { capture: true });
+    const finishTrackedTouch = event => {
+      if (event.pointerType !== "touch") return;
+      activeTouchPointerIds.delete(event.pointerId);
+      if (!activeTouchPointerIds.size) pageZoomGestureActive = false;
+    };
+    ui.viewport.addEventListener("pointerup", finishTrackedTouch, { capture: true });
+    ui.viewport.addEventListener("pointercancel", finishTrackedTouch, { capture: true });
     ui.stage.addEventListener("pointerdown", beginPointer); ui.stage.addEventListener("pointermove", movePointer);
     ui.stage.addEventListener("pointerup", endPointer); ui.stage.addEventListener("pointercancel", endPointer);
     ui.stage.addEventListener("click", event => {
@@ -2695,6 +3373,11 @@ export function createStudyNotes(dependencies) {
       else renderPage();
     });
     ui.viewport.addEventListener("pagezoomstart", () => {
+      pageZoomGestureActive = true;
+      if (activeGesture?.type === "pan") {
+        ui.viewport.scrollLeft = activeGesture.scrollLeft;
+        ui.viewport.scrollTop = activeGesture.scrollTop;
+      }
       if (activeGesture?.before) currentContent = clone(activeGesture.before);
       activeGesture = null;
       ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
@@ -2744,6 +3427,7 @@ export function createStudyNotes(dependencies) {
       else if (isTextEditingTarget(event.target)) return;
       const file = imageFileFromPasteEvent(event);
       if (!file) return;
+      if (!isEditableNow()) { explainBlockedEdit(); return; }
       event.preventDefault(); addImageBlob(file).catch(reportError);
     });
     document.addEventListener("keydown", event => {
@@ -2771,10 +3455,15 @@ export function createStudyNotes(dependencies) {
       sharePdfBlob(generatedPdf.blob, generatedPdf.filename, currentNote.title).catch(reportError);
     });
     ui.cancelPdf.addEventListener("click", () => exportController?.abort());
-    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && currentNote) void saveCoordinator.flushAll(); });
-    window.addEventListener("pagehide", () => { if (currentNote) void saveCoordinator.flushAll(); });
+    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && currentNote && !readOnlyEditor) void saveCoordinator.flushAll(); });
+    window.addEventListener("pagehide", () => {
+      if (currentNote && !readOnlyEditor) void saveCoordinator.flushAll();
+      editorLease?.release();
+    });
     window.addEventListener("online", () => {
-      void recoverAllPendingWork().catch(error => console.warn("オンライン復帰後のノート再送に失敗しました。", error));
+      if (!readOnlyEditor || !dedicatedEditor) {
+        void recoverAllPendingWork().catch(error => console.warn("オンライン復帰後のノート再送に失敗しました。", error));
+      }
     });
   }
 
@@ -2784,7 +3473,10 @@ export function createStudyNotes(dependencies) {
   return {
     refresh: refreshNotes,
     resetForUserChange,
-    flush: () => saveCoordinator.flushAll(),
+    // The list tab may be replaying an already durable IndexedDB draft in the
+    // background. Logging out must not wait indefinitely for that network
+    // retry; only an active writer tab has editable in-memory state to flush.
+    flush: () => currentNote && !readOnlyEditor ? saveCoordinator.flushAll() : Promise.resolve([]),
     openMaterialNote,
     confirmMaterialReplacement,
     finalizeMaterialReplacement,

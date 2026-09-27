@@ -75,6 +75,26 @@ async function login(page, user) {
   await expect(page.locator("#noteListView")).toBeVisible();
 }
 
+async function openEditorPopup(opener, trigger, {
+  blockedRequests = null,
+  onDialog = null,
+  onPageError = null,
+  onRequest = null,
+  timeout = 90_000
+} = {}) {
+  const popupPromise = opener.waitForEvent("popup", { timeout });
+  const triggerPromise = Promise.resolve().then(trigger);
+  const editor = await popupPromise;
+  await guardProductionFirebase(editor, blockedRequests);
+  if (onDialog) editor.on("dialog", onDialog);
+  if (onPageError) editor.on("pageerror", onPageError);
+  if (onRequest) editor.on("request", onRequest);
+  await triggerPromise;
+  await editor.waitForURL(url => url.searchParams.get("noteEditor") === "1" && Boolean(url.searchParams.get("noteId")), { timeout });
+  await expect(editor.locator("#noteEditorView")).toBeVisible({ timeout });
+  return editor;
+}
+
 async function readNotes(uid) {
   const environment = await initializeTestEnvironment({ projectId: "demo-dental-qa", firestore: { host: "127.0.0.1", port: 8080 } });
   try {
@@ -286,24 +306,14 @@ async function localPendingSaveCountForUser(page, uid) {
 
 async function seedPendingPageDraft(page, { uid, noteId, pageId, content, expectedRevision }) {
   await page.evaluate(async value => {
-    const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("dentalQaNoteLocal", 2);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    const { createNoteLocalStore } = await import("/js/core/note-local-store.js");
+    const localStore = createNoteLocalStore();
     const key = `${value.uid}|${value.noteId}|${value.pageId}`;
-    const put = (storeName, record) => new Promise((resolve, reject) => {
-      const transaction = database.transaction(storeName, "readwrite");
-      transaction.objectStore(storeName).put(record);
-      transaction.oncomplete = resolve;
-      transaction.onerror = () => reject(transaction.error);
-      transaction.onabort = () => reject(transaction.error);
-    });
     const updatedAt = new Date().toISOString();
     const revisionFields = Number.isInteger(value.expectedRevision)
       ? { expectedRevision: value.expectedRevision }
       : {};
-    await put("pageDrafts", {
+    await localStore.put("pageDrafts", {
       key,
       uid: value.uid,
       noteId: value.noteId,
@@ -312,7 +322,7 @@ async function seedPendingPageDraft(page, { uid, noteId, pageId, content, expect
       ...revisionFields,
       updatedAt
     });
-    await put("pendingSaves", {
+    await localStore.put("pendingSaves", {
       key,
       uid: value.uid,
       noteId: value.noteId,
@@ -320,7 +330,7 @@ async function seedPendingPageDraft(page, { uid, noteId, pageId, content, expect
       ...revisionFields,
       updatedAt
     });
-    database.close();
+    await localStore.close();
   }, { uid, noteId, pageId, content, expectedRevision });
 }
 
@@ -340,25 +350,29 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   const pdfCdnRequests = [];
   const pageErrors = [];
   const dialogs = [];
-  page.on("dialog", async dialog => {
+  const onDialog = async dialog => {
     dialogs.push(dialog.message());
     await dialog.accept();
-  });
-  page.on("request", request => {
+  };
+  const onRequest = request => {
     const hostname = new URL(request.url()).hostname;
     if (["cdn.jsdelivr.net", "cdnjs.cloudflare.com"].includes(hostname)) {
       pdfCdnRequests.push(request.url());
     }
-  });
-  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  };
+  const onPageError = error => recordUnexpectedPageError(pageErrors, error);
+  page.on("dialog", onDialog);
+  page.on("request", onRequest);
+  page.on("pageerror", onPageError);
   const user = await createUser();
   await login(page, user);
   await expect(page.locator("#localEnvironmentStatus")).toContainText("Auth: 接続済み / Firestore: 接続済み / Storage: 接続済み");
 
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("E2E 学習ノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), {
+    blockedRequests, onDialog, onRequest, onPageError
+  });
   await expect(page.locator("#noteTitleInput")).toHaveValue("E2E 学習ノート");
 
   const stage = page.locator("#notePageStage");
@@ -379,6 +393,7 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await expect(stage.locator('[data-transform-handle="resize-se"]')).toBeVisible();
   await expect(stage.locator('[data-transform-handle="rotate"]')).toHaveCount(0);
   await expect(page.locator('#noteSelectionActions [data-selection-action="rotate-left"]')).toBeDisabled();
+  await stage.locator(".note-paper-layer").evaluate(node => { node.dataset.renderProbe = "persistent-background"; });
   const maskBeforeResize = await stage.locator(".note-mask").boundingBox();
   const maskResizeHandle = await stage.locator('[data-transform-handle="resize-se"]').boundingBox();
   await page.mouse.move(maskResizeHandle.x + maskResizeHandle.width / 2, maskResizeHandle.y + maskResizeHandle.height / 2);
@@ -387,6 +402,7 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await page.mouse.up();
   const maskAfterResize = await stage.locator(".note-mask").boundingBox();
   expect(maskAfterResize.width).toBeGreaterThan(maskBeforeResize.width);
+  await expect(stage.locator('.note-paper-layer[data-render-probe="persistent-background"]')).toHaveCount(1);
 
   await openPageSidebar(page);
   await page.locator('[data-page-action="add-ruled"]').click();
@@ -444,12 +460,11 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   expect((await PDFDocument.load(pdfBytes)).getPageCount()).toBe(2);
   await page.locator('#noteExportDialog button[value="close"]').click();
 
+  const editorTabIdBeforeReload = new URL(page.url()).searchParams.get("editorTabId");
+  expect(editorTabIdBeforeReload).toBeTruthy();
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await expect(page.locator("#noteList")).toContainText("E2E 学習ノート");
-  await page.locator(".note-card:has-text('E2E 学習ノート') button", { hasText: "編集" }).click();
+  expect(new URL(page.url()).searchParams.get("editorTabId")).toBe(editorTabIdBeforeReload);
   await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
   await expect(page.locator("#notePageStage [data-element-id]")).toHaveCount(1);
 
@@ -463,14 +478,231 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   expect(pageErrors).toEqual([]);
 });
 
+test("@authenticated 単一タブで100ストロークと即時ページ切替を行っても自己競合しない", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("100ストローク競合E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), {
+    blockedRequests,
+    onPageError: error => recordUnexpectedPageError(pageErrors, error)
+  });
+
+  const stage = page.locator("#notePageStage");
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  for (let index = 0; index < 100; index += 1) {
+    const row = index % 20;
+    const column = Math.floor(index / 20);
+    const startX = box.x + box.width * (.08 + column * .14);
+    const startY = box.y + box.height * (.06 + row * .042);
+    const pointerId = 1000 + index;
+    await stage.dispatchEvent("pointerdown", {
+      pointerId, pointerType: "pen", button: 0, pressure: .1,
+      clientX: startX, clientY: startY
+    });
+    await stage.dispatchEvent("pointermove", {
+      pointerId, pointerType: "pen", button: 0, pressure: index % 2 ? 1 : .2,
+      clientX: startX + box.width * .055, clientY: startY + box.height * .008
+    });
+    await stage.dispatchEvent("pointerup", {
+      pointerId, pointerType: "pen", button: 0,
+      clientX: startX + box.width * .055, clientY: startY + box.height * .008
+    });
+  }
+
+  await expect(stage.locator('[data-element-id]')).toHaveCount(100);
+  await expect(page.locator("#notePageConflictBanner")).toBeHidden();
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 30_000 });
+  await expect.poll(() => localNoteStoreCounts(page)).toMatchObject({ conflicts: 0, pendingSaves: 0 });
+
+  await openPageSidebar(page);
+  await page.locator('[data-page-action="add-blank"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("2 / 2");
+  const secondBox = await stage.boundingBox();
+  await stage.dispatchEvent("pointerdown", {
+    pointerId: 1200, pointerType: "pen", button: 0, pressure: .5,
+    clientX: secondBox.x + secondBox.width * .2, clientY: secondBox.y + secondBox.height * .2
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 1200, pointerType: "pen", button: 0, pressure: .5,
+    clientX: secondBox.x + secondBox.width * .55, clientY: secondBox.y + secondBox.height * .24
+  });
+  await stage.dispatchEvent("pointerup", {
+    pointerId: 1200, pointerType: "pen", button: 0,
+    clientX: secondBox.x + secondBox.width * .55, clientY: secondBox.y + secondBox.height * .24
+  });
+  await page.locator('#notePageList [aria-label="1ページを開く"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
+  await expect(stage.locator('[data-element-id]')).toHaveCount(100);
+  await expect(page.locator("#notePageConflictBanner")).toBeHidden();
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 30_000 });
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorView")).toBeVisible({ timeout: 20_000 });
+  await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
+  await expect(page.locator("#notePageStage [data-element-id]")).toHaveCount(100);
+  await expect(page.locator("#notePageConflictBanner")).toBeHidden();
+  const stored = await readNotes(user.uid);
+  expect(stored.notes).toHaveLength(1);
+  expect(stored.notes[0].pages).toHaveLength(2);
+  expect(stored.notes[0].pages.every(item => Number(item.contentRevision) >= 1)).toBeTruthy();
+  expect(stored.notes[0].pages.every(item => Boolean(item.lastClientMutationId))).toBeTruthy();
+  expect(pageErrors).toEqual([]);
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 固定線幅・ツール再タップ設定・長押し直線化・パレット保持を操作で確認する", async ({ page }) => {
+  test.setTimeout(120_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("マークアップ設定E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
+
+  const toolbarButtons = page.locator(".note-toolbar button");
+  expect(await toolbarButtons.count()).toBeGreaterThanOrEqual(10);
+  for (const button of await toolbarButtons.all()) {
+    expect(await button.getAttribute("aria-label")).toBeTruthy();
+    expect(await button.getAttribute("title")).toBeTruthy();
+    const dimensions = await button.boundingBox();
+    if (dimensions) {
+      expect(dimensions.width).toBeGreaterThanOrEqual(44);
+      expect(dimensions.height).toBeGreaterThanOrEqual(44);
+    }
+  }
+  await expect(page.locator(".note-pencil-doubletap-notice")).toContainText("Apple Pencil本体のダブルタップを取得できません");
+
+  const penButton = page.locator('[data-note-tool="pen"]');
+  await penButton.click();
+  await expect(page.locator("#noteToolSettings")).toBeVisible();
+  await expect(page.locator("#noteToolSettingsTitle")).toHaveText("ペン設定");
+  await page.locator('#noteWidthPresets [data-width="72"]').click();
+  await page.locator('#noteColorPresets [data-color="#ef4444"]').click();
+  await page.locator("#noteOpacityInput").fill("77");
+  await expect(page.locator("#noteWidthInput")).toHaveValue("72");
+  await expect(page.locator("#noteColorInput")).toHaveValue("#ef4444");
+
+  const stage = page.locator("#notePageStage");
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  await stage.dispatchEvent("pointerdown", {
+    pointerId: 1301, pointerType: "pen", button: 0, pressure: .05,
+    clientX: box.x + box.width * .15, clientY: box.y + box.height * .15
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 1301, pointerType: "pen", button: 0, pressure: 1,
+    clientX: box.x + box.width * .3, clientY: box.y + box.height * .18
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 1301, pointerType: "pen", button: 0, pressure: .1,
+    clientX: box.x + box.width * .45, clientY: box.y + box.height * .16
+  });
+  await stage.dispatchEvent("pointerup", {
+    pointerId: 1301, pointerType: "pen", button: 0,
+    clientX: box.x + box.width * .45, clientY: box.y + box.height * .16
+  });
+  const penPath = stage.locator('path.note-element[data-element-id]').first();
+  await expect(penPath).toHaveAttribute("stroke", "#ef4444");
+  await expect(penPath).toHaveAttribute("stroke-width", "7.2");
+  await expect(penPath).toHaveAttribute("stroke-opacity", "0.77");
+
+  const highlighterButton = page.locator('[data-note-tool="highlighter"]');
+  await highlighterButton.click();
+  await highlighterButton.click();
+  await expect(page.locator("#noteToolSettingsTitle")).toHaveText("蛍光ペン設定");
+  await page.locator('#noteWidthPresets [data-width="82"]').click();
+  await page.locator('#noteColorPresets [data-color="#6ce5ff"]').click();
+  await page.locator("#noteOpacityInput").fill("35");
+  await expect(penPath).toHaveAttribute("stroke", "#ef4444");
+  await stage.dispatchEvent("pointerdown", {
+    pointerId: 1302, pointerType: "pen", button: 0, pressure: .05,
+    clientX: box.x + box.width * .15, clientY: box.y + box.height * .3
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 1302, pointerType: "pen", button: 0, pressure: 1,
+    clientX: box.x + box.width * .45, clientY: box.y + box.height * .34
+  });
+  await stage.dispatchEvent("pointerup", {
+    pointerId: 1302, pointerType: "pen", button: 0,
+    clientX: box.x + box.width * .45, clientY: box.y + box.height * .34
+  });
+  const highlighterPath = stage.locator('path.note-element[data-element-id]').nth(1);
+  await expect(highlighterPath).toHaveAttribute("stroke", "#6ce5ff");
+  await expect(highlighterPath).toHaveAttribute("stroke-width", "82");
+  await expect(highlighterPath).toHaveAttribute("stroke-opacity", "0.35");
+
+  const eraserButton = page.locator('[data-note-tool="eraser-object"]');
+  await eraserButton.click();
+  await eraserButton.click();
+  await expect(page.locator("#noteToolSettingsTitle")).toHaveText("消しゴム設定");
+  await page.locator("#noteEraserMode").selectOption("pixel");
+  await page.locator("#noteEraserSize").fill("60");
+  await expect(page.locator("#noteEraserBadge")).toHaveText("P");
+
+  await page.locator("#noteToolbarDock").selectOption("top");
+  await expect(page.locator(".note-toolbar")).toHaveAttribute("data-dock", "top");
+  await page.locator("#noteToolbarDock").selectOption("right");
+  await expect(page.locator(".note-toolbar")).toHaveAttribute("data-dock", "right");
+  await page.locator("#noteToolbarDock").selectOption("bottom");
+  await expect(page.locator(".note-toolbar")).toHaveAttribute("data-dock", "bottom");
+  await page.locator("#noteToolbarDock").selectOption("left");
+  await expect(page.locator(".note-toolbar")).toHaveAttribute("data-dock", "left");
+  await page.locator("#notePagesBtn").click();
+  await expect(page.locator("#notePageSidebar")).toBeHidden();
+
+  await penButton.click();
+  await stage.dispatchEvent("pointerdown", {
+    pointerId: 1303, pointerType: "pen", button: 0, pressure: .5,
+    clientX: box.x + box.width * .2, clientY: box.y + box.height * .48
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 1303, pointerType: "pen", button: 0, pressure: .5,
+    clientX: box.x + box.width * .36, clientY: box.y + box.height * .52
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 1303, pointerType: "pen", button: 0, pressure: .5,
+    clientX: box.x + box.width * .56, clientY: box.y + box.height * .47
+  });
+  await page.waitForTimeout(750);
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 1303, pointerType: "pen", button: 0, pressure: .5,
+    clientX: box.x + box.width * .62, clientY: box.y + box.height * .5
+  });
+  await stage.dispatchEvent("pointerup", {
+    pointerId: 1303, pointerType: "pen", button: 0,
+    clientX: box.x + box.width * .62, clientY: box.y + box.height * .5
+  });
+  const straightPath = stage.locator('path.note-element[data-element-id]').last();
+  await expect(straightPath).toBeVisible();
+  expect((await straightPath.getAttribute("d")).match(/L/g) || []).toHaveLength(1);
+
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 30_000 });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorView")).toBeVisible({ timeout: 20_000 });
+  await expect(page.locator(".note-toolbar")).toHaveAttribute("data-dock", "left");
+  await expect(page.locator("#notePageSidebar")).toBeHidden();
+  await page.locator('[data-note-tool="pen"]').click();
+  await expect(page.locator("#noteToolSettingsTitle")).toHaveText("ペン設定");
+  await expect(page.locator("#noteWidthInput")).toHaveValue("72");
+  await expect(page.locator("#noteColorInput")).toHaveValue("#ef4444");
+  await page.locator('[data-note-tool="highlighter"]').click();
+  await page.locator('[data-note-tool="highlighter"]').click();
+  await expect(page.locator("#noteWidthInput")).toHaveValue("82");
+  await expect(page.locator("#noteColorInput")).toHaveValue("#6ce5ff");
+});
+
 test("@authenticated lineは移動・保存再読込でき、後続panのpointercancelで巻き戻らない", async ({ page }) => {
   test.setTimeout(90_000);
   const user = await createUser();
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("line変形E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
 
   const stage = page.locator("#notePageStage");
   const box = await stage.boundingBox();
@@ -522,15 +754,132 @@ test("@authenticated lineは移動・保存再読込でき、後続panのpointer
   expect(Number(await line.getAttribute("x1"))).toBeCloseTo(movedX, 6);
   await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
 
-  await page.locator("#closeNoteBtn").click();
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await page.locator(".note-card:has-text('line変形E2Eノート') button", { hasText: "編集" }).click();
   const reloadedLine = page.locator("#notePageStage line:not(.note-element-hit)");
   await expect(reloadedLine).toHaveCount(1);
   expect(Number(await reloadedLine.getAttribute("x1"))).toBeCloseTo(movedX, 6);
+});
+
+test("@authenticated 読み取り専用タブではUndo・Redo・コピー貼り付け・削除・画像貼り付けを無効にする", async ({ page }) => {
+  test.setTimeout(90_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("読み取り専用ガードE2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests });
+
+  const stage = page.locator("#notePageStage");
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  await openPageSidebar(page);
+  await page.locator('[data-page-action="add-blank"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("2 / 2");
+  await page.locator("#notePageList .note-page-thumbnail").first().click();
+  const drawStroke = async (pointerId, yOffset) => {
+    await stage.dispatchEvent("pointerdown", {
+      pointerId, pointerType: "mouse", button: 0,
+      clientX: box.x + box.width * .2, clientY: box.y + box.height * yOffset
+    });
+    await stage.dispatchEvent("pointermove", {
+      pointerId, pointerType: "mouse", button: 0, pressure: .5,
+      clientX: box.x + box.width * .6, clientY: box.y + box.height * (yOffset + .04)
+    });
+    await stage.dispatchEvent("pointerup", {
+      pointerId, pointerType: "mouse", button: 0,
+      clientX: box.x + box.width * .6, clientY: box.y + box.height * (yOffset + .04)
+    });
+  };
+
+  await drawStroke(41, .2);
+  await drawStroke(42, .35);
+  await expect(stage.locator("[data-element-id]")).toHaveCount(2);
+  await page.locator("#noteUndoBtn").click();
+  await expect(stage.locator("[data-element-id]")).toHaveCount(1);
+  await page.locator('[data-note-tool="select"]').click();
+  await stage.locator("[data-element-id]").click();
+  await expect(stage.locator(".note-selected")).toHaveCount(1);
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+
+  const takeover = await page.context().newPage();
+  await guardProductionFirebase(takeover, blockedRequests);
+  try {
+    const takeoverUrl = new URL(page.url());
+    takeoverUrl.searchParams.set("editorTabId", crypto.randomUUID());
+    await takeover.goto(takeoverUrl.toString(), { waitUntil: "domcontentloaded" });
+    await expect(takeover.locator("#noteEditorView")).toBeVisible({ timeout: 20_000 });
+    await expect(takeover.locator("#noteEditorLockBanner")).toContainText("別のタブで編集中");
+    await takeover.locator("#noteEditorTakeoverBtn").click();
+    await expect(takeover.locator("#noteEditorView")).not.toHaveClass(/is-readonly/);
+    await expect(page.locator("#noteEditorView")).toHaveClass(/is-readonly/);
+    await expect(page.locator("#noteTitleInput")).toHaveAttribute("readonly", "");
+    await expect(page.locator('[data-note-action="rename"]')).toBeDisabled();
+    await expect(page.locator('[data-note-action="duplicate"]')).toBeDisabled();
+    await expect(page.locator('[data-note-action="delete"]')).toBeDisabled();
+    await expect(page.locator("#noteBackgroundBtn")).toBeDisabled();
+    await openPageSidebar(page);
+    await expect(page.locator('[data-page-action="add-blank"]')).toBeDisabled();
+    const beforeState = await readNotes(user.uid);
+    const protectedBefore = beforeState.notes.find(note => note.title === "読み取り専用ガードE2Eノート");
+    const leakedDialogs = [];
+    page.on("dialog", async dialog => {
+      leakedDialogs.push(dialog.message());
+      await dialog.accept();
+    });
+    await page.evaluate(() => {
+      const title = document.querySelector("#noteTitleInput");
+      title.readOnly = false;
+      title.value = "不正な名前変更";
+      title.dispatchEvent(new Event("change", { bubbles: true }));
+      [
+        '[data-note-action="rename"]',
+        '[data-note-action="duplicate"]',
+        '[data-note-action="delete"]',
+        "#noteBackgroundBtn",
+        '[data-page-action="add-blank"]',
+        "#notePageList .note-page-row-actions button:last-child"
+      ].forEach(selector => {
+        const button = document.querySelector(selector);
+        if (!button) return;
+        button.disabled = false;
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      });
+    });
+    await page.waitForTimeout(1000);
+    const afterState = await readNotes(user.uid);
+    const protectedAfter = afterState.notes.find(note => note.id === protectedBefore.id);
+    expect(leakedDialogs).toEqual([]);
+    expect(afterState.notes).toHaveLength(beforeState.notes.length);
+    expect(protectedAfter.title).toBe(protectedBefore.title);
+    expect(protectedAfter.deletedAt || null).toBe(protectedBefore.deletedAt || null);
+    expect(protectedAfter.pages).toHaveLength(protectedBefore.pages.length);
+    expect(protectedAfter.pages.map(item => ({ pageId: item.pageId, order: item.order, background: item.background })))
+      .toEqual(protectedBefore.pages.map(item => ({ pageId: item.pageId, order: item.order, background: item.background })));
+
+    await page.locator("#noteUndoBtn").click();
+    await page.locator("#noteRedoBtn").click();
+    await page.keyboard.press("Delete");
+    await expect(stage.locator("[data-element-id]")).toHaveCount(1);
+
+    await page.evaluate(base64 => {
+      const bytes = Uint8Array.from(atob(base64), value => value.charCodeAt(0));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([bytes], "blocked-paste.png", { type: "image/png" }));
+      document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer }));
+    }, TEST_PNG.toString("base64"));
+    await expect.poll(() => localNoteStoreCounts(page)).toMatchObject({ pendingAssets: 0 });
+    await expect(stage.locator("[data-element-id]")).toHaveCount(1);
+
+    await page.keyboard.press("Control+c");
+    await page.locator("#noteEditorTakeoverBtn").click();
+    await expect(page.locator("#noteEditorView")).not.toHaveClass(/is-readonly/);
+    await page.keyboard.press("Control+v");
+    await expect(stage.locator("[data-element-id]")).toHaveCount(1);
+    expect(blockedRequests).toEqual([]);
+  } finally {
+    await takeover.close();
+  }
 });
 
 test("@authenticated ハンドルで図形変形・回転・arrow端点移動し自由形投げ縄で複数選択する", async ({ page }) => {
@@ -539,7 +888,7 @@ test("@authenticated ハンドルで図形変形・回転・arrow端点移動し
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("直接変形E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
   const stage = page.locator("#notePageStage");
   await stage.scrollIntoViewIfNeeded();
   const box = await stage.boundingBox();
@@ -561,6 +910,7 @@ test("@authenticated ハンドルで図形変形・回転・arrow端点移動し
 
   await page.locator('[data-note-tool="select"]').click();
   const rectangle = stage.locator("g.note-element:has(rect:not(.note-element-hit))");
+  await stage.locator(".note-paper-layer").evaluate(node => { node.dataset.renderProbe = "persistent-background"; });
   await rectangle.locator(".note-element-hit").click({ position: { x: 4, y: 4 } });
   await expect(stage.locator('[data-selection-overlay="true"]')).toBeVisible();
   await expect(stage.locator('[data-transform-handle^="resize-"]')).toHaveCount(8);
@@ -602,10 +952,14 @@ test("@authenticated ハンドルで図形変形・回転・arrow端点移動し
   expect(Number(await stage.locator("line[marker-end]").getAttribute("x2"))).toBeGreaterThan(arrowEndBefore);
 
   // A lasso is one continuous pointer gesture around both shapes.
-  await page.mouse.move(point(.06, .06).x, point(.06, .06).y);
+  const lassoBox = await stage.boundingBox();
+  const lassoPoint = (x, y) => ({ x: lassoBox.x + lassoBox.width * x, y: lassoBox.y + lassoBox.height * y });
+  await page.mouse.move(lassoPoint(.04, .1).x, lassoPoint(.04, .1).y);
   await page.mouse.down();
-  for (const vertex of [point(.72, .06), point(.72, .58), point(.06, .58), point(.06, .06)]) {
+  const lassoVertices = [lassoPoint(.75, .1), lassoPoint(.75, .52), lassoPoint(.04, .52), lassoPoint(.04, .1)];
+  for (const [index, vertex] of lassoVertices.entries()) {
     await page.mouse.move(vertex.x, vertex.y, { steps: 5 });
+    if (index === 0) await expect(stage.locator(".note-lasso-path")).toHaveCount(1);
   }
   await page.mouse.up();
   await expect(stage.locator(".note-element.note-selected")).toHaveCount(2);
@@ -626,6 +980,7 @@ test("@authenticated ハンドルで図形変形・回転・arrow端点移動し
   });
   await expect.poll(async () => (await stage.locator('[data-selection-overlay="true"]').boundingBox()).width)
     .toBeGreaterThan(selectionBeforeCancel.width);
+  await expect(stage.locator('.note-paper-layer[data-render-probe="persistent-background"]')).toHaveCount(1);
   await stage.dispatchEvent("pointercancel", {
     pointerId: 71, pointerType: "mouse", button: 0,
     clientX: multiResizeBox.x + multiResizeBox.width / 2 + 45,
@@ -664,7 +1019,7 @@ test("@authenticated 日本語複数行テキストを再編集し書式・配�
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("日本語テキストE2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
   const stage = page.locator("#notePageStage");
   await stage.scrollIntoViewIfNeeded();
   const box = await stage.boundingBox();
@@ -717,7 +1072,7 @@ test("@authenticated ハイライト・オブジェクト消しゴム・ピク�
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("消しゴムE2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
   const stage = page.locator("#notePageStage");
   await stage.scrollIntoViewIfNeeded();
   const box = await stage.boundingBox();
@@ -858,18 +1213,20 @@ test("@authenticated 画像Storage失敗時はIndexedDBへ保持し再読込後�
   test.setTimeout(90_000);
   const blockedRequests = await guardProductionFirebase(page);
   const dialogs = [];
-  page.on("dialog", async dialog => {
+  const onDialog = async dialog => {
     dialogs.push(dialog.message());
     await dialog.accept();
-  });
+  };
+  page.on("dialog", onDialog);
   const user = await createUser();
   await login(page, user);
   let journalSeenBeforeUpload = false;
 
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("画像復旧E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), {
+    blockedRequests, onDialog
+  });
 
   await page.route("**/v0/b/demo-dental-qa.firebasestorage.app/o**", async route => {
     const request = route.request();
@@ -905,9 +1262,6 @@ test("@authenticated 画像Storage失敗時はIndexedDBへ保持し再読込後�
   });
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await page.locator(".note-card:has-text('画像復旧E2Eノート') button", { hasText: "編集" }).click();
   await expect(page.locator("#notePageStage .note-image-element img")).toHaveAttribute("src", /blob:/, { timeout: 20_000 });
   await page.locator(".note-more-menu summary").click();
   await page.locator('[data-note-action="export"]').click();
@@ -927,9 +1281,6 @@ test("@authenticated 画像Storage失敗時はIndexedDBへ保持し再読込後�
 
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await page.locator(".note-card:has-text('画像復旧E2Eノート') button", { hasText: "編集" }).click();
   await expect(page.locator("#notePageStage .note-image-element")).toHaveCount(1, { timeout: 20_000 });
   const stored = await readNotes(user.uid);
   expect(stored.notes[0].pages[0].contentRevision).toBeGreaterThan(0);
@@ -944,8 +1295,7 @@ test("@authenticated 一般ページ下書きも再読込後に自動再送す�
 
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("下書き再送E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests });
 
   const storedBefore = await readNotes(user.uid);
   const note = storedBefore.notes.find(item => item.title === "下書き再送E2Eノート");
@@ -976,9 +1326,6 @@ test("@authenticated 一般ページ下書きも再読込後に自動再送す�
 
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await page.locator(".note-card:has-text('下書き再送E2Eノート') button", { hasText: "編集" }).click();
   await expect(page.locator("#notePageStage path[data-element-id]")).toHaveCount(1, { timeout: 20_000 });
   await expect.poll(async () => {
     const stored = await readNotes(user.uid);
@@ -995,8 +1342,7 @@ test("@authenticated オンライン状態が反復しても未送信下書き�
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("再送排他E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests });
 
   const storedBefore = await readNotes(user.uid);
   const note = storedBefore.notes.find(item => item.title === "再送排他E2Eノート");
@@ -1023,7 +1369,6 @@ test("@authenticated オンライン状態が反復しても未送信下書き�
       savedAt: ""
     }
   });
-  await page.locator("#closeNoteBtn").click();
   await expect.poll(() => localNoteStoreCounts(page)).toMatchObject({ pageDrafts: 1, pendingSaves: 1 });
 
   let uploadCount = 0;
@@ -1164,8 +1509,7 @@ test("@authenticated 基準revisionのない旧下書きは推測保存せず競
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("基準不明E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests });
 
   const storedBefore = await readNotes(user.uid);
   const note = storedBefore.notes.find(item => item.title === "基準不明E2Eノート");
@@ -1190,7 +1534,6 @@ test("@authenticated 基準revisionのない旧下書きは推測保存せず競
       savedAt: ""
     }
   });
-  await page.locator("#closeNoteBtn").click();
   await page.evaluate(() => {
     window.__noteRecoveryOnline = true;
     window.dispatchEvent(new Event("online"));
@@ -1214,8 +1557,7 @@ test("@authenticated 復旧中に更新されたIndexedDB下書きをcompare-and
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("復旧競合E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests });
 
   const storedBefore = await readNotes(user.uid);
   const note = storedBefore.notes.find(item => item.title === "復旧競合E2Eノート");
@@ -1243,8 +1585,6 @@ test("@authenticated 復旧中に更新されたIndexedDB下書きをcompare-and
     expectedRevision: 0,
     content: originalContent
   });
-  await page.locator("#closeNoteBtn").click();
-
   let releaseUpload;
   let notifyUploadStarted;
   const uploadGate = new Promise(resolve => { releaseUpload = resolve; });
@@ -1313,8 +1653,7 @@ test("@authenticated 再送前にクラウドが更新済みなら下書きを�
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("下書き競合E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests });
 
   const storedBefore = await readNotes(user.uid);
   const note = storedBefore.notes.find(item => item.title === "下書き競合E2Eノート");
@@ -1344,15 +1683,11 @@ test("@authenticated 再送前にクラウドが更新済みなら下書きを�
 
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await expect(page.locator(".note-card:has-text('下書き競合E2Eノート')")).toContainText("競合あり", { timeout: 20_000 });
+  await expect(page.locator("#noteSaveStatus")).toContainText("競合あり", { timeout: 20_000 });
   await expect.poll(() => localNoteStoreCounts(page)).toEqual({ pendingAssets: 0, pageDrafts: 1, pendingSaves: 1, conflicts: 1 });
   const storedAfter = await readNotes(user.uid);
   expect(storedAfter.notes.find(item => item.id === note.id)?.pages[0]?.contentRevision).toBe(1);
 
-  await page.locator(".note-card:has-text('下書き競合E2Eノート') button", { hasText: "編集" }).click();
-  await expect(page.locator("#noteSaveStatus")).toContainText("競合あり");
   await expect(page.locator("#notePageStage [data-element-id]")).toHaveCount(1);
   expect(blockedRequests).toEqual([]);
 });
@@ -1360,13 +1695,14 @@ test("@authenticated 再送前にクラウドが更新済みなら下書きを�
 test("@authenticated 削除済みノートの端末下書きを一覧から新規ノートへ復元する", async ({ page }) => {
   test.setTimeout(90_000);
   const blockedRequests = await guardProductionFirebase(page);
-  page.on("dialog", dialog => dialog.accept());
+  const dialogs = [];
+  const onDialog = dialog => { dialogs.push(`${dialog.type()}: ${dialog.message()}`); return dialog.accept(); };
+  page.on("dialog", onDialog);
   const user = await createUser();
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("孤立下書きE2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests, onDialog });
 
   const before = await readNotes(user.uid);
   const sourceNote = before.notes.find(item => item.title === "孤立下書きE2Eノート");
@@ -1398,14 +1734,19 @@ test("@authenticated 削除済みノートの端末下書きを一覧から新�
     deletedReason: "user"
   });
 
-  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.goto("/?firebaseEmulator=1", { waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
   await page.locator("#tabBtnPdf").click();
   await page.locator("#noteModeBtn").click();
   const recoveryCard = page.locator(".note-recovery-card");
   await expect(recoveryCard).toContainText("一覧にないノートの未保存下書き", { timeout: 20_000 });
-  await recoveryCard.getByRole("button", { name: "新規ノートとして復元" }).click();
-  await expect(page.locator("#noteEditorView")).toBeVisible({ timeout: 20_000 });
+  try {
+    page = await openEditorPopup(page, () => recoveryCard.getByRole("button", { name: "新規ノートとして復元" }).click(), {
+      blockedRequests, onDialog
+    });
+  } catch (error) {
+    throw new Error(`${error.message}\nDialogs: ${dialogs.join(" | ")}`);
+  }
   await expect(page.locator("#notePageStage path[data-element-id]")).toHaveCount(1);
   await expect.poll(() => localNoteStoreCounts(page)).toEqual({
     pendingAssets: 0,
@@ -1425,8 +1766,7 @@ test("@authenticated 画像アップロード中にページを切り替えて�
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("画像ページ固定E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests });
 
   let releaseUpload;
   let uploadStarted;
@@ -1475,6 +1815,8 @@ test("@authenticated 同じ教材を2画面で同時に開いても既定ノー�
   const blockedRequests = await guardProductionFirebase(page);
   const secondPage = await page.context().newPage();
   const secondBlockedRequests = await guardProductionFirebase(secondPage);
+  let firstEditor = null;
+  let secondEditor = null;
   const user = await createUser();
   const material = await seedOpenableMaterial(user.uid);
 
@@ -1491,10 +1833,13 @@ test("@authenticated 同じ教材を2画面で同時に開いても既定ノー�
 
     const firstMaterialButton = page.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" });
     const secondMaterialButton = secondPage.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" });
-    await Promise.all([firstMaterialButton.click(), secondMaterialButton.click()]);
+    [firstEditor, secondEditor] = await Promise.all([
+      openEditorPopup(page, () => firstMaterialButton.click(), { blockedRequests }),
+      openEditorPopup(secondPage, () => secondMaterialButton.click(), { blockedRequests: secondBlockedRequests })
+    ]);
     await Promise.all([
-      expect(page.locator("#noteEditorView")).toBeVisible(),
-      expect(secondPage.locator("#noteEditorView")).toBeVisible()
+      expect(firstEditor.locator("#noteEditorView")).toBeVisible(),
+      expect(secondEditor.locator("#noteEditorView")).toBeVisible()
     ]);
 
     const stored = await readNotes(user.uid);
@@ -1510,6 +1855,8 @@ test("@authenticated 同じ教材を2画面で同時に開いても既定ノー�
     expect(blockedRequests).toEqual([]);
     expect(secondBlockedRequests).toEqual([]);
   } finally {
+    await firstEditor?.close().catch(() => {});
+    await secondEditor?.close().catch(() => {});
     await secondPage.close();
   }
 });
@@ -1536,8 +1883,9 @@ test("@authenticated 既定ノートの作成失敗記録がある場合は同�
 
   await page.locator("#newNoteBtn").click();
   await page.locator('[data-create-note="material"]').click();
-  await page.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" }).click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" }).click(), {
+    blockedRequests
+  });
   await expect(page.locator("#notePageCounter")).toHaveText("1 / 1");
 
   const stored = await readNotes(user.uid);
@@ -1550,22 +1898,24 @@ test("@authenticated 既定ノートの作成失敗記録がある場合は同�
 test("@authenticated ユーザー削除済みノートがあってもページ数変更後は新しい教材既定ノートを作る", async ({ page }) => {
   test.setTimeout(120_000);
   const blockedRequests = await guardProductionFirebase(page);
-  page.on("dialog", async dialog => { await dialog.accept(); });
+  const onDialog = async dialog => { await dialog.accept(); };
+  page.on("dialog", onDialog);
   const user = await createUser();
   const material = await seedOpenableMaterial(user.uid);
   await login(page, user);
 
   await page.locator("#newNoteBtn").click();
   await page.locator('[data-create-note="material"]').click();
-  await page.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" }).click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
-  await expect(page.locator("#notePageCounter")).toHaveText("1 / 1");
+  const firstEditor = await openEditorPopup(page, () => page.locator("#noteMaterialPicker button", { hasText: "既定ノート更新E2E教材" }).click(), {
+    blockedRequests, onDialog
+  });
+  await expect(firstEditor.locator("#notePageCounter")).toHaveText("1 / 1");
   const firstState = await readNotes(user.uid);
   const firstNote = firstState.notes.find(item => item.sourceMaterialId === material.materialId && !item.deletedAt);
   expect(firstNote).toBeTruthy();
   expect(firstNote.id).toBe(material.defaultNoteId);
 
-  await page.locator("#closeNoteBtn").click();
+  await firstEditor.close();
   await updateNoteRoot(user.uid, firstNote.id, {
     deletedAt: new Date().toISOString(),
     deletedReason: "user",
@@ -1589,8 +1939,10 @@ test("@authenticated ユーザー削除済みノートがあってもページ�
   const archivedNote = replacedMaterialState.notes.find(item => item.id === firstNote.id);
   expect(archivedNote.deletedReason).toBe("material-replaced");
 
-  await materialRow.locator("[data-open-note]").click();
-  await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
+  const replacementEditor = await openEditorPopup(page, () => materialRow.locator("[data-open-note]").click(), {
+    blockedRequests, onDialog
+  });
+  await expect(replacementEditor.locator("#notePageCounter")).toHaveText("1 / 2");
 
   const replacedState = await readNotes(user.uid);
   const linkedNotes = replacedState.notes.filter(item => item.sourceMaterialId === material.materialId);
@@ -1602,20 +1954,22 @@ test("@authenticated ユーザー削除済みノートがあってもページ�
   expect(blockedRequests).toEqual([]);
 });
 
-test("@authenticated クラウド版採用後は古い競合キューを再送しない", async ({ page }) => {
+test("@authenticated 競合直後にクラウド版または競合コピーを選べ、古い競合キューを再送しない", async ({ page }) => {
   test.setTimeout(90_000);
   const blockedRequests = await guardProductionFirebase(page);
-  page.on("dialog", async dialog => {
+  const onDialog = async dialog => {
     if (dialog.message().includes("ローカル版を競合コピー")) await dialog.dismiss();
     else if (dialog.type() === "prompt" && dialog.message().includes("ノートを閉じる操作")) await dialog.accept("continue");
     else await dialog.accept();
-  });
+  };
+  page.on("dialog", onDialog);
   const user = await createUser();
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("競合破棄E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), {
+    blockedRequests, onDialog
+  });
   const stage = page.locator("#notePageStage");
   const box = await stage.boundingBox();
   expect(box).toBeTruthy();
@@ -1636,37 +1990,91 @@ test("@authenticated クラウド版採用後は古い競合キューを再送�
   const notePage = note.pages[0];
   expect(notePage.contentRevision).toBe(1);
 
-  await updateNotePage(user.uid, note.id, notePage.pageId, { contentRevision: 2 });
+  await updateNotePage(user.uid, note.id, notePage.pageId, {
+    contentRevision: 2,
+    lastWriterSessionId: "external-writer-session",
+    lastClientInstanceId: "external-client",
+    lastClientMutationId: "external-mutation"
+  });
   await drawStroke(32, .25);
   await expect(page.locator("#noteSaveStatus")).toContainText("競合あり", { timeout: 20_000 });
   await expect.poll(() => localNoteStoreCounts(page)).toMatchObject({ pageDrafts: 1, pendingSaves: 1, conflicts: 1 });
-  await page.locator("#closeNoteBtn").click();
-  await expect(page.locator("#noteListView")).toBeVisible();
-  await expect(page.locator(".note-card:has-text('競合破棄E2Eノート')")).toContainText("競合あり");
-  await page.locator(".note-card:has-text('競合破棄E2Eノート') button", { hasText: "競合を解決" }).click();
+  await expect(stage.locator("[data-element-id]")).toHaveCount(2);
+  await expect(page.locator("#noteBackgroundBtn")).toBeDisabled();
+  await openPageSidebar(page);
+  await expect(page.locator("#notePageList .note-page-row-actions button").first()).toBeDisabled();
+  await page.locator("#noteUndoBtn").click();
+  await expect(stage.locator("[data-element-id]")).toHaveCount(2);
+  await page.locator('#notePageConflictBanner [data-conflict-action="cloud"]').click();
   await expect.poll(() => localNoteStoreCounts(page)).toEqual({ pendingAssets: 0, pageDrafts: 0, pendingSaves: 0, conflicts: 0 });
+  await expect(stage.locator("[data-element-id]")).toHaveCount(1);
 
-  await page.locator(".note-card:has-text('競合破棄E2Eノート') button", { hasText: "編集" }).click();
-  await page.locator("#closeNoteBtn").click();
-  await page.waitForTimeout(1200);
+  await updateNotePage(user.uid, note.id, notePage.pageId, {
+    contentRevision: 3,
+    lastWriterSessionId: "second-external-writer-session",
+    lastClientInstanceId: "second-external-client",
+    lastClientMutationId: "second-external-mutation"
+  });
+  await drawStroke(33, .4);
+  await expect(page.locator("#noteSaveStatus")).toContainText("競合あり", { timeout: 20_000 });
+  await expect.poll(() => localNoteStoreCounts(page)).toMatchObject({ pageDrafts: 1, pendingSaves: 1, conflicts: 1 });
+  await page.locator('#notePageConflictBanner [data-conflict-action="copy"]').click();
+  await expect.poll(() => localNoteStoreCounts(page)).toEqual({ pendingAssets: 0, pageDrafts: 0, pendingSaves: 0, conflicts: 0 });
+  await expect.poll(async () => {
+    const stored = await readNotes(user.uid);
+    return stored.notes.some(item => item.title.includes("競合コピー") && item.status === "ready");
+  }, { timeout: 20_000 }).toBe(true);
+
+  await page.close();
+  await new Promise(resolve => setTimeout(resolve, 1200));
   const after = await readNotes(user.uid);
-  expect(after.notes.find(item => item.id === note.id)?.pages[0]?.contentRevision).toBe(2);
+  expect(after.notes.find(item => item.id === note.id)?.pages[0]?.contentRevision).toBe(3);
   expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 2本指ピンチ中は描画や1本指パンを開始しない", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("ピンチ排他E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
+  const stage = page.locator("#notePageStage");
+  const viewport = page.locator("#noteViewport");
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  const point = (x, y) => ({ clientX: box.x + box.width * x, clientY: box.y + box.height * y });
+  await page.locator('[data-note-tool="pan"]').click();
+  const initialScrollTop = await viewport.evaluate(node => {
+    node.scrollTop = Math.min(240, node.scrollHeight - node.clientHeight);
+    return node.scrollTop;
+  });
+  await stage.dispatchEvent("pointerdown", { pointerId: 81, pointerType: "touch", button: 0, ...point(.3, .3), width: 8, height: 8 });
+  await stage.dispatchEvent("pointermove", { pointerId: 81, pointerType: "touch", button: 0, ...point(.3, .2), width: 8, height: 8 });
+  await expect.poll(() => viewport.evaluate(node => node.scrollTop)).not.toBe(initialScrollTop);
+  await stage.dispatchEvent("pointerdown", { pointerId: 82, pointerType: "touch", button: 0, ...point(.7, .65), width: 8, height: 8 });
+  await expect.poll(() => viewport.evaluate(node => node.scrollTop)).toBe(initialScrollTop);
+  await stage.dispatchEvent("pointermove", { pointerId: 82, pointerType: "touch", button: 0, ...point(.86, .78), width: 8, height: 8 });
+  await stage.dispatchEvent("pointerup", { pointerId: 82, pointerType: "touch", button: 0, ...point(.86, .78), width: 8, height: 8 });
+  await stage.dispatchEvent("pointerup", { pointerId: 81, pointerType: "touch", button: 0, ...point(.3, .3), width: 8, height: 8 });
+  await expect(stage.locator("[data-element-id]")).toHaveCount(0);
+  await expect.poll(() => stage.evaluate(node => node.style.transform)).toContain("scale(");
+  expect(Number(await stage.evaluate(node => getComputedStyle(node).getPropertyValue("--page-zoom")))).toBeGreaterThan(1);
 });
 
 test("@authenticated ページ追加・並び替え・削除はorderRevision競合を検出し、再読込後に再試行できる", async ({ page }) => {
   test.setTimeout(90_000);
   const dialogs = [];
-  page.on("dialog", async dialog => {
+  const onDialog = async dialog => {
     dialogs.push(dialog.message());
     await dialog.accept();
-  });
+  };
+  page.on("dialog", onDialog);
   const user = await createUser();
   await login(page, user);
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("ページ競合E2Eノート");
-  await page.locator('[data-create-note="blank"]').click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { onDialog });
   const [{ id: noteId }] = (await readNotes(user.uid)).notes;
 
   await updateNoteRoot(user.uid, noteId, { orderRevision: 2 });
@@ -1677,9 +2085,6 @@ test("@authenticated ページ追加・並び替え・削除はorderRevision競�
 
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await page.locator(".note-card:has-text('ページ競合E2Eノート') button", { hasText: "編集" }).click();
   await openPageSidebar(page);
   await page.locator('[data-page-action="add-ruled"]').click();
   await expect(page.locator("#notePageCounter")).toHaveText("2 / 2");
@@ -1692,9 +2097,6 @@ test("@authenticated ページ追加・並び替え・削除はorderRevision競�
 
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await page.locator(".note-card:has-text('ページ競合E2Eノート') button", { hasText: "編集" }).click();
   await openPageSidebar(page);
   await page.locator("#notePageList .note-page-row-actions").nth(1).getByRole("button", { name: "↑" }).click();
   await expect.poll(async () => {
@@ -1710,9 +2112,6 @@ test("@authenticated ページ追加・並び替え・削除はorderRevision競�
 
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
-  await page.locator("#tabBtnPdf").click();
-  await page.locator("#noteModeBtn").click();
-  await page.locator(".note-card:has-text('ページ競合E2Eノート') button", { hasText: "編集" }).click();
   await openPageSidebar(page);
   await page.locator("#notePageList .note-page-row-actions").nth(1).getByRole("button", { name: "削除" }).click();
   await expect(page.locator("#notePageCounter")).toHaveText("1 / 1");
@@ -1722,15 +2121,17 @@ test("@authenticated PDFを教材へ追加せずノート専用Storage背景と�
   test.setTimeout(120_000);
   const blockedRequests = await guardProductionFirebase(page);
   const pageErrors = [];
-  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  const onPageError = error => recordUnexpectedPageError(pageErrors, error);
+  page.on("pageerror", onPageError);
   const user = await createUser();
   await login(page, user);
   const fixture = await createPdfFixture({ pageCount: 2 });
 
   await page.locator("#newNoteBtn").click();
   await page.locator("#newNoteTitle").fill("E2E PDFノート");
-  await page.locator("#notePdfInput").setInputFiles({ name: "two-pages.pdf", mimeType: "application/pdf", buffer: fixture });
-  await expect(page.locator("#noteEditorView")).toBeVisible({ timeout: 90_000 });
+  page = await openEditorPopup(page, () => page.locator("#notePdfInput").setInputFiles({
+    name: "two-pages.pdf", mimeType: "application/pdf", buffer: fixture
+  }), { blockedRequests, onPageError, timeout: 120_000 });
   await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
   await expect(page.locator("#notePageStage .note-background-image")).toBeVisible({ timeout: 20_000 });
 
@@ -1761,15 +2162,14 @@ test("@authenticated 教材をノートで繰り返し開いても既定ノー�
   await page.locator("#addPdfBtn").click();
   await expect(page.locator("#pdfEditStatus")).toContainText("教材を追加しました", { timeout: 30_000 });
   let row = page.locator('#pdfEditTableBody tr:has-text("既定ノートE2E教材")');
-  await row.locator("[data-open-note]").click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
-  await expect(page.locator("#notePageStage .note-background-image")).toBeVisible({ timeout: 20_000 });
-  await page.locator("#closeNoteBtn").click();
+  let editor = await openEditorPopup(page, () => row.locator("[data-open-note]").click(), { blockedRequests });
+  await expect(editor.locator("#notePageStage .note-background-image")).toBeVisible({ timeout: 20_000 });
+  await editor.close();
 
   await page.locator("#pdfEditModeBtn").click();
   row = page.locator('#pdfEditTableBody tr:has-text("既定ノートE2E教材")');
-  await row.locator("[data-open-note]").click();
-  await expect(page.locator("#noteEditorView")).toBeVisible();
+  editor = await openEditorPopup(page, () => row.locator("[data-open-note]").click(), { blockedRequests });
+  await expect(editor.locator("#noteEditorView")).toBeVisible();
 
   const stored = await readNotes(user.uid);
   const linked = stored.notes.filter(note => note.type === "material-linked");

@@ -17,6 +17,10 @@ service cloud.firestore {
       return !data.keys().hasAny([field]) || (data[field] is list && data[field].size() <= maxSize);
     }
 
+    function optionalBoundedString(data, field, maxSize) {
+      return !data.keys().hasAny([field]) || (data[field] is string && data[field].size() <= maxSize);
+    }
+
     function validNote(data) {
       return validSchemaVersion(data)
         && (!data.keys().hasAny(['title']) || (data.title is string && data.title.size() <= 200))
@@ -39,6 +43,11 @@ service cloud.firestore {
         && optionalNonNegativeInt(data, 'order')
         && optionalNonNegativeInt(data, 'contentRevision')
         && optionalNonNegativeInt(data, 'noteMaskCount')
+        && optionalNonNegativeInt(data, 'lastBaseRevision')
+        && optionalBoundedString(data, 'lastClientInstanceId', 128)
+        && optionalBoundedString(data, 'lastEditorTabId', 128)
+        && optionalBoundedString(data, 'lastWriterSessionId', 128)
+        && optionalBoundedString(data, 'lastClientMutationId', 128)
         && (!data.keys().hasAny(['deletedAt']) || data.deletedAt == null || data.deletedAt is timestamp || data.deletedAt is string)
         && (!data.keys().hasAny(['contentPath']) || (
           data.contentPath is string

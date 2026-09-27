@@ -39,6 +39,7 @@ import {
   writeSplitDocuments
 } from "./services/cloud-store.js";
 
+const noteEditorRoute = new URLSearchParams(globalThis.location?.search || "").get("noteEditor") === "1";
 
 window.addEventListener("error", event => {
   console.error(event.error || event.message);
@@ -1385,7 +1386,12 @@ async function initFirebase() {
             : "Firebase接続済みです。クラウド内容を自動反映しました。"
           : "Firebase接続済みです。クラウド保存データがないため、空の初期状態を表示しています。";
         updateLoginLockedUI();
-        showTab("study");
+        if (noteEditorRoute) {
+          showTab("pdf");
+          setCombinedImageNoteMode("note");
+        } else {
+          showTab("study");
+        }
         void studyNotes.refresh();
       } catch (error) {
         if (!isSyncSessionCurrent(session)) return;

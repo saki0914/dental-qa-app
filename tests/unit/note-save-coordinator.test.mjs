@@ -175,11 +175,20 @@ test("保存中の再編集後に別タブが更新した下書きをrevision更
 test("保存競合時はローカル版をconflictsへ保持する", async () => {
   const localStore = memoryStore();
   const error = Object.assign(new Error("conflict"), { name: "NoteConflictError" });
-  const coordinator = createNoteSaveCoordinator({ localStore, debounceMs: 9999, persist: async () => { throw error; } });
+  let notifiedConflict = null;
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 9999,
+    persist: async () => { throw error; },
+    onStatus: (status, _identity, _detail, conflict) => {
+      if (status === "conflict") notifiedConflict = conflict;
+    }
+  });
   const identity = { uid: "u", noteId: "n", pageId: "p" };
   await coordinator.schedule(identity, { revision: 0, elements: [{ id: "x" }], noteMasks: [] });
   await assert.rejects(coordinator.flush(identity), /conflict/);
   assert.equal(localStore.records.has("conflicts:u|n|p"), true);
+  assert.deepEqual(notifiedConflict, localStore.records.get("conflicts:u|n|p"));
 });
 
 test("競合解決で破棄した保存状態は後続flushで再送しない", async () => {
@@ -375,5 +384,119 @@ test("reset後に遅延失敗した保存は競合レコードを作らない", 
   coordinator.reset();
   releasePersist();
   await assert.rejects(flushing, /conflict/);
+  assert.equal(localStore.records.has("conflicts:u|n|p"), false);
+});
+
+test("保存中に古いidentityで再編集・flushしてもexpectedRevisionは後退しない", async () => {
+  const localStore = memoryStore();
+  let releaseFirst;
+  let firstStarted;
+  const started = new Promise(resolve => { firstStarted = resolve; });
+  const gate = new Promise(resolve => { releaseFirst = resolve; });
+  const revisions = [];
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 9999,
+    persist: async identity => {
+      revisions.push(identity.expectedRevision);
+      if (revisions.length === 1) { firstStarted(); await gate; }
+      return { revision: identity.expectedRevision + 1 };
+    }
+  });
+  const stale = { uid: "u", noteId: "n", pageId: "p", expectedRevision: 0 };
+  await coordinator.schedule(stale, { revision: 0, elements: [{ id: "a" }], noteMasks: [] });
+  const firstFlush = coordinator.flush(stale);
+  await started;
+  await coordinator.schedule(stale, { revision: 0, elements: [{ id: "b" }], noteMasks: [] });
+  const secondFlush = coordinator.flush(stale);
+  releaseFirst();
+  await firstFlush;
+  await secondFlush;
+  await coordinator.flush(stale);
+  assert.deepEqual(revisions, [0, 1]);
+  assert.equal(localStore.records.has("conflicts:u|n|p"), false);
+});
+
+test("dirty状態へ渡された新しいidentityだけではexpectedRevisionを引き上げない", async () => {
+  const localStore = memoryStore();
+  const revisions = [];
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 9999,
+    persist: async identity => {
+      revisions.push(identity.expectedRevision);
+      return { revision: identity.expectedRevision + 1 };
+    }
+  });
+  const base = { uid: "u", noteId: "n", pageId: "p", expectedRevision: 2 };
+  await coordinator.schedule(base, { revision: 2, elements: [{ id: "dirty" }], noteMasks: [] });
+  await coordinator.flush({ ...base, expectedRevision: 9 });
+  assert.deepEqual(revisions, [2]);
+});
+
+test("未送信状態がないページは新しいidentityのexpectedRevisionを採用する", async () => {
+  const localStore = memoryStore();
+  const revisions = [];
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 9999,
+    persist: async identity => {
+      revisions.push(identity.expectedRevision);
+      return { revision: identity.expectedRevision + 1 };
+    }
+  });
+  const base = { uid: "u", noteId: "n", pageId: "p", expectedRevision: 2 };
+  await coordinator.schedule(base, { revision: 2, elements: [{ id: "first" }], noteMasks: [] });
+  await coordinator.flush(base);
+  await coordinator.schedule(
+    { ...base, expectedRevision: 7 },
+    { revision: 7, elements: [{ id: "fresh" }], noteMasks: [] }
+  );
+  await coordinator.flush({ ...base, expectedRevision: 7 });
+  assert.deepEqual(revisions, [2, 7]);
+});
+
+test("復旧保存中に新しい編集が入っても同一ページを直列化してrevisionを引き継ぐ", async () => {
+  const localStore = memoryStore();
+  const key = "u|n|p";
+  await localStore.putSavePair(
+    { key, uid: "u", noteId: "n", pageId: "p", expectedRevision: 0, mutationId: "recovery", updatedAt: "2026-01-01T00:00:00.000Z", content: { revision: 0, elements: [{ id: "recovered" }], noteMasks: [] } },
+    { key, uid: "u", noteId: "n", pageId: "p", expectedRevision: 0, mutationId: "recovery", updatedAt: "2026-01-01T00:00:00.000Z" }
+  );
+  let releaseRecovery;
+  let recoveryStarted;
+  const started = new Promise(resolve => { recoveryStarted = resolve; });
+  const gate = new Promise(resolve => { releaseRecovery = resolve; });
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const revisions = [];
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 9999,
+    persist: async identity => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      revisions.push(identity.expectedRevision);
+      if (revisions.length === 1) { recoveryStarted(); await gate; }
+      inFlight -= 1;
+      return { revision: identity.expectedRevision + 1 };
+    }
+  });
+  const stale = { uid: "u", noteId: "n", pageId: "p", expectedRevision: 0 };
+  const recovering = coordinator.recover(
+    stale,
+    { revision: 0, elements: [{ id: "recovered" }], noteMasks: [] },
+    { mutationId: "recovery", updatedAt: "2026-01-01T00:00:00.000Z" }
+  );
+  await started;
+  await coordinator.schedule(stale, { revision: 0, elements: [{ id: "new-edit" }], noteMasks: [] });
+  const flushing = coordinator.flush(stale);
+  releaseRecovery();
+  await recovering;
+  await flushing;
+  await coordinator.flush(stale);
+
+  assert.deepEqual(revisions, [0, 1]);
+  assert.equal(maxInFlight, 1);
   assert.equal(localStore.records.has("conflicts:u|n|p"), false);
 });

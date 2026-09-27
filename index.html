@@ -309,7 +309,7 @@
             <button class="note-icon-button" id="closeNoteBtn" type="button" aria-label="ノート一覧へ戻る">←</button>
             <input id="noteTitleInput" class="note-title-input" aria-label="ノート名">
             <span id="notePageCounter" class="note-page-counter">1 / 1</span>
-            <button class="note-icon-button note-mobile-pages-button" id="notePagesBtn" type="button" aria-label="ページ一覧を開く" aria-controls="notePageSidebar" aria-expanded="false">▤</button>
+            <button class="note-icon-button" id="notePagesBtn" type="button" aria-label="ページ一覧を隠す" aria-controls="notePageSidebar" aria-expanded="true">▤</button>
             <button class="note-icon-button" id="noteUndoBtn" type="button" aria-label="元に戻す" title="元に戻す">↶</button>
             <button class="note-icon-button" id="noteRedoBtn" type="button" aria-label="やり直す" title="やり直す">↷</button>
             <button class="btn soft" id="toggleNoteStudyBtn" type="button">暗記モード</button>
@@ -322,6 +322,20 @@
               <button type="button" data-note-action="delete">ノートを削除</button>
             </div></details>
           </header>
+
+          <div id="noteEditorLockBanner" class="note-editor-alert hidden" role="alert">
+            <strong id="noteEditorLockMessage">このノートは別のタブで編集中です。</strong>
+            <button type="button" id="noteEditorReadOnlyBtn">読み取り専用で開く</button>
+            <button type="button" id="noteEditorTakeoverBtn">編集をこのタブへ引き継ぐ</button>
+            <button type="button" id="noteEditorReturnBtn">既存タブへ戻る</button>
+          </div>
+          <div id="notePageConflictBanner" class="note-editor-alert danger hidden" role="alert">
+            <strong>このページは別の画面または端末でも更新されています。</strong>
+            <button type="button" data-conflict-action="cloud">クラウド版を開く</button>
+            <button type="button" data-conflict-action="copy">ローカル版を競合コピーとして保存</button>
+            <button type="button" data-conflict-action="compare">もう一度比較する</button>
+            <button type="button" data-conflict-action="list">ノート一覧へ戻る</button>
+          </div>
 
           <div class="note-editor-layout">
             <aside class="note-page-sidebar" id="notePageSidebar">
@@ -356,24 +370,31 @@
             </main>
           </div>
 
-          <div class="note-toolbar" role="toolbar" aria-label="ノート編集ツール">
-            <button type="button" data-note-tool="pan" aria-label="手のひら・移動" title="手のひら・移動">✋<span>移動</span></button>
-            <button type="button" data-note-tool="select" aria-label="選択・投げ縄" title="選択・投げ縄">⬚<span>選択</span></button>
-            <button type="button" data-note-tool="pen" class="active" aria-label="ペン" title="ペン">✎<span>ペン</span></button>
-            <button type="button" data-note-tool="highlighter" aria-label="ハイライト" title="ハイライト">▰<span>蛍光</span></button>
-            <button type="button" data-note-tool="eraser-object" aria-label="消しゴム" title="消しゴム">⌫<span>消す</span></button>
-            <button type="button" data-note-tool="shape" aria-label="図形" title="図形">○<span>図形</span></button>
-            <button type="button" data-note-tool="text" aria-label="テキスト" title="テキスト">T<span>文字</span></button>
-            <button type="button" data-note-tool="image" aria-label="画像" title="画像">▧<span>画像</span></button>
-            <button type="button" data-note-tool="mask" aria-label="暗記マスク" title="暗記マスク">■<span>マスク</span></button>
-            <button type="button" id="noteStyleBtn" aria-label="色・線設定" title="色・線設定"><i id="noteCurrentColor"></i><span>設定</span></button>
-            <button type="button" id="noteBackgroundBtn" aria-label="ページ背景設定" title="ページ背景設定">▤<span>背景</span></button>
+          <div class="note-toolbar dock-bottom" role="toolbar" aria-label="ノート編集ツール" data-dock="bottom">
+            <button type="button" id="noteToolbarDragHandle" class="note-toolbar-drag" aria-label="ツールパレットを移動" title="ドラッグして上下左右へ移動"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="7" r="1"/><circle cx="16" cy="7" r="1"/><circle cx="8" cy="12" r="1"/><circle cx="16" cy="12" r="1"/><circle cx="8" cy="17" r="1"/><circle cx="16" cy="17" r="1"/></svg></button>
+            <button type="button" data-note-tool="pan" aria-label="手のひら・移動" title="手のひら・移動"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11V7a2 2 0 0 1 4 0v3-5a2 2 0 0 1 4 0v5-3a2 2 0 0 1 4 0v7c0 5-3 8-8 8-3 0-5-2-7-5l-2-3a2 2 0 0 1 3-2l2 2"/></svg><span class="sr-only">移動</span></button>
+            <button type="button" data-note-tool="select" aria-label="選択・投げ縄" title="選択・投げ縄"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4l7 17 2-7 7-2zM15 16l4 4"/></svg><span class="sr-only">選択</span></button>
+            <button type="button" data-note-tool="pen" class="active" aria-label="ペン" title="ペン"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20l4-1 11-11-3-3L5 16zM14 7l3 3"/></svg><span class="sr-only">ペン</span></button>
+            <button type="button" data-note-tool="highlighter" aria-label="蛍光ペン" title="蛍光ペン"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 15l4 4 10-10-4-4zM3 21h10M6 14l4 4"/></svg><span class="sr-only">蛍光ペン</span></button>
+            <button type="button" data-note-tool="eraser-object" aria-label="消しゴム" title="消しゴム"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 15l8-10 8 7-7 9H7zM10 20l6-7"/></svg><span class="sr-only">消しゴム</span><b id="noteEraserBadge" aria-hidden="true">O</b></button>
+            <button type="button" data-note-tool="shape" aria-label="図形" title="図形"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="9" r="5"/><rect x="11" y="11" width="9" height="9" rx="1"/></svg><span class="sr-only">図形</span></button>
+            <button type="button" data-note-tool="text" aria-label="テキスト" title="テキスト"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M8 19h8"/></svg><span class="sr-only">テキスト</span></button>
+            <button type="button" data-note-tool="image" aria-label="画像" title="画像"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="2"/><path d="M4 17l5-5 4 4 2-2 5 4"/></svg><span class="sr-only">画像</span></button>
+            <button type="button" data-note-tool="mask" aria-label="暗記マスク" title="暗記マスク"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h10M7 14h6"/></svg><span class="sr-only">暗記マスク</span></button>
+            <button type="button" id="noteQuickSwitchBtn" aria-label="クイック切替" title="Apple Pencilダブルタップの代替: クイック切替"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h11l-3-3M17 17H6l3 3M18 7l2 2-2 2M6 17l-2-2 2-2"/></svg><span class="sr-only">クイック切替</span></button>
+            <button type="button" id="noteStyleBtn" aria-label="色・線設定" title="色・線設定"><i id="noteCurrentColor"></i><span class="sr-only">設定</span></button>
+            <button type="button" id="noteBackgroundBtn" aria-label="ページ背景設定" title="ページ背景設定"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M7 8h10M7 12h10M7 16h10"/></svg><span class="sr-only">背景</span></button>
+            <button type="button" id="noteToolbarCollapseBtn" aria-label="ツールパレットを折りたたむ" title="ツールパレットを折りたたむ"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span class="sr-only">折りたたむ</span></button>
           </div>
           <div id="noteToolSettings" class="note-tool-settings hidden">
-            <label>色 <input id="noteColorInput" type="color" value="#111111"></label>
+            <strong id="noteToolSettingsTitle">ツール設定</strong>
+            <div id="noteColorPresets" class="note-color-presets" aria-label="色候補"></div>
+            <label>その他の色 <input id="noteColorInput" type="color" value="#111111"></label>
+            <div id="noteWidthPresets" class="note-width-presets" aria-label="太さプリセット"></div>
             <label>太さ <input id="noteWidthInput" type="range" min="1" max="100" value="25"></label>
             <label>透明度 <input id="noteOpacityInput" type="range" min="5" max="100" value="100"></label>
             <label>消しゴム <select id="noteEraserMode"><option value="object">オブジェクト</option><option value="pixel">ピクセル</option></select></label>
+            <label>消しゴムサイズ <input id="noteEraserSize" type="range" min="1" max="100" value="30"></label>
             <label>図形 <select id="noteShapeType"><option value="line">直線</option><option value="arrow">矢印</option><option value="rectangle">四角形</option><option value="rounded-rectangle">角丸四角形</option><option value="ellipse">円・楕円</option><option value="triangle">三角形</option><option value="star">星</option></select></label>
             <label>線種 <select id="noteLineStyle"><option value="solid">実線</option><option value="dashed">破線</option><option value="dotted">点線</option></select></label>
             <label>塗り <input id="noteFillColor" type="color" value="#ff0000"></label>
@@ -385,6 +406,11 @@
             <label>揃え <select id="noteTextAlign"><option value="left">左</option><option value="center">中央</option><option value="right">右</option></select></label>
             <label>行間 <select id="noteLineHeight"><option value="1">狭い</option><option value="1.25" selected>標準</option><option value="1.5">広い</option><option value="2">2行</option></select></label>
             <label><input id="noteFingerDraw" type="checkbox" checked> 指で描画する</label>
+            <label><input id="notePencilMode" type="checkbox"> Apple Pencilモード</label>
+            <label><input id="noteStraightenEnabled" type="checkbox" checked> 終点長押しで直線化</label>
+            <label>パレット位置 <select id="noteToolbarDock"><option value="top">上</option><option value="right">右</option><option value="bottom">下</option><option value="left">左</option></select></label>
+            <label>クイック切替 <select id="noteQuickSwitchAction"><option value="eraser">現在ツール ↔ 消しゴム</option><option value="previous">現在ツール ↔ 前回ツール</option><option value="select">現在ツール ↔ 選択</option><option value="select-all">すべて選択</option><option value="colors">カラーパレット表示</option></select></label>
+            <p class="note-pencil-doubletap-notice">SafariのWebアプリでは、Apple Pencil本体のダブルタップを取得できません。画面上のクイック切替ボタンを使用してください。</p>
           </div>
           <input id="noteImagePhotoInput" class="hidden" type="file" accept="image/*">
           <input id="noteImageFileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp">

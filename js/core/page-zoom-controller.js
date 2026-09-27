@@ -40,10 +40,18 @@ export function restoreElementZoomAnchor(container, anchor, clientX, clientY, se
   }
 }
 
-export function createPageZoomController({ viewport, content, min = 0.8, max = 5, onChange = () => {} }) {
+export function createPageZoomController({
+  viewport,
+  content,
+  min = 0.8,
+  max = 5,
+  onChange = () => {},
+  shouldTrackTouch = () => true
+}) {
   let zoom = 1;
   let lastFitZoom = 1;
   let pinch = null;
+  let pinchGestureActive = false;
   const touches = new Map();
   const clampZoom = value => clampPageZoom(value, min, max);
 
@@ -90,10 +98,13 @@ export function createPageZoomController({ viewport, content, min = 0.8, max = 5
   function gestureEnd() { pinch = null; }
   function pointerDown(event) {
     if (event.pointerType !== "touch") return;
+    if (!shouldTrackTouch(event)) return;
     touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (touches.size !== 2) return;
     const [a, b] = [...touches.values()];
     const midpoint = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    pinchGestureActive = true;
+    viewport.dispatchEvent(new CustomEvent("pagezoomstart"));
     pinch = {
       zoom,
       distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
@@ -102,7 +113,6 @@ export function createPageZoomController({ viewport, content, min = 0.8, max = 5
       scrollTop: viewport.scrollTop,
       anchor: captureAnchor(midpoint.x, midpoint.y)
     };
-    viewport.dispatchEvent(new CustomEvent("pagezoomstart"));
   }
   function pointerMove(event) {
     if (event.pointerType !== "touch" || !touches.has(event.pointerId)) return;
@@ -119,6 +129,7 @@ export function createPageZoomController({ viewport, content, min = 0.8, max = 5
   function pointerUp(event) {
     touches.delete(event.pointerId);
     if (touches.size < 2) pinch = null;
+    if (touches.size === 0) pinchGestureActive = false;
   }
   function doubleClick(event) {
     const rect = content.getBoundingClientRect();
@@ -142,6 +153,9 @@ export function createPageZoomController({ viewport, content, min = 0.8, max = 5
 
   return {
     get zoom() { return zoom; },
+    get touchCount() { return touches.size; },
+    get isPinching() { return Boolean(pinch && touches.size >= 2); },
+    get isPinchGestureActive() { return pinchGestureActive; },
     setZoom,
     captureAnchor,
     destroy() {

@@ -1,20 +1,32 @@
 const state = {
   transactionCount: 0,
+  transactionCallCount: 0,
+  pageDataForTransaction: () => ({}),
   afterTransactionCommit: () => {}
 };
 
-export function resetFirebaseStubs({ afterTransactionCommit = () => {} } = {}) {
+export function resetFirebaseStubs({
+  afterTransactionCommit = () => {},
+  pageDataForTransaction = () => ({})
+} = {}) {
   state.transactionCount = 0;
+  state.transactionCallCount = 0;
+  state.pageDataForTransaction = pageDataForTransaction;
   state.afterTransactionCommit = afterTransactionCommit;
 }
 
 const reference = parts => ({ path: parts.join("/"), parts });
-const snapshotFor = target => {
+const snapshotFor = (target, transactionCall = 0) => {
   const isPage = target.parts.includes("pages");
   return {
     exists: () => true,
     data: () => isPage
-      ? { contentRevision: 0, noteMaskCount: 0, deletedAt: null }
+      ? {
+          contentRevision: 0,
+          noteMaskCount: 0,
+          deletedAt: null,
+          ...state.pageDataForTransaction(transactionCall)
+        }
       : { status: "ready", pendingStoragePaths: [], noteMaskCount: 0, deletedAt: null }
   };
 };
@@ -38,8 +50,9 @@ export const writeBatch = () => ({
 });
 
 export async function runTransaction(_db, updateFunction) {
+  const transactionCall = ++state.transactionCallCount;
   const transaction = {
-    get: async target => snapshotFor(target),
+    get: async target => snapshotFor(target, transactionCall),
     set: () => {},
     update: () => {}
   };

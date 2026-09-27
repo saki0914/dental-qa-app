@@ -23,7 +23,7 @@ function getProductionFirebaseAttempts(page) {
   return productionFirebaseAttemptsByPage.get(page);
 }
 
-export async function guardProductionFirebase(page) {
+export async function guardProductionFirebase(page, sharedAttempts = null) {
   const attempts = getProductionFirebaseAttempts(page);
   if (guardedPages.has(page)) return attempts;
 
@@ -31,7 +31,9 @@ export async function guardProductionFirebase(page) {
     const url = new URL(route.request().url());
     const isProductionProject = url.href.includes("dental-qa-hub-e7cce");
     if (PRODUCTION_FIREBASE_HOSTS.has(url.hostname) || isProductionProject) {
-      attempts.push(`${route.request().method()} ${url.origin}${url.pathname}`);
+      const attempt = `${route.request().method()} ${url.origin}${url.pathname}`;
+      attempts.push(attempt);
+      if (sharedAttempts && sharedAttempts !== attempts) sharedAttempts.push(attempt);
       await route.abort("blockedbyclient");
       return;
     }

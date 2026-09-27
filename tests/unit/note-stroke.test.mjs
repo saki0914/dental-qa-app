@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { strokeSegments } from "../../js/core/note-stroke.js";
 
-test("新規pressure strokeは点ごとの筆圧を隣接segment幅へ反映する", () => {
+test("旧形式でpressureEnabledのストロークは互換表示のため点ごとの筆圧を反映できる", () => {
   const segments = strokeSegments([
     { x: 0, y: 0, pressure: .1 },
     { x: .5, y: .5, pressure: .5 },

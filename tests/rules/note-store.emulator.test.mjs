@@ -17,6 +17,13 @@ const page = materialId => ({
   size: { width: 100, height: 200 },
   background: { type: "material-page", materialId, materialPage: 1 }
 });
+const blankPage = pageId => ({
+  pageId,
+  order: 1,
+  pageType: "blank",
+  size: { width: 100, height: 200 },
+  background: { type: "blank", paperColor: "#FFFFFF" }
+});
 
 async function createFixture(uid) {
   const environment = await initializeTestEnvironment({ projectId, firestore, storage: storageConfig });
@@ -128,6 +135,81 @@ test("status欠落の旧ノートをready相当として一覧へ返す", async 
     });
     const notes = await store.listNotes({ expectedUid: uid });
     assert.equal(notes.some(note => note.id === noteId), true);
+  } finally {
+    await environment.cleanup();
+  }
+});
+
+test("同じwriterSessionの直列保存だけを1回rebaseする", async () => {
+  const uid = "note-store-rebase-user";
+  const noteId = "note-rebase";
+  const pageId = "page-rebase";
+  const { environment, db, store } = await createFixture(uid);
+  try {
+    await store.createNote({
+      noteId,
+      title: "rebase test",
+      type: "standalone",
+      pages: [blankPage(pageId)],
+      expectedUid: uid
+    });
+    const base = {
+      noteId,
+      pageId,
+      expectedRevision: 0,
+      expectedUid: uid,
+      clientInstanceId: "client-1",
+      editorTabId: "tab-1",
+      writerSessionId: "writer-1"
+    };
+    const content = elementId => ({
+      schemaVersion: 1,
+      noteId,
+      pageId,
+      revision: 0,
+      elements: [{ id: elementId, type: "stroke", points: [{ x: .1, y: .1 }, { x: .2, y: .2 }], style: {} }],
+      noteMasks: []
+    });
+
+    const results = await Promise.all([
+      store.savePageContent({ ...base, clientMutationId: "mutation-1" }, content("first")),
+      store.savePageContent({ ...base, clientMutationId: "mutation-2" }, content("second"))
+    ]);
+
+    assert.deepEqual(results.map(result => result.revision), [1, 2]);
+    const pageSnapshot = await getDoc(doc(db, "users", uid, "notes", noteId, "pages", pageId));
+    assert.equal(pageSnapshot.data()?.contentRevision, 2);
+    assert.equal(pageSnapshot.data()?.lastBaseRevision, 1);
+    assert.equal(pageSnapshot.data()?.lastClientMutationId, "mutation-2");
+    const noteSnapshot = await getDoc(doc(db, "users", uid, "notes", noteId));
+    assert.deepEqual(noteSnapshot.data()?.pendingStoragePaths || [], []);
+  } finally {
+    await environment.cleanup();
+  }
+});
+
+test("異なるwriterSessionの古いrevisionはrebaseせず競合にする", async () => {
+  const uid = "note-store-rebase-conflict-user";
+  const noteId = "note-rebase-conflict";
+  const pageId = "page-rebase-conflict";
+  const { environment, store } = await createFixture(uid);
+  try {
+    await store.createNote({
+      noteId,
+      title: "rebase conflict test",
+      type: "standalone",
+      pages: [blankPage(pageId)],
+      expectedUid: uid
+    });
+    const content = { schemaVersion: 1, noteId, pageId, revision: 0, elements: [], noteMasks: [] };
+    await store.savePageContent({
+      noteId, pageId, expectedRevision: 0, expectedUid: uid,
+      writerSessionId: "writer-1", clientMutationId: "writer-1-mutation"
+    }, content);
+    await assert.rejects(store.savePageContent({
+      noteId, pageId, expectedRevision: 0, expectedUid: uid,
+      writerSessionId: "writer-2", clientMutationId: "writer-2-mutation"
+    }, content), error => error?.name === "NoteConflictError" && error.cloudRevision === 1);
   } finally {
     await environment.cleanup();
   }
