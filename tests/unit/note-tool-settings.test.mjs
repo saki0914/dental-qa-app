@@ -11,11 +11,12 @@ test("ペン・蛍光・消しゴム設定をUIDごとに分離して保持す�
   const storage = memoryStorage();
   const alice = createNoteToolSettingsStore({ uid: "alice", storage });
   const bob = createNoteToolSettingsStore({ uid: "bob", storage });
-  alice.save({ penWidth: 42, penColor: "#ff0000", highlighterWidth: 70, eraserMode: "pixel", toolbarDock: "left" });
+  alice.save({ penWidth: 42, penColor: "#ff0000", highlighterWidth: 70, eraserMode: "pixel", toolbarDock: "left", toolbarAutoHide: true });
   assert.equal(alice.load().penWidth, 42);
   assert.equal(alice.load().highlighterWidth, 70);
   assert.equal(alice.load().eraserMode, "pixel");
   assert.equal(alice.load().toolbarDock, "left");
+  assert.equal(alice.load().toolbarAutoHide, true);
   assert.notEqual(bob.load().penWidth, 42);
 });
 

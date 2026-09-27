@@ -9,6 +9,7 @@ export const NOTE_TOOL_DEFAULTS = Object.freeze({
   eraserSize: 30,
   toolbarDock: "bottom",
   sidebarVisible: true,
+  toolbarAutoHide: false,
   pencilMode: false,
   straightenEnabled: true,
   quickSwitchAction: "eraser"
@@ -32,6 +33,7 @@ export function normalizeNoteToolSettings(value = {}) {
     eraserSize: clamp(value.eraserSize, 1, 100, NOTE_TOOL_DEFAULTS.eraserSize),
     toolbarDock: DOCKS.has(value.toolbarDock) ? value.toolbarDock : NOTE_TOOL_DEFAULTS.toolbarDock,
     sidebarVisible: value.sidebarVisible !== false,
+    toolbarAutoHide: value.toolbarAutoHide === true,
     pencilMode: value.pencilMode === true,
     straightenEnabled: value.straightenEnabled !== false,
     quickSwitchAction: QUICK_ACTIONS.has(value.quickSwitchAction) ? value.quickSwitchAction : NOTE_TOOL_DEFAULTS.quickSwitchAction

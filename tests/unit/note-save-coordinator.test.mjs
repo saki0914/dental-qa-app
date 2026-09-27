@@ -56,6 +56,26 @@ test("クラウド保存前に下書きと保存待ちを端末内へ保存す�
   assert.equal(localStore.records.has("pageDrafts:u|n|p"), false);
 });
 
+test("IndexedDB下書き保存失敗は端末内保存済みと誤表示しない状態を通知する", async () => {
+  const localStore = memoryStore();
+  const failure = new Error("IndexedDB quota exceeded");
+  localStore.putSavePair = async () => { throw failure; };
+  const statuses = [];
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 9999,
+    persist: async () => assert.fail("クラウド保存へ進んではならない"),
+    onStatus: (status, _identity, detail) => statuses.push({ status, detail })
+  });
+  const identity = { uid: "u", noteId: "n", pageId: "p" };
+  await assert.rejects(
+    coordinator.schedule(identity, { revision: 0, elements: [], noteMasks: [] }),
+    failure
+  );
+  assert.deepEqual(statuses, [{ status: "local-error", detail: failure }]);
+  assert.equal(coordinator.getState(identity).dirty, true);
+});
+
 test("別タブ相当の新しいmutationIdをクラウド保存完了で削除しない", async () => {
   const localStore = memoryStore();
   let releasePersist;

@@ -213,6 +213,12 @@ export function createNoteSaveCoordinator({
           state.latestMutation?.mutationId === mutationId) {
         state.latestMutation = persistedMutation;
       }
+    } catch (error) {
+      state.lastError = error;
+      if (isStateStillValid(state, { generation, identity: effectiveIdentity })) {
+        onStatus("local-error", effectiveIdentity, error);
+      }
+      throw error;
     } finally {
       if (state.localWrite === localWrite) state.localWrite = null;
     }

@@ -119,6 +119,12 @@ test("Firestoreノートrulesは疎な旧documentを許容し、存在するsche
   await assertFails(updateDoc(noteRef, { pageCount: -1 }));
   await assertFails(updateDoc(noteRef, { deletedAt: 123 }));
   await assertSucceeds(updateDoc(noteRef, { status: "deleting", deletedAt: "legacy-logical-delete" }));
+  await assertSucceeds(updateDoc(noteRef, {
+    recoveredFromNoteId: "source-note",
+    recoveredAt: serverTimestamp()
+  }));
+  await assertFails(updateDoc(noteRef, { recoveredFromNoteId: "x".repeat(129) }));
+  await assertFails(updateDoc(noteRef, { recoveredAt: 123 }));
   await assertFails(updateDoc(pageRef, { noteId: "other-note" }));
   await assertFails(updateDoc(pageRef, { contentRevision: 1.5 }));
   await assertSucceeds(updateDoc(pageRef, {

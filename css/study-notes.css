@@ -76,3 +76,74 @@ body.note-editor-dedicated .note-viewport{height:calc(100dvh - 62px);background:
   .note-toolbar.dock-top{top:62px}
   .note-page-sidebar{display:none}.note-page-sidebar.open{display:block}
 }
+
+/* Stable editor chrome and recoverable startup states */
+.note-editor>.note-editor-header{
+  display:grid;
+  grid-template-columns:44px minmax(100px,1fr) 64px repeat(3,44px) 96px repeat(3,44px);
+  align-items:center;
+  gap:6px;
+  block-size:62px;
+  min-block-size:62px;
+  max-block-size:62px;
+  box-sizing:border-box;
+  flex-wrap:nowrap;
+}
+.note-editor>.note-editor-header>*{min-width:0}
+.note-title-input{inline-size:100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.note-page-counter{inline-size:64px;text-align:center;white-space:nowrap}
+.note-save-status-shell{position:relative;inline-size:44px;block-size:44px;contain:layout}
+.note-save-status{
+  display:grid;
+  place-items:center;
+  inline-size:44px;
+  min-inline-size:44px;
+  max-inline-size:44px;
+  block-size:44px;
+  min-block-size:44px;
+  max-block-size:44px;
+  padding:0;
+  border:1px solid #cbd5e1;
+  border-radius:50%;
+  background:#fff;
+  color:#475569;
+  font-weight:800;
+  contain:layout paint;
+}
+.note-save-status[data-state="saving"] #noteSaveStatusIcon{display:inline-block;animation:note-save-spin .9s linear infinite}
+.note-save-status[data-state="recoverable-error"],.note-save-status[data-state="local-storage-error"],.note-save-status[data-state="error"],.note-save-status[data-state="conflict"]{color:#b91c1c;border-color:#fca5a5;background:#fff7f7}
+.note-save-status[data-state="dirty-local"],.note-save-status[data-state="local-saved"],.note-save-status[data-state="offline-local"]{color:#9a6700;border-color:#f3cc65;background:#fffbea}
+@keyframes note-save-spin{to{transform:rotate(360deg)}}
+.note-save-popover{
+  position:absolute;
+  z-index:80;
+  inset-block-start:50px;
+  inset-inline-end:0;
+  inline-size:min(330px,calc(100vw - 24px));
+  padding:12px;
+  border:1px solid #cbd5e1;
+  border-radius:14px;
+  background:#fff;
+  box-shadow:0 18px 45px rgba(15,23,42,.24);
+  color:#334155;
+}
+.note-save-popover p{margin:6px 0 10px;line-height:1.45}
+.note-save-actions{display:flex;gap:6px;flex-wrap:wrap}.note-save-actions button{min-height:44px}
+.note-editor-alert{position:absolute;z-index:55;top:70px;left:50%;transform:translateX(-50%);width:min(760px,calc(100% - 24px));box-sizing:border-box;box-shadow:0 12px 32px rgba(15,23,42,.18)}
+.note-editor-startup{position:absolute;z-index:70;inset:62px 0 0;display:grid;place-items:center;padding:20px;background:#747b86;color:#0f172a}
+.note-editor-startup-card{width:min(540px,calc(100% - 24px));padding:24px;border:1px solid rgba(255,255,255,.7);border-radius:20px;background:rgba(255,255,255,.96);box-shadow:0 24px 70px rgba(15,23,42,.32);text-align:center}
+.note-editor-startup-card h3{margin:12px 0 6px}.note-editor-startup-card p{margin:6px 0;color:#475569;overflow-wrap:anywhere}
+.note-editor-spinner{display:inline-block;width:30px;height:30px;border:3px solid #cbd5e1;border-top-color:#2563eb;border-radius:50%;animation:note-save-spin .9s linear infinite}
+.note-editor-startup[data-state$="error"] .note-editor-spinner{display:none}
+.note-editor-startup-actions{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-top:18px}
+.note-editor-startup-actions button{min-height:44px;border:1px solid #94a3b8;border-radius:10px;background:#fff;padding:8px 12px}
+.note-tool-settings-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex:1 0 100%}
+.note-tool-settings-heading button{min-width:56px;min-height:44px;border:0;border-radius:10px;background:#e2e8f0;color:#0f172a;font-weight:700}
+.note-editor.markup-inactive .note-selection-actions{display:none!important}
+.note-editor.markup-inactive .note-page-stage{touch-action:pan-x pan-y}
+
+@media(max-width:760px){
+  .note-editor>.note-editor-header{grid-template-columns:44px minmax(0,1fr) repeat(6,44px);gap:0;block-size:58px;min-block-size:58px;max-block-size:58px}
+  .note-editor>.note-editor-header .note-page-counter,.note-editor>.note-editor-header #toggleNoteStudyBtn{display:none}
+  .note-editor-startup{inset-block-start:58px}
+}

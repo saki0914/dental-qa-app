@@ -6,6 +6,7 @@ import {
 import { initializeFirebaseServices, verifyFirebaseEmulatorConnectivity } from "./config/firebase.js";
 import { restoreLegacyQuestionStatuses } from "./core/cloud-sync-state.js";
 import { createSaveCoordinator } from "./core/save-coordinator.js";
+import { selectNoteFeatureUser } from "./core/note-editor-state.js";
 import {
   escapeDisplayText,
   escapeHtml,
@@ -326,7 +327,14 @@ const imageMemory = createImageMemory({
 });
 
 studyNotes = createStudyNotes({
-  getCurrentUser: () => isInteractionReady() ? currentUser : null,
+  // Notes use an independent Firestore/Storage save pipeline. In the
+  // dedicated editor an authenticated user must still be able to retry or
+  // restore an IndexedDB draft when the legacy app-wide cloud load failed.
+  getCurrentUser: () => selectNoteFeatureUser({
+    dedicatedEditor: noteEditorRoute,
+    user: currentUser,
+    interactionReady: isInteractionReady()
+  }),
   getDb: () => db,
   getStorage: () => storage,
   getMaterials: () => imageMemory.getMaterials(),
@@ -1163,6 +1171,15 @@ function showTab(tabName) {
   document.getElementById(`tab-${tabName}`).classList.remove("hidden");
 }
 
+function showDedicatedNoteEditorShell(state = "authenticating", detail = "現在の処理：ログイン状態を確認中") {
+  if (!noteEditorRoute) return;
+  document.querySelectorAll(".tab").forEach(tab => tab.classList.remove("active"));
+  document.querySelectorAll('[id^="tab-"]').forEach(panel => panel.classList.add("hidden"));
+  document.getElementById("tab-pdf")?.classList.remove("hidden");
+  setCombinedImageNoteMode("note");
+  studyNotes?.setStartupState?.(state, { detail });
+}
+
 
 function applyState(state) {
   isApplyingCloudState = true;
@@ -1350,7 +1367,11 @@ async function initFirebase() {
         el.cloudStatus.textContent =
           "Firebase接続済みです。ログインすると学習・問題管理・進捗・クラウド連携が使えます。";
         updateLoginLockedUI();
-        showTab("auth");
+        if (noteEditorRoute) {
+          showDedicatedNoteEditorShell("fatal-error", "ログイン状態を確認できませんでした。ノート一覧へ戻ってログインしてください。");
+        } else {
+          showTab("auth");
+        }
         return;
       }
 
@@ -1367,7 +1388,8 @@ async function initFirebase() {
       el.authStatus.textContent = `ログイン中: ${user.email || "メール不明"}（クラウド読込中）`;
       el.cloudStatus.textContent = "Firebase接続済みです。クラウド保存データを確認しています...";
       updateLoginLockedUI();
-      showTab("auth");
+      if (noteEditorRoute) showDedicatedNoteEditorShell();
+      else showTab("auth");
 
       try {
         const result = await loadFromCloud({
@@ -1402,6 +1424,9 @@ async function initFirebase() {
           "クラウドデータの初期読込に失敗したため、編集をロックしています。\n" +
           "ページを再読み込みしてください。\n" + (error.message || error);
         updateLoginLockedUI();
+        if (noteEditorRoute) {
+          showDedicatedNoteEditorShell("recoverable-error", `クラウド初期読込に失敗しました：${error.message || error}`);
+        }
       }
     });
   } catch (error) {
@@ -1412,7 +1437,11 @@ async function initFirebase() {
     syncPhase = "error";
     updateLoginLockedUI();
     el.cloudStatus.textContent = "Firebase接続エラーです。\n" + (error.message || error);
-    alert("Firebase接続エラーです。\n\n" + (error.message || error));
+    if (noteEditorRoute) {
+      showDedicatedNoteEditorShell("fatal-error", `Firebaseを初期化できませんでした：${error.message || error}`);
+    } else {
+      alert("Firebase接続エラーです。\n\n" + (error.message || error));
+    }
   }
 }
 
@@ -1779,7 +1808,10 @@ function init() {
     try { renderPdfViewer(); } catch (error) { console.error("renderPdfViewer failed", error); }
     try { resetBulkImportState(); } catch (error) { console.error("resetBulkImportState failed", error); }
     try { updateLoginLockedUI(); } catch (error) { console.error("updateLoginLockedUI failed", error); }
-    try { showTab("auth"); } catch (error) { console.error("showTab failed", error); }
+    try {
+      if (noteEditorRoute) showDedicatedNoteEditorShell("initializing", "現在の処理：Firebaseを初期化中");
+      else showTab("auth");
+    } catch (error) { console.error("showTab failed", error); }
     if (el.forceResetStudyFiltersBtn) {
       el.forceResetStudyFiltersBtn.addEventListener("click", resetStudyFiltersToAll);
     }

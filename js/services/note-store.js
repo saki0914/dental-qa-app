@@ -584,6 +584,27 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     return path;
   }
 
+  async function uploadRecoveredBackground(noteId, pageId, blob, expectedUid) {
+    requireExpectedUid(expectedUid);
+    validateImageBlob(blob, {
+      label: "復元ページ背景",
+      allowedTypes: ["image/png", "image/jpeg", "image/webp"]
+    });
+    const { uid, storage } = context(expectedUid);
+    const extension = blob.type === "image/png" ? "png" : blob.type === "image/webp" ? "webp" : "jpg";
+    const path = `users/${uid}/notes/${noteId}/sourcePages/${pageId}/background.${extension}`;
+    context(expectedUid);
+    await journalStoragePath(noteId, path, expectedUid);
+    try {
+      context(expectedUid);
+      await uploadBytes(storageRef(storage, path), blob, { contentType: blob.type });
+    } catch (error) {
+      await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
+      throw error;
+    }
+    return path;
+  }
+
   async function deleteStoragePaths(paths, expectedUid) {
     const { storage } = writeContext(expectedUid);
     const failed = [];
@@ -1056,7 +1077,7 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
   return {
     listNotes, getNote, listNotesByMaterial, listPages, createNote, createCreatingNote, finalizeCreatingNote,
     finalizeNoteCreation, abortCreatingNote, cleanupStuckCreatingNotes, markCreationFailed,
-    uploadSourcePage, deleteStoragePaths, loadPageContent, savePageContent, enqueuePageContentSave, uploadAsset, getAsset,
+    uploadSourcePage, uploadRecoveredBackground, deleteStoragePaths, loadPageContent, savePageContent, enqueuePageContentSave, uploadAsset, getAsset,
     getStorageBlob, cleanupStoragePath, updatePageOrder, createPage, deletePage, updatePage, updateNote,
     deleteMaterialLinkedNotes, restoreNote, deleteNote
   };

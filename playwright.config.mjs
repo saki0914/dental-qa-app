@@ -44,6 +44,7 @@ export default defineConfig({
     {
       name: "iPhone",
       use: {
+        browserName: "webkit",
         viewport: { width: 390, height: 844 },
         hasTouch: true,
         isMobile: true,
@@ -55,6 +56,7 @@ export default defineConfig({
     {
       name: "iPad Portrait",
       use: {
+        browserName: "webkit",
         viewport: { width: 768, height: 1024 },
         hasTouch: true,
         isMobile: true,
@@ -66,6 +68,7 @@ export default defineConfig({
     {
       name: "iPad Landscape",
       use: {
+        browserName: "webkit",
         viewport: { width: 1024, height: 768 },
         hasTouch: true,
         isMobile: true,

@@ -305,6 +305,23 @@
         </section>
 
         <section id="noteEditorView" class="note-editor hidden" aria-label="ノート編集">
+          <div id="noteEditorStartup" class="note-editor-startup" data-state="initializing" role="status" aria-live="polite">
+            <div class="note-editor-startup-card">
+              <span class="note-editor-spinner" aria-hidden="true"></span>
+              <h3 id="noteEditorStartupTitle">ノートを読み込んでいます</h3>
+              <p id="noteEditorStartupDetail">現在の処理：初期化中</p>
+              <p id="noteEditorStartupSlow" class="hidden">読み込みに時間がかかっています</p>
+              <div id="noteEditorStartupActions" class="note-editor-startup-actions hidden">
+                <button type="button" data-startup-action="retry">再試行</button>
+                <button type="button" data-startup-action="local">端末内の下書きから復元</button>
+                <button type="button" data-startup-action="cloud">クラウド版を開く</button>
+                <button type="button" data-startup-action="readonly">読み取り専用で開く</button>
+                <button type="button" data-startup-action="list">ノート一覧へ戻る</button>
+                <button type="button" data-startup-action="copy-diagnostics">診断情報をコピー</button>
+                <button type="button" data-startup-action="download-diagnostics">診断情報をダウンロード</button>
+              </div>
+            </div>
+          </div>
           <header class="note-editor-header">
             <button class="note-icon-button" id="closeNoteBtn" type="button" aria-label="ノート一覧へ戻る">←</button>
             <input id="noteTitleInput" class="note-title-input" aria-label="ノート名">
@@ -313,8 +330,22 @@
             <button class="note-icon-button" id="noteUndoBtn" type="button" aria-label="元に戻す" title="元に戻す">↶</button>
             <button class="note-icon-button" id="noteRedoBtn" type="button" aria-label="やり直す" title="やり直す">↷</button>
             <button class="btn soft" id="toggleNoteStudyBtn" type="button">暗記モード</button>
-            <span id="noteSaveStatus" class="note-save-status" role="status">保存済み</span>
-            <button class="btn soft hidden" id="noteRetrySaveBtn" type="button">保存を再試行</button>
+            <div class="note-save-status-shell">
+              <button id="noteSaveStatus" class="note-save-status" type="button" data-state="saved" aria-label="保存済み" title="保存済み" aria-expanded="false" aria-controls="noteSavePopover"><span id="noteSaveStatusIcon" aria-hidden="true">✓</span><span id="noteSaveStatusButtonText" class="sr-only">保存済み</span></button>
+              <span id="noteSaveStatusLive" class="sr-only" role="status" aria-live="polite">保存済み</span>
+              <div id="noteSavePopover" class="note-save-popover hidden">
+                <strong id="noteSaveStatusText">保存済み</strong>
+                <p id="noteSaveStatusDetail">クラウドへ保存されています。</p>
+                <div class="note-save-actions">
+                  <button class="btn soft hidden" id="noteRetrySaveBtn" type="button">保存を再試行</button>
+                  <button class="btn soft hidden" id="noteRestoreLocalDraftBtn" type="button">端末内の下書きから復元</button>
+                  <button class="btn soft hidden" id="noteContinueEditingBtn" type="button">編集を続ける</button>
+                  <button class="btn soft" id="noteSaveDiagnosticsBtn" type="button">診断情報を見る</button>
+                  <button class="btn soft" id="noteSaveListBtn" type="button">ノート一覧へ戻る</button>
+                </div>
+              </div>
+            </div>
+            <button class="note-icon-button" id="noteMarkupDoneBtn" type="button" aria-label="マークアップを完了" title="マークアップを完了">✓</button>
             <details class="note-more-menu"><summary aria-label="その他メニュー">•••</summary><div>
               <button type="button" data-note-action="export">PDFを書き出す</button>
               <button type="button" data-note-action="rename">ノート名を変更</button>
@@ -387,7 +418,7 @@
             <button type="button" id="noteToolbarCollapseBtn" aria-label="ツールパレットを折りたたむ" title="ツールパレットを折りたたむ"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span class="sr-only">折りたたむ</span></button>
           </div>
           <div id="noteToolSettings" class="note-tool-settings hidden">
-            <strong id="noteToolSettingsTitle">ツール設定</strong>
+            <div class="note-tool-settings-heading"><strong id="noteToolSettingsTitle">ツール設定</strong><button id="noteToolSettingsDoneBtn" type="button" aria-label="ツール設定を閉じる">完了</button></div>
             <div id="noteColorPresets" class="note-color-presets" aria-label="色候補"></div>
             <label>その他の色 <input id="noteColorInput" type="color" value="#111111"></label>
             <div id="noteWidthPresets" class="note-width-presets" aria-label="太さプリセット"></div>
@@ -408,6 +439,7 @@
             <label><input id="noteFingerDraw" type="checkbox" checked> 指で描画する</label>
             <label><input id="notePencilMode" type="checkbox"> Apple Pencilモード</label>
             <label><input id="noteStraightenEnabled" type="checkbox" checked> 終点長押しで直線化</label>
+            <label><input id="noteToolbarAutoHide" type="checkbox"> 描画中はツールパレットを自動でしまう</label>
             <label>パレット位置 <select id="noteToolbarDock"><option value="top">上</option><option value="right">右</option><option value="bottom">下</option><option value="left">左</option></select></label>
             <label>クイック切替 <select id="noteQuickSwitchAction"><option value="eraser">現在ツール ↔ 消しゴム</option><option value="previous">現在ツール ↔ 前回ツール</option><option value="select">現在ツール ↔ 選択</option><option value="select-all">すべて選択</option><option value="colors">カラーパレット表示</option></select></label>
             <p class="note-pencil-doubletap-notice">SafariのWebアプリでは、Apple Pencil本体のダブルタップを取得できません。画面上のクイック切替ボタンを使用してください。</p>

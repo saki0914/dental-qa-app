@@ -27,6 +27,8 @@ service cloud.firestore {
         && (!data.keys().hasAny(['status']) || (data.status is string && data.status in ['creating', 'ready', 'failed', 'deleting']))
         && (!data.keys().hasAny(['type']) || (data.type is string && data.type in ['standalone', 'material-linked', 'pdf-imported']))
         && (!data.keys().hasAny(['materialRefs']) || data.materialRefs is list)
+        && optionalBoundedString(data, 'recoveredFromNoteId', 128)
+        && (!data.keys().hasAny(['recoveredAt']) || data.recoveredAt is timestamp || (data.recoveredAt is string && data.recoveredAt.size() <= 64))
         && optionalBoundedList(data, 'pendingStoragePaths', 1000)
         && optionalBoundedList(data, 'orphanedPaths', 1000)
         && optionalBoundedList(data, 'failedPageIds', 1000)
