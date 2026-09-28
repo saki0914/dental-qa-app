@@ -3,8 +3,25 @@ import test from "node:test";
 import {
   createNoteInputGuard,
   isDrawingInputCaptureEnabled,
-  registerInputDebugPointerdownCapture
+  registerInputDebugPointerdownCapture,
+  shouldClaimStylusTouch
 } from "../../js/core/note-input-guard.js";
+
+test("iPadOSのScribbleにPencilのstrokeを奪われないよう、ページ上のstylus touchだけを確保する", () => {
+  const stylus = { touchType: "stylus" };
+  const finger = { touchType: "direct" };
+  const pageTarget = { closest: () => null };
+  const controlTarget = { closest: selector => (selector.includes("button") ? {} : null) };
+  const base = { target: pageTarget, hasContent: true, textInputActive: false };
+  assert.equal(shouldClaimStylusTouch({ ...base, touches: [stylus] }), true);
+  assert.equal(shouldClaimStylusTouch({ ...base, touches: [finger, stylus] }), true, "掌と同時でもPencilは確保する");
+  assert.equal(shouldClaimStylusTouch({ ...base, touches: [finger] }), false, "指のpan・pinchは妨げない");
+  assert.equal(shouldClaimStylusTouch({ ...base, touches: [{}] }), false, "touchType非対応環境では何もしない");
+  assert.equal(shouldClaimStylusTouch({ ...base, touches: [stylus], textInputActive: true }), false, "テキスト入力ではScribbleを使える");
+  assert.equal(shouldClaimStylusTouch({ ...base, touches: [stylus], target: controlTarget }), false, "ボタンなどはclickを保つ");
+  assert.equal(shouldClaimStylusTouch({ ...base, touches: [stylus], hasContent: false }), false);
+  assert.equal(shouldClaimStylusTouch({ ...base, touches: null }), false);
+});
 
 test("Pencil capture入口は描画レイヤーと同じ状態条件だけで有効になる", () => {
   const editable = {

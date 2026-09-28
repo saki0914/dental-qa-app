@@ -8,6 +8,7 @@
 | 対象リポジトリ | `/Users/sakin/dev/dental-qa-app` |
 | 調査基準HEAD | `e8c4f8e95e6401d722fa5e1dcb035ec044f583b1` |
 | 改訂1 | 2026-09-28。不具合修正と水平展開、CRUD高速化、テキスト描画の修正を実装し本文へ反映（コミット`7315b12`、変更一覧は付録C） |
+| 改訂2 | 2026-09-28。iPad実機確認で見つかったStorageのCORS設定漏れとApple Pencilのstroke欠落（Scribble）を修正（付録D） |
 | 作成日 | 2026-09-28 |
 | 対象クライアント | iPad Safari、Desktop Safari／Chrome、ホーム画面追加版 |
 | 本番配信 | GitHub Pages |
@@ -754,6 +755,8 @@ users/{uid}/notes/{noteId}/assets/{assetId}/{filename}
 users/{uid}/notes/{noteId}/pages/{pageId}/revisions/{mutationId}-{hash}.json
 ```
 
+ブラウザはページJSON、背景、貼付画像を`getBlob()`で直接取得するため、本番バケットには配信元originからのGETを許可するCORS設定が必要である（改訂2）。設定値はリポジトリの`storage.cors.json`で管理し、変更時は`gcloud storage buckets update gs://dental-qa-hub-e7cce.firebasestorage.app --cors-file=storage.cors.json`で反映する。未設定の場合、取得は通信エラー扱いで約2分間再試行されたのち`storage/retry-limit-exceeded`となり、ノートを開けない。Emulatorは任意のoriginを許可するため、自動テストではこの設定漏れを検出できない。
+
 ページJSONは不変revisionとして保存し、Firestoreページ文書の`contentPath`だけをtransactionで最新へ切り替える。ただし現行Storage Rulesはrevision pathの`update`も許可しており、不変性は未達である。以下のクライアント変更とRules変更を同一リリース単位で行う。Rulesの`update`拒否だけを先行させない。
 
 1. 新規revision pathはcreateのみ許可し、既存objectのupdateを拒否する。
@@ -1216,6 +1219,14 @@ function clientToNormalizedPagePoint(clientX, clientY, pageRoot) {
 
 Palm Guardの接触面積、cooldownはtouchだけへ適用し、penを拒否しない。
 
+iPadOSの手書き入力（Scribble）は、ページが確保していないApple Pencilの接触を監視し、pointerdownを送る前にstroke全体を取り込むことがある（WebKit bug 217430）。改訂2の実機診断では、「あ」を20回書いた約60 strokeのうちページへ届いたpen pointerdownは32件だった。対策として、ページ（`#notePageStage`）へnon-passiveの`touchstart`／`touchmove` listenerを置き、`touchType === "stylus"`のtouchだけ`preventDefault()`する（`shouldClaimStylusTouch()`）。pointer eventはtouch eventより先に配信されるため描画処理は変わらない。次の場合は確保しない。
+
+- 指のtouch（パン、ピンチ、スワイプを妨げない）
+- テキストツール使用中とテキスト入力中（Scribbleで入力枠へ手書き入力できるようにする）
+- ボタン、入力欄などのネイティブ操作要素（clickを保つ）
+
+診断JSONの`drawing.windowCapturePointerdown`（常時計測）と`stageCapturePointerdown`、`stylusTouchesClaimed`を比べると、strokeがページへ届く前に失われたかを判別できる。対策後も欠落する場合の暫定回避は、iPadの設定で「Apple Pencil」→「手書き入力（Scribble）」をオフにすることである。
+
 ### 26.3 ストロークsession
 
 ```json
@@ -1604,6 +1615,8 @@ Canvas描画は編集画面と共通の`note-renderer.js`および`note-text-lay
 | GAP-RACE-01 | cloud再検証timeout後の遅延応答を世代で無効化する仕組みが未実装 | P0 |
 | GAP-TEXT-01 | テキストの入力中表示と確定表示の改行一致をiPad Safari実機で未確認（Linux Chromiumでは864件中861件一致） | P1実機確認 |
 | GAP-TEST-01 | 改訂1でWebKit（iPad Portrait／Landscape）のE2Eプロジェクトを未実行 | P1 |
+| GAP-STORAGE-01 | 本番StorageバケットにCORS設定がなく、`getBlob()`が2分間再試行後に失敗してノートを開けなかった | 解消（改訂2、バケット設定） |
+| GAP-PENCIL-01 | iPadOSの手書き入力（Scribble）がApple Pencilのstrokeを取り込み、書いた線の約半数が欠落した | 対策済み・実機確認要（改訂2） |
 
 ### 38.3 結論
 
@@ -1789,3 +1802,14 @@ LAN環境はHTTPのため、Clipboard APIとWeb Share APIを利用できない�
 
 - `CLAUDE.md`／`AGENTS.md`にあるCodexとClaude CodeのAI会議・レビュー往復は、利用者の指示により省略した。代わりに差分の自己レビューとC.6の自動テストを行った。
 - 39章のPhase 0-0／Phase 0（実機診断基盤の実装と予備計測）は、コードから原因と効果が明らかな修正の前提にしなかった（39章冒頭の運用）。読込性能の完了判定は40章のとおり実機計測を必要とし、GAP-PERF-01〜03は未解決のまま残す。
+
+## 付録D 改訂2（2026-09-28）iPad実機確認で見つかった不具合
+
+改訂1をGitHub Pages＋本番FirebaseのiPad（Safari 26.6.1）で確認し、次の2件を修正した。
+
+| 不具合 | 実機診断での根拠 | 原因 | 対処 |
+|---|---|---|---|
+| 保存済みノートを開くと約2分後に「ノートを開けませんでした（storage/retry-limit-exceeded）」となる | ノート・ページ一覧は約0.13秒で取得できたが、`page-content-json`だけが121秒後に失敗。保存（upload）は成功 | 本番StorageバケットにCORS設定がなく、ブラウザからの`getBlob()`が通信エラー扱いで再試行され続けた。ノート機能の追加時から存在し、Emulatorでは再現しない | バケットへ`storage.cors.json`を適用（22.2節）。適用後、同じノートが約1.5秒で開けることを実機で確認 |
+| Apple Pencilで書いた線の約半数が表示されない | 「あ」を20回（約60 stroke）書いて、ページが受け取ったpen pointerdownは32件。受け取った分は全て確定済み（破棄0、長いtaskなし） | iPadOSの手書き入力（Scribble）が、ページが確保していないPencilの接触を取り込み、pointer eventを送らなかった | ページ上のstylus touchを`preventDefault()`で確保（26.2節）。実機での再確認待ち |
+
+改訂2の自動テストは付録C.6と同じ構成で実行し、追加した単体テスト（`shouldClaimStylusTouch()`）とE2E（stylus touchの確保と、指・テキストツールでは確保しないこと）を含めて成功した。Scribbleそのものは自動テストでは再現できないため、iPad実機で「あ」を20回書き、全strokeが表示されることを確認して完了とする。

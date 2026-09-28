@@ -11,6 +11,33 @@ export function isDrawingInputCaptureEnabled({
   return Boolean(hasContent) && !studyMode && markupMode && !readOnlyEditor && ["pen", "highlighter"].includes(tool);
 }
 
+// iPadOS Scribble watches Apple Pencil contacts that the page does not claim
+// and can swallow whole strokes before any pointer event is sent (WebKit bug
+// 217430): while writing, often every second quick stroke never produces a
+// pointerdown. Preventing the default of stylus touch events claims them for
+// the page. Fingers keep their native behaviour, native controls keep their
+// click, and text input keeps Scribble so handwriting into a text box works.
+const NATIVE_TOUCH_TARGET_SELECTOR = [
+  "input",
+  "textarea",
+  "select",
+  "button",
+  "a[href]",
+  "summary",
+  "[contenteditable]:not([contenteditable=\"false\"])"
+].join(",");
+
+export function shouldClaimStylusTouch({
+  touches = [],
+  target = null,
+  hasContent = false,
+  textInputActive = false
+} = {}) {
+  if (!hasContent || textInputActive) return false;
+  if (target?.closest?.(NATIVE_TOUCH_TARGET_SELECTOR)) return false;
+  return Array.from(touches || []).some(touch => touch?.touchType === "stylus");
+}
+
 export function registerInputDebugPointerdownCapture({
   enabled = false,
   targets = [],

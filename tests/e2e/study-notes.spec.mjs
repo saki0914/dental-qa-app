@@ -3964,6 +3964,60 @@ test("@authenticated @ipad-input-core moveなしの1点strokeはドラフトと�
   }
 });
 
+test("@authenticated @ipad-input-core Apple Pencilのtouchはページで確保し、指とテキスト入力は妨げない", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("Scribble抑止E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
+  const stage = page.locator("#notePageStage");
+  await expect(stage.locator('[data-layer="drawing-input"]')).toHaveClass(/active/);
+  // Chromium has no Touch.touchType; emulate WebKit's property so the same
+  // listener path that iPad Safari runs can be checked here.
+  await page.evaluate(() => {
+    const stylusTouches = new WeakSet();
+    globalThis.__noteStylusTouches = stylusTouches;
+    Object.defineProperty(Touch.prototype, "touchType", {
+      configurable: true,
+      get() { return stylusTouches.has(this) ? "stylus" : "direct"; }
+    });
+  });
+  const dispatchTouches = () => page.evaluate(() => {
+    const layer = document.querySelector('#notePageStage [data-layer="drawing-input"]');
+    const rect = layer.getBoundingClientRect();
+    let identifier = 1;
+    const fire = (type, stylus) => {
+      const touch = new Touch({
+        identifier: identifier++,
+        target: layer,
+        clientX: rect.left + rect.width * .4,
+        clientY: rect.top + rect.height * .4
+      });
+      if (stylus) globalThis.__noteStylusTouches.add(touch);
+      const event = new TouchEvent(type, {
+        touches: [touch], targetTouches: [touch], changedTouches: [touch], bubbles: true, cancelable: true
+      });
+      layer.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    return {
+      stylusStart: fire("touchstart", true),
+      stylusMove: fire("touchmove", true),
+      fingerStart: fire("touchstart", false),
+      fingerMove: fire("touchmove", false)
+    };
+  });
+
+  expect(await dispatchTouches(), "Pencilだけを確保して指のpan・pinchは残す").toEqual({
+    stylusStart: true, stylusMove: true, fingerStart: false, fingerMove: false
+  });
+  await page.locator('[data-note-tool="text"]').click();
+  expect(await dispatchTouches(), "テキストツールではScribbleの手書き入力を妨げない").toEqual({
+    stylusStart: false, stylusMove: false, fingerStart: false, fingerMove: false
+  });
+});
+
 test("@authenticated @ipad-input-core stable入力面は0〜32ms間隔の1点・交差strokeと残留touch後のpenを欠落させない", async ({ page }, testInfo) => {
   test.setTimeout(120_000);
   const user = await createUser();

@@ -62,7 +62,8 @@ import {
 import {
   createNoteInputGuard,
   isDrawingInputCaptureEnabled,
-  registerInputDebugPointerdownCapture
+  registerInputDebugPointerdownCapture,
+  shouldClaimStylusTouch
 } from "../core/note-input-guard.js";
 import { createNoteLocalStore, noteLocalKey } from "../core/note-local-store.js";
 import {
@@ -419,6 +420,7 @@ export function createStudyNotes(dependencies) {
     drawingSurfacePointerdown: 0,
     captureGateAccepted: 0,
     captureGateRejected: 0,
+    stylusTouchesClaimed: 0,
     orphanedSessionsRecovered: 0,
     contactMoveSessionsRecovered: 0,
     contactMoveRecoveriesBlocked: 0,
@@ -827,6 +829,7 @@ export function createStudyNotes(dependencies) {
         ["drawing surface", drawingDiagnostics.drawingSurfacePointerdown],
         ["capture gate通過", drawingDiagnostics.captureGateAccepted],
         ["capture gate除外", drawingDiagnostics.captureGateRejected],
+        ["stylus touch確保", drawingDiagnostics.stylusTouchesClaimed],
         ["孤立session復旧", drawingDiagnostics.orphanedSessionsRecovered],
         ["contact move復旧", drawingDiagnostics.contactMoveSessionsRecovered],
         ["contact move復旧拒否", drawingDiagnostics.contactMoveRecoveriesBlocked],
@@ -3607,16 +3610,13 @@ export function createStudyNotes(dependencies) {
     const { signal } = drawingInputListenerController;
     drawingInputListenerGeneration += 1;
     drawingDiagnostics.listenerGeneration = drawingInputListenerGeneration;
-    registerInputDebugPointerdownCapture({
-      enabled: inputDebugEnabled,
-      targets: [globalThis],
-      signal,
-      listener: event => {
-        if (event.pointerType !== "pen") return;
-        drawingDiagnostics.windowCapturePointerdown += 1;
-        scheduleInputDebugRender();
-      }
-    });
+    // Always counted (a passive capture listener costs nothing): comparing it
+    // with the stage count shows whether a lost stroke reached the page at all.
+    globalThis.addEventListener("pointerdown", event => {
+      if (event.pointerType !== "pen") return;
+      drawingDiagnostics.windowCapturePointerdown += 1;
+      scheduleInputDebugRender();
+    }, { capture: true, passive: true, signal });
     registerInputDebugPointerdownCapture({
       enabled: inputDebugEnabled,
       targets: [document],
@@ -3681,6 +3681,22 @@ export function createStudyNotes(dependencies) {
       if (raw) drawingDiagnostics.rawupdateEvents += 1;
       handler(event);
     };
+    // See shouldClaimStylusTouch(): without a non-passive touch listener that
+    // prevents the default, iPadOS Scribble drops Apple Pencil strokes on the
+    // page. Pointer events are dispatched before the touch events, so drawing
+    // itself is unchanged.
+    const claimStylusTouch = event => {
+      if (!shouldClaimStylusTouch({
+        touches: event.changedTouches,
+        target: event.target,
+        hasContent: Boolean(currentContent),
+        textInputActive: currentTool === "text" || Boolean(textEditorSession)
+      })) return;
+      if (event.type === "touchstart") drawingDiagnostics.stylusTouchesClaimed += 1;
+      if (event.cancelable !== false) event.preventDefault();
+    };
+    ui.stage.addEventListener("touchstart", claimStylusTouch, { passive: false, signal });
+    ui.stage.addEventListener("touchmove", claimStylusTouch, { passive: false, signal });
     ui.stage.addEventListener("pointerdown", capturePenPointer(beginPointer), { capture: true, signal });
     ui.stage.addEventListener("pointermove", capturePenPointer(movePointer), { capture: true, signal });
     if ("onpointerrawupdate" in globalThis) {
