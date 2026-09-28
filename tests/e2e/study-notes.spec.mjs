@@ -2335,17 +2335,24 @@ test("@authenticated 専用エディタは対象外ノート一覧を構築せ�
     claimConfirmationWaitMs: 180,
     retryCount: 0
   });
+  const startupSpan = name => startupMetrics.spans.find(span => span.name === name);
   const parallelStartupSpans = [
-    "note-resource-preparation",
+    "note-metadata",
     "page-metadata",
     "editor-lock",
     "local-record-scan"
-  ].map(name => startupMetrics.spans.find(span => span.name === name));
+  ].map(startupSpan);
   expect(parallelStartupSpans.every(Boolean)).toBe(true);
   expect(
     Math.max(...parallelStartupSpans.map(span => span.startMs)),
-    "独立した初期化処理は少なくとも1区間で重なり、直列完了を待たない"
+    "ノート本体・ページ一覧・編集権・端末記録の読込は互いを待たずに同時に始める"
   ).toBeLessThanOrEqual(Math.min(...parallelStartupSpans.map(span => span.endMs)));
+  const resourcePreparation = startupSpan("note-resource-preparation");
+  expect(resourcePreparation, "教材リソース準備を計測する").toBeTruthy();
+  expect(resourcePreparation.startMs, "教材リソース準備はノート本体に依存するため取得後に始める")
+    .toBeGreaterThanOrEqual(startupSpan("note-metadata").endMs);
+  expect(resourcePreparation.startMs, "教材リソース準備はページ本文の読込より前に始める")
+    .toBeLessThanOrEqual(startupSpan("page-content-json").startMs);
   await testInfo.attach("note-startup-metrics.json", {
     body: JSON.stringify(startupMetrics, null, 2),
     contentType: "application/json"

@@ -27,6 +27,18 @@ export function localRecordMatches(current, expected) {
     (current.updatedAt || current.createdAt) === expectedTimestamp;
 }
 
+// iPad Safari can close an IndexedDB connection while the page is in the
+// background ("Connection to Indexed Database server lost"). A cached, closed
+// connection would make every later draft save fail until reload, so such
+// errors drop the cached connection and the operation is retried once.
+export function isClosedIndexedDbConnectionError(error) {
+  const name = String(error?.name || "");
+  const message = String(error?.message || "");
+  return name === "InvalidStateError" ||
+    /connection (?:to indexed database server )?(?:is )?(?:lost|closing|closed)/i.test(message) ||
+    /database connection is closing/i.test(message);
+}
+
 export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange = globalThis.IDBKeyRange) {
   let connectionPromise;
   async function serializeForStore(storeName, value) {
@@ -34,11 +46,13 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
       throw new TypeError(`${storeName}のローカル保存にはuidとnoteIdが必要です。`);
     }
     if (!isBlobLike(value?.blob)) {
-      return structuredClone(value);
+      // IndexedDB structured-clones the value inside put(); an extra clone
+      // here only doubled the cost of every draft save.
+      return value;
     }
     const { blob, ...metadata } = value;
     return {
-      ...structuredClone(metadata),
+      ...metadata,
       blobBytes: await blob.arrayBuffer(),
       blobType: blob.type
     };
@@ -58,28 +72,59 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
   function open() {
     if (!indexedDb) return Promise.reject(new Error("IndexedDBを利用できません。"));
     if (connectionPromise) return connectionPromise;
-    connectionPromise = new Promise((resolve, reject) => {
+    const pending = new Promise((resolve, reject) => {
       const request = indexedDb.open(DATABASE_NAME, VERSION);
       request.onupgradeneeded = () => {
         STORES.forEach(name => {
           if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name, { keyPath: "key" });
         });
       };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const database = request.result;
+        const forget = () => { if (connectionPromise === pending) connectionPromise = undefined; };
+        // A newer schema in another tab must not wait for this tab forever.
+        database.onversionchange = () => {
+          forget();
+          try { database.close(); } catch {}
+        };
+        database.onclose = forget;
+        resolve(database);
+      };
+      request.onerror = () => {
+        // Do not cache a failed open: a later save must be able to retry.
+        if (connectionPromise === pending) connectionPromise = undefined;
+        reject(request.error || new Error("IndexedDBを開けませんでした。"));
+      };
     });
-    return connectionPromise;
+    connectionPromise = pending;
+    return pending;
+  }
+
+  // `operation(database)` starts its transaction synchronously. A closed
+  // cached connection fails before any write is applied, so one retry on a
+  // fresh connection cannot duplicate work.
+  async function withConnection(operation) {
+    for (let attempt = 0; ; attempt += 1) {
+      const active = open();
+      const database = await active;
+      try {
+        return await operation(database);
+      } catch (error) {
+        if (attempt > 0 || !isClosedIndexedDbConnectionError(error)) throw error;
+        if (connectionPromise === active) connectionPromise = undefined;
+        try { database.close?.(); } catch {}
+      }
+    }
   }
 
   function prefixRange(prefix) {
     if (!keyRange?.bound) throw new Error("IndexedDBの範囲検索を利用できません。");
-    return keyRange.bound(prefix, `${prefix}\uffff`);
+    return keyRange.bound(prefix, `${prefix}￿`);
   }
 
   async function run(storeName, mode, callback) {
     if (!STORES.includes(storeName)) throw new Error(`不明なIndexedDBストアです: ${storeName}`);
-    const db = await open();
-    return new Promise((resolve, reject) => {
+    return withConnection(db => new Promise((resolve, reject) => {
       const transaction = db.transaction(storeName, mode);
       const store = transaction.objectStore(storeName);
       let request;
@@ -87,7 +132,7 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
       transaction.oncomplete = () => resolve(request?.result);
       transaction.onerror = () => reject(transaction.error || request?.error);
       transaction.onabort = () => reject(transaction.error || new Error("IndexedDB処理が中断されました。"));
-    });
+    }));
   }
 
   return {
@@ -110,15 +155,14 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
         serializeForStore("pageDrafts", draft),
         serializeForStore("pendingSaves", pending)
       ]);
-      const db = await open();
-      return new Promise((resolve, reject) => {
+      return withConnection(db => new Promise((resolve, reject) => {
         const transaction = db.transaction(["pageDrafts", "pendingSaves"], "readwrite");
         transaction.objectStore("pageDrafts").put(serializedDraft);
         transaction.objectStore("pendingSaves").put(serializedPending);
         transaction.oncomplete = () => resolve(true);
         transaction.onerror = () => reject(transaction.error || new Error("ローカル保存に失敗しました。"));
         transaction.onabort = () => reject(transaction.error || new Error("ローカル保存が中断されました。"));
-      });
+      }));
     },
     async putSavePairIfMatching(draft, pending, expectedMutationId) {
       if (!draft?.key || draft.key !== pending?.key) {
@@ -134,8 +178,7 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
         serializeForStore("pageDrafts", draft),
         serializeForStore("pendingSaves", pending)
       ]);
-      const db = await open();
-      return new Promise((resolve, reject) => {
+      return withConnection(db => new Promise((resolve, reject) => {
         const transaction = db.transaction(["pageDrafts", "pendingSaves"], "readwrite");
         const draftStore = transaction.objectStore("pageDrafts");
         const pendingStore = transaction.objectStore("pendingSaves");
@@ -158,11 +201,10 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
         transaction.oncomplete = () => resolve(stored);
         transaction.onerror = () => reject(transaction.error || draftRequest.error || pendingRequest.error);
         transaction.onabort = () => reject(transaction.error || new Error("IndexedDB処理が中断されました。"));
-      });
+      }));
     },
     async deleteSavePairIfUnchanged(key, expected) {
-      const db = await open();
-      return new Promise((resolve, reject) => {
+      return withConnection(db => new Promise((resolve, reject) => {
         const transaction = db.transaction(["pageDrafts", "pendingSaves"], "readwrite");
         const draftStore = transaction.objectStore("pageDrafts");
         const pendingStore = transaction.objectStore("pendingSaves");
@@ -184,12 +226,11 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
         transaction.oncomplete = () => resolve(deleted);
         transaction.onerror = () => reject(transaction.error || draftRequest.error || pendingRequest.error);
         transaction.onabort = () => reject(transaction.error || new Error("IndexedDB処理が中断されました。"));
-      });
+      }));
     },
     async deleteIfUnchanged(storeName, key, updatedAt) {
       if (!STORES.includes(storeName)) throw new Error(`不明なIndexedDBストアです: ${storeName}`);
-      const db = await open();
-      return new Promise((resolve, reject) => {
+      return withConnection(db => new Promise((resolve, reject) => {
         const transaction = db.transaction(storeName, "readwrite");
         const store = transaction.objectStore(storeName);
         let deleted = false;
@@ -202,7 +243,7 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
         transaction.oncomplete = () => resolve(deleted);
         transaction.onerror = () => reject(transaction.error || request.error);
         transaction.onabort = () => reject(transaction.error || new Error("IndexedDB処理が中断されました。"));
-      });
+      }));
     },
     async listForUser(store, uid) {
       if (!uid) throw new Error("ローカル保存のユーザー識別子が不足しています。");

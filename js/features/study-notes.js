@@ -29,6 +29,7 @@ import {
   translateElement
 } from "../core/note-geometry.js";
 import { randomId } from "../core/id.js";
+import { runWithConcurrency } from "../core/bounded-concurrency.js";
 import { chooseClipboardImage, imageFileFromPasteEvent, isTextEditingTarget, readClipboardImage } from "../core/note-clipboard.js";
 import { createNoteBackgroundSignature } from "../core/note-background.js";
 import { resolveNoteConflicts } from "../core/note-conflict-resolution.js";
@@ -83,7 +84,22 @@ import {
   loadSessionBoundMaterialDimensions
 } from "../core/note-session-loading.js";
 import { strokeSvgNodes } from "../core/note-stroke.js";
-import { ensureTextElementHeight, layoutTextBox } from "../core/note-text-layout.js";
+import {
+  NOTE_TEXT_DEFAULT_BOX,
+  NOTE_TEXT_EDITOR_MIN_FONT_PX,
+  NOTE_TEXT_MIN_BOX_WIDTH,
+  NOTE_TEXT_MIN_DRAG_WIDTH,
+  createNoteTextMeasure,
+  ensureTextElementHeight,
+  layoutTextBox,
+  measureTextFontMetrics,
+  noteTextFontStack,
+  noteTextGenericFamily,
+  renderableTextLine,
+  resolveTextBoxFromGesture,
+  setNoteTextCanvasFont,
+  textLineBaselines
+} from "../core/note-text-layout.js";
 import { pageSwipeVisualOffset, resolvePageSwipe, resolvePageSwipeIntent } from "../core/note-page-swipe.js";
 import { createNoteThumbnailSignature } from "../core/note-thumbnail.js";
 import {
@@ -109,7 +125,7 @@ import {
   sanitizePdfFilename,
   sharePdfBlob
 } from "../core/note-pdf-export.js";
-import { NoteConflictError, createNoteStore } from "../services/note-store.js";
+import { NoteConflictError, createNoteStore, noteTimestampMs } from "../services/note-store.js";
 
 const A4_SIZE = Object.freeze({ width: 1240, height: 1754 });
 const DEFAULT_BACKGROUND = Object.freeze({
@@ -127,6 +143,8 @@ const TOOL_LABELS = {
   text: "テキスト", image: "画像", mask: "暗記マスク", study: "暗記モード"
 };
 const PENDING_STROKE_IDLE_MS = 220;
+const NOTE_COPY_CONCURRENCY = 3;
+const PDF_UPLOAD_CONCURRENCY = 2;
 const TOUCH_PREEMPT_POLICY = Object.freeze({
   pan: "preserve-viewport",
   lasso: "rollback",
@@ -323,6 +341,7 @@ export function createStudyNotes(dependencies) {
   let pendingStrokeIdleKind = "";
   let pendingStrokeIdleSince = 0;
   let pendingThumbnailTimer = 0;
+  let lastDrawingActivityAt = 0;
   let swipeGesture = null;
   let pageSwitching = false;
   let maskMultiSelect = false;
@@ -330,6 +349,7 @@ export function createStudyNotes(dependencies) {
   let transientUi = createClosedTransientUi();
   let syncingTransientUi = false;
   let renderToken = 0;
+  let renderedElementState = null;
   let backgroundRenderToken = 0;
   let renderedBackgroundSignature = "";
   let objectUrls = [];
@@ -357,6 +377,11 @@ export function createStudyNotes(dependencies) {
   let clientInstanceId = "";
   let editorTabId = routeParams.get("editorTabId") || randomId();
   let conflictPageIds = new Set();
+  const pageSaveStates = new Map();
+  const STUCK_CREATION_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+  let lastStuckCreationCleanupAt = 0;
+  let latestNoteDocuments = null;
+  let notesWithLocalChanges = new Set();
   const activeTouchPointerIds = new Set();
   let routeOpened = false;
   const inputGuard = createNoteInputGuard();
@@ -682,6 +707,10 @@ export function createStudyNotes(dependencies) {
       0
     );
     const positionedLayersValid = positionedValues.every(candidate => candidate.valid);
+    // Client rects include the page zoom transform. The contract is 1 CSS px
+    // of page layout, so sub-pixel layout rounding must not fail validation
+    // (and disable Pencil capture) just because the page is zoomed in.
+    const clientTolerancePx = Math.max(1, Number(zoomController?.zoom || 1));
     const viewport = globalThis.visualViewport;
     return {
       sourceWidth,
@@ -697,7 +726,8 @@ export function createStudyNotes(dependencies) {
       positionedLayers,
       maximumLayerDeltaPx,
       positionedLayerMaximumDeltaPx,
-      valid: maximumLayerDeltaPx <= 1 && positionedLayersValid,
+      clientTolerancePx,
+      valid: maximumLayerDeltaPx <= clientTolerancePx && positionedLayersValid,
       cssTransform: globalThis.getComputedStyle?.(ui.stage)?.transform || "none",
       svgViewBox: svg?.getAttribute?.("viewBox") || "",
       visualViewport: viewport ? {
@@ -1433,7 +1463,10 @@ export function createStudyNotes(dependencies) {
       return result;
     },
     onStatus: (status, identity, detail, conflictRecord) => {
-      if (!currentNote || identity.noteId !== currentNote.id || identity.pageId !== pages[currentPageIndex]?.pageId) return;
+      // Page switches only wait for the local draft; the previous page keeps
+      // saving in the background. Its failures and conflicts must stay
+      // visible instead of being dropped because another page is showing.
+      if (!currentNote || identity.noteId !== currentNote.id) return;
       const normalizedStatus = status === "error"
         ? "recoverable-error"
         : status === "offline"
@@ -1441,13 +1474,19 @@ export function createStudyNotes(dependencies) {
           : status === "local-error"
             ? "local-storage-error"
             : status;
-      setSaveState(normalizedStatus, { error: detail instanceof Error ? detail : null });
+      const isCurrentPage = identity.pageId === pages[currentPageIndex]?.pageId;
+      pageSaveStates.set(identity.pageId, {
+        state: normalizedStatus,
+        error: detail instanceof Error ? detail : null
+      });
       if (status === "conflict") {
         currentNote.hasConflict = true;
         conflictPageIds.add(identity.pageId);
-        ui.backgroundBtn.disabled = pages[currentPageIndex]?.pageId === identity.pageId;
-        ui.conflictBanner.classList.toggle("hidden", pages[currentPageIndex]?.pageId !== identity.pageId);
-        renderPageList();
+        if (isCurrentPage) {
+          ui.backgroundBtn.disabled = true;
+          ui.conflictBanner.classList.remove("hidden");
+        }
+        syncPageListState();
         const applyConflict = conflict => {
           if (!conflict || currentNote?.id !== identity.noteId) return;
           currentNote.conflicts = [
@@ -1460,9 +1499,62 @@ export function createStudyNotes(dependencies) {
           .then(applyConflict)
           .catch(error => console.error("競合情報を画面へ反映できませんでした。", error));
       }
+      renderAggregateSaveState();
       if (detail instanceof Error) console.error(detail);
     }
   });
+
+  const SAVE_STATE_UNSYNCED = new Set(["editing", "local-saved", "dirty-local"]);
+
+  function pageNumberLabel(pageId) {
+    const index = pages.findIndex(page => page.pageId === pageId);
+    return index >= 0 ? `${index + 1}ページ` : "別のページ";
+  }
+
+  function renderAggregateSaveState() {
+    const currentPageId = pages[currentPageIndex]?.pageId;
+    const current = pageSaveStates.get(currentPageId) || null;
+    const entries = [...pageSaveStates.entries()].filter(([pageId]) => pages.some(page => page.pageId === pageId));
+    const others = entries.filter(([pageId]) => pageId !== currentPageId);
+    if (current?.state === "conflict") {
+      setSaveState("conflict", { error: current.error });
+      return;
+    }
+    const pick = states => entries.find(([, value]) => states.includes(value.state)) || null;
+    const otherConflict = others.find(([, value]) => value.state === "conflict");
+    if (otherConflict) {
+      setSaveState("recoverable-error", {
+        detail: `${pageNumberLabel(otherConflict[0])}に保存競合があります。そのページを開いて解決してください。`,
+        error: otherConflict[1].error
+      });
+      return;
+    }
+    const failure = pick(["local-storage-error"]) || pick(["recoverable-error"]) || pick(["offline-local"]);
+    if (failure) {
+      const [pageId, value] = failure;
+      const detail = pageId === currentPageId
+        ? ""
+        : value.state === "local-storage-error"
+          ? `${pageNumberLabel(pageId)}の端末内保存に失敗しました。画面を閉じずに再試行してください。`
+          : `${pageNumberLabel(pageId)}のクラウド保存が完了していません。この端末内には保存されています。`;
+      setSaveState(value.state, { detail, error: value.error });
+      return;
+    }
+    if (pick(["saving"])) {
+      setSaveState("saving");
+      return;
+    }
+    if (current && current.state !== "saved" && current.state !== "conflict") {
+      setSaveState(current.state, { error: current.error });
+      return;
+    }
+    const unsynced = others.find(([, value]) => SAVE_STATE_UNSYNCED.has(value.state));
+    if (unsynced) {
+      setSaveState("local-saved", { detail: `${pageNumberLabel(unsynced[0])}のクラウド保存を待っています。` });
+      return;
+    }
+    setSaveState(current?.state === "conflict" ? "conflict" : "saved");
+  }
 
   function identity(page = pages[currentPageIndex]) {
     const editorIdentity = editorLease?.getIdentity?.() || {};
@@ -1611,6 +1703,7 @@ export function createStudyNotes(dependencies) {
 
   function resetPageRender() {
     renderToken += 1;
+    renderedElementState = null;
     backgroundRenderToken += 1;
     renderedBackgroundSignature = "";
     releaseObjectUrls();
@@ -1666,15 +1759,20 @@ export function createStudyNotes(dependencies) {
         return;
       }
 
-      const loadedNotes = await noteStore.listNotes({ expectedUid: session.uid });
-      assertUserSession(session);
-      const [conflicts, pendingSaves, pendingAssets, pageDrafts] = await Promise.all([
+      // One collection read serves the visible list and the stale-creation
+      // cleanup; the local scans run in parallel with it.
+      const [noteDocuments, conflicts, pendingSaves, pendingAssets, pageDrafts] = await Promise.all([
+        noteStore.listNoteDocuments({ expectedUid: session.uid }),
         localStore.listForUser("conflicts", session.uid),
         localStore.listForUser("pendingSaves", session.uid),
         localStore.listForUser("pendingAssets", session.uid),
         localStore.listForUser("pageDrafts", session.uid)
       ]);
       assertUserSession(session);
+      const loadedNotes = await noteStore.listNotes({ expectedUid: session.uid, documents: noteDocuments });
+      latestNoteDocuments = { uid: session.uid, documents: noteDocuments };
+      notesWithLocalChanges = new Set([...pageDrafts, ...pendingSaves, ...pendingAssets]
+        .map(item => item.noteId).filter(Boolean));
       notes = loadedNotes;
       const liveNoteIds = new Set(notes.map(note => note.id));
       const draftsByKey = new Map(pageDrafts.map(draft => [draft.key, draft]));
@@ -1721,6 +1819,13 @@ export function createStudyNotes(dependencies) {
         });
       }
     }
+  }
+
+  function noteListSyncSummary() {
+    return JSON.stringify([
+      notes.map(note => [note.id, note.hasConflict === true, note.pendingSaveCount || 0, note.pendingAssetCount || 0, note.unsyncedCount || 0]),
+      orphanedDrafts.map(group => [group.noteId, group.items.length])
+    ]);
   }
 
   function renderNoteList() {
@@ -1829,12 +1934,50 @@ export function createStudyNotes(dependencies) {
     }
   }
 
+  function noteCardMaterialIdentity(background) {
+    if (background?.type !== "material-page") return "";
+    const material = getMaterials().find(item => item.id === background.materialId) || null;
+    return JSON.stringify({
+      source: materialSourceCacheIdentity(materialSourcePage({ background })),
+      masks: getMaterialPageMasks(material, background.materialPage)
+    });
+  }
+
+  function showNoteCardThumbnail(note, preview, blob) {
+    const url = URL.createObjectURL(blob);
+    const image = document.createElement("img");
+    image.alt = `${note.title || "無題ノート"}の先頭ページ`;
+    image.src = url;
+    image.dataset.thumbnailUrl = url;
+    preview.replaceChildren(image);
+    preview.classList.remove("loading", "fallback");
+  }
+
   async function hydrateNoteCardThumbnail(note, preview) {
     const session = captureUserSession();
     if (!session || !preview?.isConnected) return;
     const tokenKey = `card:${note.id}`;
     const token = Number(thumbnailTokens.get(tokenKey) || 0) + 1;
     thumbnailTokens.set(tokenKey, token);
+    // Fast path: the note root's updatedAt changes with every content, page
+    // or order change. When it matches the cached card and there are no
+    // local drafts, reuse the thumbnail without listing pages or downloading
+    // the first page's JSON (previously 2+ round trips per card per render).
+    const indexKey = noteLocalKey(session.uid, note.id, "note-card", "thumbnail-index");
+    const noteUpdatedAtMs = noteTimestampMs(note.updatedAt);
+    if (noteUpdatedAtMs > 0 && !notesWithLocalChanges.has(note.id)) {
+      const index = await localStore.get("thumbnails", indexKey).catch(() => null);
+      assertUserSession(session);
+      if (
+        index?.kind === "note-card-thumbnail-index" &&
+        index.noteUpdatedAtMs === noteUpdatedAtMs &&
+        index.blob instanceof Blob && index.blob.size > 0 &&
+        index.materialIdentity === noteCardMaterialIdentity(index.background)
+      ) {
+        if (preview.isConnected && thumbnailTokens.get(tokenKey) === token) showNoteCardThumbnail(note, preview, index.blob);
+        return;
+      }
+    }
     const notePages = await noteStore.listPages(note.id, { expectedUid: session.uid });
     assertUserSession(session);
     const page = notePages[0];
@@ -1898,14 +2041,22 @@ export function createStudyNotes(dependencies) {
       });
     }
     assertUserSession(session);
+    if (noteUpdatedAtMs > 0 && draft?.uid !== session.uid && !notesWithLocalChanges.has(note.id)) {
+      void localStore.put("thumbnails", {
+        key: indexKey,
+        uid: session.uid,
+        noteId: note.id,
+        pageId: "note-card",
+        kind: "note-card-thumbnail-index",
+        noteUpdatedAtMs,
+        background: clone(page.background || null),
+        materialIdentity: noteCardMaterialIdentity(page.background),
+        blob,
+        updatedAt: new Date().toISOString()
+      }).catch(error => console.debug("ノート一覧サムネイルの索引を保存できませんでした。", error));
+    }
     if (!preview.isConnected || thumbnailTokens.get(tokenKey) !== token) return;
-    const url = URL.createObjectURL(blob);
-    const image = document.createElement("img");
-    image.alt = `${note.title || "無題ノート"}の先頭ページ`;
-    image.src = url;
-    image.dataset.thumbnailUrl = url;
-    preview.replaceChildren(image);
-    preview.classList.remove("loading", "fallback");
+    showNoteCardThumbnail(note, preview, blob);
   }
 
   function reportError(error, userMessage = "") {
@@ -2058,6 +2209,9 @@ export function createStudyNotes(dependencies) {
     ui.createProgressBar.value = 0;
     await noteStore.createCreatingNote(noteId, { title, type: "pdf-imported", defaultBackground: { ...DEFAULT_BACKGROUND } }, session.uid);
     assertUserSession(session);
+    const inFlightUploads = new Set();
+    let uploadFailure = null;
+    const settleUploads = () => Promise.allSettled([...inFlightUploads]);
     try {
       await convertPdfToImageFiles(file, (current, total) => {
         const percent = Math.round(current / total * 100);
@@ -2066,17 +2220,36 @@ export function createStudyNotes(dependencies) {
       }, {
         signal: createController.signal,
         onPage: async ({ file: pageFile, pageNumber, width, height, pdfRotation }) => {
+          if (uploadFailure) throw uploadFailure;
           assertUserSession(session);
           const pageId = randomId();
-          const imagePath = await noteStore.uploadSourcePage(noteId, pageId, pageFile, session.uid);
-          assertUserSession(session);
-          uploaded.push(imagePath);
-          notePages.push({
+          const page = {
             pageId, order: pageNumber, pageType: "pdf-source-page", size: { width, height },
-            background: { type: "pdf-source-page", imagePath, sourcePageNumber: pageNumber, pdfRotation }
-          });
+            background: { type: "pdf-source-page", imagePath: "", sourcePageNumber: pageNumber, pdfRotation }
+          };
+          notePages.push(page);
+          // Upload this page while the next one renders, with a small bound
+          // on in-flight uploads (each holds one page JPEG in memory).
+          const upload = noteStore.uploadSourcePage(noteId, pageId, pageFile, session.uid)
+            .then(imagePath => {
+              uploaded.push(imagePath);
+              page.background.imagePath = imagePath;
+            })
+            .catch(error => {
+              uploadFailure ||= error;
+              throw error;
+            });
+          inFlightUploads.add(upload);
+          upload.then(() => inFlightUploads.delete(upload), () => inFlightUploads.delete(upload));
+          while (inFlightUploads.size >= PDF_UPLOAD_CONCURRENCY && !uploadFailure) {
+            await Promise.race([...inFlightUploads]).catch(() => {});
+          }
+          if (uploadFailure) throw uploadFailure;
         }
       });
+      if (inFlightUploads.size) ui.createProgressLabel.textContent = "ページ画像の保存を完了しています…";
+      await settleUploads();
+      if (uploadFailure) throw uploadFailure;
       assertUserSession(session);
       if (!notePages.length) throw new Error("PDFにページがありません。");
       await noteStore.finalizeCreatingNote(noteId, notePages, session.uid);
@@ -2090,6 +2263,9 @@ export function createStudyNotes(dependencies) {
         });
       }
     } catch (error) {
+      // Every started upload must settle first so its path is either in
+      // `uploaded` (and deleted below) or already removed from the journal.
+      await settleUploads();
       await compensateCreationFailure(noteId, {
         pageIds: notePages.map(page => page.pageId),
         storagePaths: uploaded,
@@ -2178,24 +2354,22 @@ export function createStudyNotes(dependencies) {
       localRecoverySuppressed = preferCloud;
       explicitReadOnlyMode = forceReadOnly === true;
       assertUserSession(session);
-      currentNote = await measureStartupPhase(
+      contentCache = new Map(); contentLoadPromises = new Map(); pageSaveStates.clear();
+      assetCache = new Map(); backgroundBlobCache = new Map(); backgroundBlobPromises = new Map(); selectedIds = [];
+      revealedMaskIds = new Set(); editingHiddenMaskIds = new Set();
+      // The note document, its page list, the editor lease and the local
+      // record scan are independent. Starting them together removes one full
+      // Firestore round trip (and the fixed lease wait) from every launch.
+      const noteMetadataPromise = measureStartupPhase(
         "note-metadata",
         () => noteStore.getNote(noteId, { expectedUid: session.uid }),
         note => ({ found: Boolean(note && !note.deletedAt), noteType: note?.type || "" })
       );
-      assertUserSession(session);
-      if (!currentNote || currentNote.deletedAt) throw new Error("ノートが見つかりません。");
-      startupMetrics.setContext({ noteType: currentNote.type || "" });
-      setEditorStartupState("loading-pages");
-      contentCache = new Map(); contentLoadPromises = new Map();
-      assetCache = new Map(); backgroundBlobCache = new Map(); backgroundBlobPromises = new Map(); selectedIds = [];
-      revealedMaskIds = new Set(); editingHiddenMaskIds = new Set();
-      // These four operations have no data dependency on one another. Running
-      // them in series added a network round trip, the fixed lease wait, and an
-      // IndexedDB scan to every editor launch before the first page could load.
-      // Start the fixed lease-confirmation wait first. Firestore may spend
-      // noticeable synchronous time preparing listPages() before returning its
-      // Promise, so starting it first lets that CPU work overlap the 180ms wait.
+      const pageMetadataPromise = measureStartupPhase(
+        "page-metadata",
+        () => noteStore.listPages(noteId, { expectedUid: session.uid }),
+        loadedPages => ({ pageCount: loadedPages.length })
+      );
       const editorLeasePromise = measureStartupPhase(
         "editor-lock",
         () => establishEditorLease(noteId, session, { forceReadOnly }),
@@ -2222,14 +2396,17 @@ export function createStudyNotes(dependencies) {
           pageDrafts: records.pageDrafts.length
         })
       );
+      // Observe the parallel branches now so a missing note does not surface
+      // their later rejections as unhandled.
+      [pageMetadataPromise, editorLeasePromise, localRecordsPromise].forEach(promise => promise.catch(() => {}));
+      currentNote = await noteMetadataPromise;
+      assertUserSession(session);
+      if (!currentNote || currentNote.deletedAt) throw new Error("ノートが見つかりません。");
+      startupMetrics.setContext({ noteType: currentNote.type || "" });
+      setEditorStartupState("loading-pages");
       const resourcePreparationPromise = measureStartupPhase(
         "note-resource-preparation",
         () => prepareNoteResources(currentNote)
-      );
-      const pageMetadataPromise = measureStartupPhase(
-        "page-metadata",
-        () => noteStore.listPages(noteId, { expectedUid: session.uid }),
-        loadedPages => ({ pageCount: loadedPages.length })
       );
       const [leaseResult, localRecords, , loadedPages] = await Promise.all([
         editorLeasePromise,
@@ -2289,6 +2466,15 @@ export function createStudyNotes(dependencies) {
         }), () => ({ cachedDrafts: contentCache.size }));
       }
       conflictPageIds = new Set(localConflicts.map(conflict => conflict.pageId));
+      // Seed per-page save states so that switching pages keeps showing
+      // drafts that are still waiting for the cloud.
+      const pendingState = navigator.onLine === false ? "offline-local" : "recoverable-error";
+      [...pendingForNote, ...pendingAssetsForNote].forEach(item => {
+        if (item?.pageId) pageSaveStates.set(item.pageId, { state: pendingState, error: null });
+      });
+      localConflicts.forEach(conflict => {
+        if (conflict?.pageId) pageSaveStates.set(conflict.pageId, { state: "conflict", error: null });
+      });
       startupMetrics.increment("conflicts-detected", localConflicts.length);
       startupMetrics.setContext({
         pendingSaveCount: pendingForNote.length,
@@ -2367,11 +2553,45 @@ export function createStudyNotes(dependencies) {
       : renderPage();
     // renderPage starts the background and pasted-image requests before its
     // first await. Build the sidebar while that I/O is already in flight.
+    let pageListRebuilt = true;
     if (measureInitialLoad) measureStartupWork("page-list-dom", renderPageList, () => ({ pageCount: pages.length }));
-    else renderPageList();
+    else pageListRebuilt = !syncPageListState();
+    renderAggregateSaveState();
     await pageRenderPromise;
     preloadAdjacentPages();
-    if (startupState === "ready") schedulePageThumbnails();
+    if (startupState === "ready" && pageListRebuilt) schedulePageThumbnails();
+  }
+
+  function pageListMatchesPages() {
+    const items = ui.pageList.children;
+    if (items.length !== pages.length) return false;
+    return pages.every((page, index) => items[index]?.querySelector?.(".note-page-thumbnail")?.dataset.pageId === page.pageId);
+  }
+
+  // Updates selection, counters and per-page action state without rebuilding
+  // the list. Rebuilding on every page switch discarded all thumbnails and
+  // restarted their generation (a Storage/JSON read per page).
+  function syncPageListState() {
+    if (!pageListMatchesPages()) {
+      renderPageList();
+      return false;
+    }
+    [...ui.pageList.children].forEach((item, index) => {
+      const page = pages[index];
+      const conflicted = conflictPageIds.has(page.pageId);
+      item.classList.toggle("active", index === currentPageIndex);
+      item.classList.toggle("has-conflict", conflicted);
+      const open = item.querySelector(".note-page-thumbnail");
+      if (open) {
+        open.setAttribute("aria-current", index === currentPageIndex ? "page" : "false");
+        open.title = conflicted ? `${index + 1}ページ（保存競合あり）` : `${index + 1}ページ`;
+      }
+      item.querySelectorAll(".note-page-row-actions button").forEach(button => {
+        button.disabled = readOnlyEditor || !hasWriterOwnership() || conflicted;
+      });
+    });
+    ui.pageCounter.textContent = `${currentPageIndex + 1} / ${pages.length}`;
+    return true;
   }
 
   function renderPageList() {
@@ -2380,15 +2600,22 @@ export function createStudyNotes(dependencies) {
     ui.pageList.replaceChildren();
     pages.forEach((page, index) => {
       const item = document.createElement("li"); item.classList.toggle("active", index === currentPageIndex);
+      const conflicted = conflictPageIds.has(page.pageId);
+      item.classList.toggle("has-conflict", conflicted);
       const open = document.createElement("button"); open.type = "button"; open.className = "note-page-thumbnail";
       open.dataset.pageId = page.pageId;
       open.setAttribute("aria-label", `${index + 1}ページを開く`);
+      open.setAttribute("aria-current", index === currentPageIndex ? "page" : "false");
+      open.title = conflicted ? `${index + 1}ページ（保存競合あり）` : `${index + 1}ページ`;
       open.textContent = `${index + 1}\n${page.pageType === "pdf-source-page" ? "PDF" : page.pageType === "material-page" ? "教材" : page.background?.type === "ruled" ? "罫線" : "白紙"}`;
-      open.addEventListener("click", () => switchPage(index).catch(reportError));
+      open.addEventListener("click", () => {
+        const target = pages.findIndex(candidate => candidate.pageId === page.pageId);
+        if (target >= 0) switchPage(target).catch(reportError);
+      });
       const actions = document.createElement("div"); actions.className = "note-page-row-actions";
       [["↑", "up"], ["↓", "down"], ["複製", "duplicate"], ["削除", "delete"]].forEach(([label, action]) => {
         const button = document.createElement("button"); button.type = "button"; button.textContent = label; button.title = `${index + 1}ページ ${label}`;
-        button.disabled = readOnlyEditor || !hasWriterOwnership() || conflictPageIds.has(page.pageId);
+        button.disabled = readOnlyEditor || !hasWriterOwnership() || conflicted;
         button.addEventListener("click", () => pageAction(action, index).catch(reportError)); actions.append(button);
       });
       item.append(open, actions); ui.pageList.append(item);
@@ -2593,7 +2820,10 @@ export function createStudyNotes(dependencies) {
     }
   }
 
-  async function switchPage(index, { localOnly = false, direction = "" } = {}) {
+  // Page changes only wait for the IndexedDB draft of the page being left
+  // (spec 10). Its cloud save continues in the per-page queue and failures
+  // stay visible through the aggregated save status.
+  async function switchPage(index, { localOnly = true, direction = "" } = {}) {
     if (pageSwitching || index < 0 || index >= pages.length || index === currentPageIndex) return;
     const sourcePage = pages[currentPageIndex];
     pageSwitching = true;
@@ -2985,13 +3215,20 @@ export function createStudyNotes(dependencies) {
     const sweepKey = recoveryKey(session);
     if (pendingRecoverySweeps.has(sweepKey)) return pendingRecoverySweeps.get(sweepKey);
     const sweep = (async () => {
-      try {
-        const recovered = await noteStore.cleanupStuckCreatingNotes({ expectedUid: session.uid });
-        assertUserSession(session);
-        if (recovered.length) console.warn(`${recovered.length}件の未完了ノートを補償処理しました。`);
-      } catch (error) {
-        if (error?.name === "NoteSessionChangedError") throw error;
-        console.warn("未完了ノートの補償処理を継続できませんでした。", error);
+      // Stuck creations are only cleaned after 24 hours, so scanning for them
+      // on every list refresh only added a full collection read.
+      const cleanupDue = Date.now() - lastStuckCreationCleanupAt >= STUCK_CREATION_CLEANUP_INTERVAL_MS;
+      if (cleanupDue) {
+        lastStuckCreationCleanupAt = Date.now();
+        try {
+          const documents = latestNoteDocuments?.uid === session.uid ? latestNoteDocuments.documents : null;
+          const recovered = await noteStore.cleanupStuckCreatingNotes({ expectedUid: session.uid, documents });
+          assertUserSession(session);
+          if (recovered.length) console.warn(`${recovered.length}件の未完了ノートを補償処理しました。`);
+        } catch (error) {
+          if (error?.name === "NoteSessionChangedError") throw error;
+          console.warn("未完了ノートの補償処理を継続できませんでした。", error);
+        }
       }
       assertUserSession(session);
       await recoverPendingCleanups(session);
@@ -3020,6 +3257,7 @@ export function createStudyNotes(dependencies) {
           localStore.listForUser("pendingAssets", session.uid)
         ]);
         assertUserSession(session);
+        const summaryBefore = noteListSyncSummary();
         notes.forEach(note => {
           note.conflicts = conflicts.filter(conflict => conflict.noteId === note.id);
           note.hasConflict = note.conflicts.length > 0;
@@ -3037,7 +3275,9 @@ export function createStudyNotes(dependencies) {
             items: group.items.filter(item => remainingKeys.has(item.pending.key))
           }))
           .filter(group => group.items.length);
-        renderNoteList();
+        // Rebuilding the list restarts every card thumbnail; only do it when
+        // the recovery actually changed what the cards show.
+        if (noteListSyncSummary() !== summaryBefore) renderNoteList();
       }
     })().finally(() => {
       if (pendingRecoverySweeps.get(sweepKey) === sweep) pendingRecoverySweeps.delete(sweepKey);
@@ -3113,30 +3353,43 @@ export function createStudyNotes(dependencies) {
     return group;
   }
 
+  let textMeasureContext = null;
+  function textMeasurement(style, fontSize) {
+    if (!textMeasureContext) textMeasureContext = document.createElement("canvas").getContext("2d");
+    return setNoteTextCanvasFont(textMeasureContext, style, fontSize);
+  }
+
   function textNode(element, metrics = notePageMetrics(pages[currentPageIndex]?.size)) {
     const style = element.style || {};
     const fontSize = metrics.heightRatio(style.fontSizeRatio || .025);
-    const family = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
-    const measurement = document.createElement("canvas").getContext("2d");
-    measurement.font = `${style.fontStyle || "normal"} ${style.fontWeight || "normal"} ${fontSize}px ${family}`;
-    const align = style.textAlign || "left";
-    const anchorX = align === "center"
-      ? metrics.x(element.bounds.x + element.bounds.width / 2)
-      : align === "right" ? metrics.x(element.bounds.x + element.bounds.width) : metrics.x(element.bounds.x);
+    const measurement = textMeasurement(style, fontSize);
+    const align = style.textAlign === "center" || style.textAlign === "right" ? style.textAlign : "left";
+    const left = metrics.x(element.bounds.x);
+    const boxWidth = metrics.widthRatio(element.bounds.width);
+    const anchorX = align === "center" ? left + boxWidth / 2 : align === "right" ? left + boxWidth : left;
     const lineHeight = fontSize * Number(style.lineHeight || 1.25);
+    const fontMetrics = measureTextFontMetrics(measurement, fontSize);
     const layout = layoutTextBox(element.text, {
-      maxWidth: metrics.widthRatio(element.bounds.width),
+      maxWidth: boxWidth,
       lineHeight,
-      measureText: value => measurement.measureText(value).width
+      measureText: createNoteTextMeasure(measurement, style, fontSize)
+    });
+    const top = metrics.y(element.bounds.y);
+    // Absolute baselines (not accumulated dy) keep blank lines and match the
+    // editor textarea, which places each line with CSS half-leading.
+    const baselines = textLineBaselines(layout.lines.length, {
+      top,
+      lineHeight,
+      ...fontMetrics
     });
     const effectiveHeight = Math.max(element.bounds.height, layout.requiredHeight / metrics.height);
     const node = createSvgElement("text", {
       x: anchorX,
-      y: metrics.y(element.bounds.y),
+      y: baselines[0] ?? top + fontSize,
       fill: style.color || "#111111",
       opacity: style.opacity ?? 1,
       "font-size": fontSize,
-      "font-family": family,
+      "font-family": noteTextGenericFamily(style.fontFamily),
       "font-weight": style.fontWeight || "normal",
       "font-style": style.fontStyle || "normal",
       "text-anchor": align === "center" ? "middle" : align === "right" ? "end" : "start",
@@ -3144,9 +3397,15 @@ export function createStudyNotes(dependencies) {
       "data-element-id": element.id,
       transform: `rotate(${element.rotation || 0} ${metrics.x(element.bounds.x + element.bounds.width / 2)} ${metrics.y(element.bounds.y + effectiveHeight / 2)})`
     });
+    node.setAttributeNS("http://www.w3.org/XML/1998/namespace", "xml:space", "preserve");
+    node.style.setProperty("font-family", noteTextFontStack(style.fontFamily));
+    node.style.setProperty("white-space", "pre");
     layout.lines.forEach((line, index) => {
-      const span = createSvgElement("tspan", { x: anchorX, dy: index ? lineHeight : fontSize });
-      span.textContent = line || " "; node.append(span);
+      const visible = renderableTextLine(line);
+      if (!visible) return;
+      const span = createSvgElement("tspan", { x: anchorX, y: baselines[index] });
+      span.textContent = visible;
+      node.append(span);
     });
     return node;
   }
@@ -3156,13 +3415,10 @@ export function createStudyNotes(dependencies) {
     const metrics = notePageMetrics(pages[currentPageIndex]?.size);
     const style = element.style || {};
     const fontSize = Math.max(8, metrics.heightRatio(style.fontSizeRatio || .025));
-    const family = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
-    const measurement = document.createElement("canvas").getContext("2d");
-    measurement.font = `${style.fontStyle || "normal"} ${style.fontWeight || "normal"} ${fontSize}px ${family}`;
     return ensureTextElementHeight(element, {
       pageWidth: metrics.width,
       pageHeight: metrics.height,
-      measureText: value => measurement.measureText(value).width
+      measureText: createNoteTextMeasure(textMeasurement(style, fontSize), style, fontSize)
     });
   }
 
@@ -3465,6 +3721,91 @@ export function createStudyNotes(dependencies) {
     syncDrawingInputLayer();
   }
 
+  function strokeElementNodes(element, metrics) {
+    const selectedClass = `note-element ${selectedIds.includes(element.id) ? "note-selected" : ""}`;
+    const defaultOpacity = element.type === "highlighter" ? .3 : 1;
+    if ((element.type === "stroke" && element.pressureEnabled === true) || element.points?.length === 1) {
+      return strokeSvgNodes(createSvgElement, element.points, Number(element.style?.widthRatio || .0025), {
+        pressureEnabled: element.type === "stroke" && element.pressureEnabled === true,
+        scaleX: metrics.width,
+        scaleY: metrics.height,
+        attributes: {
+          fill: "none", stroke: element.style?.color || "#111111",
+          "stroke-opacity": element.style?.opacity ?? defaultOpacity,
+          class: selectedClass,
+          "data-element-id": element.id
+        }
+      });
+    }
+    return [createSvgElement("path", {
+      d: pathData(element.points, metrics), fill: "none", stroke: element.style?.color || "#111111",
+      "stroke-width": Math.max(1, metrics.widthRatio(element.style?.widthRatio || .0025)),
+      "stroke-opacity": element.style?.opacity ?? defaultOpacity,
+      "stroke-linecap": "round", "stroke-linejoin": "round",
+      class: selectedClass,
+      "data-element-id": element.id
+    })];
+  }
+
+  function vectorElementNodes(element, metrics, pageSize) {
+    if (["highlighter", "stroke"].includes(element.type)) return strokeElementNodes(element, metrics);
+    if (element.type === "shape") {
+      const nodes = [];
+      const markerId = `noteArrowHead-${String(element.id).replace(/[^a-zA-Z0-9_-]/g, "")}`;
+      if (element.shapeType === "arrow") {
+        const defs = createSvgElement("defs");
+        const marker = createSvgElement("marker", { id: markerId, markerWidth: 10, markerHeight: 10, refX: 8, refY: 3, orient: "auto", markerUnits: "strokeWidth" });
+        marker.append(createSvgElement("path", { d: "M0,0 L0,6 L9,3 z", fill: "context-stroke" }));
+        defs.append(marker);
+        nodes.push(defs);
+      }
+      const node = shapeNode(element, markerId, pageSize, metrics);
+      if (selectedIds.includes(element.id)) node.classList.add("note-selected");
+      nodes.push(node);
+      return nodes;
+    }
+    if (element.type === "text") {
+      const node = textNode(element, metrics);
+      if (selectedIds.includes(element.id)) node.classList.add("note-selected");
+      return [node];
+    }
+    return [];
+  }
+
+  // Appends strokes committed since the last full render to the live element
+  // layer. Writing a character settles several strokes; rebuilding every
+  // element of the page after each pause made long pages lag under the Pencil.
+  // Returns false when anything other than an append happened, so the caller
+  // falls back to the full renderPage().
+  function appendCommittedStrokes() {
+    const page = pages[currentPageIndex];
+    const state = renderedElementState;
+    if (!currentContent || !page || !state || state.pageId !== page.pageId || !state.layer?.isConnected) return false;
+    if (selectedIds.length || cropSession) return false;
+    const ordered = [...currentContent.elements].sort((a, b) => Number(a.zIndex || 0) - Number(b.zIndex || 0));
+    if (ordered.length < state.elementIds.length) return false;
+    for (let index = 0; index < state.elementIds.length; index += 1) {
+      if (ordered[index].id !== state.elementIds[index]) return false;
+    }
+    const added = ordered.slice(state.elementIds.length);
+    if (!added.every(element => ["stroke", "highlighter"].includes(element.type))) return false;
+    if (added.length) {
+      const metrics = notePageMetrics(page.size);
+      let group = state.layer.lastElementChild?.localName === "svg" ? state.layer.lastElementChild : null;
+      if (!group) {
+        group = createSvgElement("svg", { viewBox: metrics.viewBox, preserveAspectRatio: "none", class: "note-layer note-svg-layer note-element-layer" });
+        group.style.zIndex = String(state.elementIds.length + 1);
+        state.layer.append(group);
+      }
+      added.forEach(element => strokeElementNodes(element, metrics).forEach(node => group.append(node)));
+    }
+    ui.stage.querySelectorAll('[data-note-draft="settled"]').forEach(node => node.remove());
+    renderedElementState = { ...state, elementIds: ordered.map(element => element.id) };
+    ui.undo.disabled = !history.canUndo();
+    ui.redo.disabled = !history.canRedo();
+    return true;
+  }
+
   async function renderPage() {
     if (!currentContent || !pages[currentPageIndex]) return;
     const measureInitialLoad = startupState === "loading-content";
@@ -3569,6 +3910,7 @@ export function createStudyNotes(dependencies) {
     let assetByteSize = 0;
     let failedAssetCount = 0;
     const ordered = [...currentContent.elements].sort((a, b) => Number(a.zIndex || 0) - Number(b.zIndex || 0));
+    let vectorGroup = null;
     for (const [stackIndex, element] of ordered.entries()) {
       const layerZIndex = String(stackIndex + 1);
       if (element.type === "image") {
@@ -3596,61 +3938,26 @@ export function createStudyNotes(dependencies) {
         });
         assetRenderPromises.push(assetRender);
         wrap.append(image); elementLayer.append(wrap);
+        vectorGroup = null;
         continue;
       }
 
-      const svg = createSvgElement("svg", { viewBox: metrics.viewBox, preserveAspectRatio: "none", class: "note-layer note-svg-layer note-element-layer" });
-      svg.style.zIndex = layerZIndex;
-      if (["highlighter", "stroke"].includes(element.type)) {
-        if (element.type === "stroke" && element.pressureEnabled === true) {
-          strokeSvgNodes(createSvgElement, element.points, Number(element.style?.widthRatio || .0025), {
-            pressureEnabled: true,
-            scaleX: metrics.width,
-            scaleY: metrics.height,
-            attributes: {
-              fill: "none", stroke: element.style?.color || "#111111",
-              "stroke-opacity": element.style?.opacity ?? 1,
-              class: `note-element ${selectedIds.includes(element.id) ? "note-selected" : ""}`,
-              "data-element-id": element.id
-            }
-          }).forEach(node => svg.append(node));
-        } else if (element.points?.length === 1) {
-          strokeSvgNodes(createSvgElement, element.points, Number(element.style?.widthRatio || .0025), {
-            pressureEnabled: false,
-            scaleX: metrics.width,
-            scaleY: metrics.height,
-            attributes: {
-              fill: "none", stroke: element.style?.color || "#111111",
-              "stroke-opacity": element.style?.opacity ?? (element.type === "highlighter" ? .3 : 1),
-              class: `note-element ${selectedIds.includes(element.id) ? "note-selected" : ""}`,
-              "data-element-id": element.id
-            }
-          }).forEach(node => svg.append(node));
-        } else {
-          svg.append(createSvgElement("path", {
-            d: pathData(element.points, metrics), fill: "none", stroke: element.style?.color || "#111111",
-            "stroke-width": Math.max(1, metrics.widthRatio(element.style?.widthRatio || .0025)),
-            "stroke-opacity": element.style?.opacity ?? (element.type === "highlighter" ? .3 : 1),
-            "stroke-linecap": "round", "stroke-linejoin": "round",
-            class: `note-element ${selectedIds.includes(element.id) ? "note-selected" : ""}`,
-            "data-element-id": element.id
-          }));
-        }
-      } else if (element.type === "shape") {
-        const markerId = `noteArrowHead-${String(element.id).replace(/[^a-zA-Z0-9_-]/g, "")}`;
-        if (element.shapeType === "arrow") {
-          const defs = createSvgElement("defs");
-          const marker = createSvgElement("marker", { id: markerId, markerWidth: 10, markerHeight: 10, refX: 8, refY: 3, orient: "auto", markerUnits: "strokeWidth" });
-          marker.append(createSvgElement("path", { d: "M0,0 L0,6 L9,3 z", fill: "context-stroke" })); defs.append(marker); svg.append(defs);
-        }
-        const node = shapeNode(element, markerId, page.size, metrics); if (selectedIds.includes(element.id)) node.classList.add("note-selected"); svg.append(node);
-      } else if (element.type === "text") {
-        const node = textNode(element, metrics); if (selectedIds.includes(element.id)) node.classList.add("note-selected"); svg.append(node);
-      } else {
-        continue;
+      const nodes = vectorElementNodes(element, metrics, page.size);
+      if (!nodes.length) continue;
+      // Consecutive vector elements share one SVG root. One full-page SVG per
+      // stroke made every render and every paint scale with the stroke count.
+      if (!vectorGroup) {
+        vectorGroup = createSvgElement("svg", { viewBox: metrics.viewBox, preserveAspectRatio: "none", class: "note-layer note-svg-layer note-element-layer" });
+        vectorGroup.style.zIndex = layerZIndex;
+        elementLayer.append(vectorGroup);
       }
-      elementLayer.append(svg);
+      nodes.forEach(node => vectorGroup.append(node));
     }
+    renderedElementState = {
+      pageId: page.pageId,
+      elementIds: ordered.map(element => element.id),
+      layer: elementLayer
+    };
     ui.stage.append(elementLayer);
 
     const maskLayer = document.createElement("div"); maskLayer.className = "note-layer"; maskLayer.dataset.layer = "masks"; maskLayer.style.zIndex = "20";
@@ -3757,28 +4064,26 @@ export function createStudyNotes(dependencies) {
     if (!snapshot?.content || !isEditableNow()) { explainBlockedEdit(); return; }
     const session = captureUserSession();
     assertUserSession(session);
-    const metadataUpdates = [];
+    const pageUpdates = [];
     snapshot.pageMetadata?.forEach(saved => {
       const page = pages.find(item => item.pageId === saved.pageId);
       if (!page) return;
       const changed = page.pageType !== saved.pageType || JSON.stringify(page.background) !== JSON.stringify(saved.background);
       page.pageType = saved.pageType;
       page.background = clone(saved.background);
-      if (changed) metadataUpdates.push(noteStore.updatePage(currentNote.id, page.pageId, {
-        pageType: page.pageType,
-        background: page.background
-      }, session.uid));
+      if (changed) pageUpdates.push({ pageId: page.pageId, fields: { pageType: page.pageType, background: page.background } });
     });
     const defaultChanged = JSON.stringify(currentNote.defaultBackground) !== JSON.stringify(snapshot.defaultBackground);
     currentNote.defaultBackground = clone(snapshot.defaultBackground);
-    if (defaultChanged) metadataUpdates.push(noteStore.updateNote(currentNote.id, {
-      defaultBackground: currentNote.defaultBackground
-    }, session.uid));
     currentContent = clone(snapshot.content);
     contentCache.set(pages[currentPageIndex].pageId, clone(currentContent));
     await Promise.all([
       scheduleLocalSave(identity(), currentContent),
-      ...metadataUpdates
+      ...(pageUpdates.length || defaultChanged
+        ? [noteStore.updatePages(currentNote.id, pageUpdates, session.uid, {
+            noteFields: defaultChanged ? { defaultBackground: currentNote.defaultBackground } : null
+          })]
+        : [])
     ]);
     renderPageList();
     renderPage();
@@ -3855,18 +4160,6 @@ export function createStudyNotes(dependencies) {
     return clientPointToNormalized(event.clientX, event.clientY, pageRect || ui.stage.getBoundingClientRect());
   }
 
-  function historySnapshotReference(content) {
-    return {
-      content,
-      defaultBackground: clone(currentNote?.defaultBackground || DEFAULT_BACKGROUND),
-      pageMetadata: pages.map(page => ({
-        pageId: page.pageId,
-        pageType: page.pageType,
-        background: clone(page.background)
-      }))
-    };
-  }
-
   function cancelPendingStrokeSchedule() {
     if (!pendingStrokeIdleHandle) return;
     if (pendingStrokeIdleKind === "idle") globalThis.cancelIdleCallback?.(pendingStrokeIdleHandle);
@@ -3920,13 +4213,7 @@ export function createStudyNotes(dependencies) {
     pendingStrokeWork = null;
     pendingStrokeIdleSince = 0;
     if (!work) return;
-    for (const entry of work.historyEntries || []) {
-      history.pushImmutable(
-        historySnapshotReference(clone(entry.before)),
-        historySnapshotReference(clone(entry.after)),
-        entry.label
-      );
-    }
+    pushStrokeHistoryEntries(work.historyEntries || []);
     ui.undo.disabled = !history.canUndo();
     // Enqueue the immutable content snapshot before yielding to rendering.
     // Multiple idle flushes may overlap while Pencil input continues; if an
@@ -3934,7 +4221,7 @@ export function createStudyNotes(dependencies) {
     // newer page snapshot and overwrite it on reload.
     const saveTask = scheduleLocalSave(work.identity, work.content);
     if (render && currentNote?.id === work.identity.noteId && pages[currentPageIndex]?.pageId === work.identity.pageId) {
-      await renderPage();
+      if (!appendCommittedStrokes()) await renderPage();
     }
     try {
       await saveTask;
@@ -3945,12 +4232,61 @@ export function createStudyNotes(dependencies) {
       }
       reportError(error);
     }
+    scheduleCurrentPageThumbnailRefresh(work.identity.noteId, work.identity.pageId);
+  }
+
+  // Stroke commits are pure appends ({...content, elements: [...elements, stroke]}).
+  // Cloning the whole page twice per stroke made each pause in handwriting a
+  // long task on large pages; clone the batch base once and share structure.
+  // History snapshots are private and only ever read through clone().
+  function appendOnlyStrokeSnapshot(sourceBefore, sourceAfter, clonedBefore) {
+    const beforeElements = sourceBefore?.elements;
+    const afterElements = sourceAfter?.elements;
+    if (!Array.isArray(beforeElements) || !Array.isArray(afterElements)) return null;
+    if (afterElements.length !== beforeElements.length + 1) return null;
+    for (let index = 0; index < beforeElements.length; index += 1) {
+      if (afterElements[index] !== beforeElements[index]) return null;
+    }
+    const keys = new Set([...Object.keys(sourceBefore), ...Object.keys(sourceAfter)]);
+    for (const key of keys) {
+      if (key !== "elements" && sourceBefore[key] !== sourceAfter[key]) return null;
+    }
+    return { ...clonedBefore, elements: [...clonedBefore.elements, clone(afterElements[afterElements.length - 1])] };
+  }
+
+  function pushStrokeHistoryEntries(entries) {
+    if (!entries.length) return;
+    const defaultBackground = clone(currentNote?.defaultBackground || DEFAULT_BACKGROUND);
+    const pageMetadata = pages.map(page => ({
+      pageId: page.pageId,
+      pageType: page.pageType,
+      background: clone(page.background)
+    }));
+    const snapshot = content => ({ content, defaultBackground, pageMetadata });
+    let previousSource = null;
+    let previousClone = null;
+    for (const entry of entries) {
+      const before = entry.before === previousSource && previousClone ? previousClone : clone(entry.before);
+      const after = appendOnlyStrokeSnapshot(entry.before, entry.after, before) || clone(entry.after);
+      history.pushImmutable(snapshot(before), snapshot(after), entry.label);
+      previousSource = entry.after;
+      previousClone = after;
+    }
+  }
+
+  // Thumbnail rendering draws the whole page into a canvas. Keep it out of
+  // the middle of handwriting: wait until the Pencil has been idle for a while.
+  function scheduleCurrentPageThumbnailRefresh(noteId, pageId, delay = 900) {
     clearTimeout(pendingThumbnailTimer);
     pendingThumbnailTimer = setTimeout(() => {
-      if (currentNote?.id === work.identity.noteId && pages[currentPageIndex]?.pageId === work.identity.pageId) {
-        refreshCurrentPageThumbnail();
+      if (currentNote?.id !== noteId || pages[currentPageIndex]?.pageId !== pageId) return;
+      const quietFor = performance.now() - lastDrawingActivityAt;
+      if (activeGesture || pendingStrokeWork || quietFor < 900) {
+        scheduleCurrentPageThumbnailRefresh(noteId, pageId, Math.max(250, 900 - quietFor));
+        return;
       }
-    }, 650);
+      refreshCurrentPageThumbnail();
+    }, delay);
   }
 
   function queueStrokeWork(before, after, label) {
@@ -4036,11 +4372,12 @@ export function createStudyNotes(dependencies) {
     return event.target?.closest?.("[data-element-id]")?.dataset.elementId || "";
   }
 
-  function hitTestElementId(point) {
+  function hitTestElementId(point, { types = null } = {}) {
     if (!point || !currentContent?.elements?.length) return "";
     const pageSize = pages[currentPageIndex]?.size;
     return [...currentContent.elements]
       .map((element, index) => ({ element, index }))
+      .filter(({ element }) => !types || types.includes(element.type))
       .sort((a, b) => Number(b.element.zIndex || 0) - Number(a.element.zIndex || 0) || b.index - a.index)
       .find(({ element }) => {
         const tolerance = Math.max(.006, Number(element.style?.widthRatio || 0) * 1.5);
@@ -4264,7 +4601,14 @@ export function createStudyNotes(dependencies) {
     const pageRect = ui.stage.getBoundingClientRect();
     const point = gesturePoint(event, pageRect);
     lastTap = point;
-    const elementId = targetElementId(event) || (["select", "text"].includes(currentTool) ? hitTestElementId(point) : "");
+    const targetedElementId = targetElementId(event);
+    const elementId = currentTool === "text"
+      // The text tool edits text only; a stroke drawn over a text box must not
+      // turn a tap on that text into a new empty box.
+      ? (currentContent.elements.some(element => element.id === targetedElementId && element.type === "text")
+        ? targetedElementId
+        : hitTestElementId(point, { types: ["text"] }))
+      : targetedElementId || (currentTool === "select" ? hitTestElementId(point) : "");
     const maskId = targetMaskId(event);
     const maskVisibilityId = targetMaskVisibilityKey(event);
     const transformHandle = requestedHandle;
@@ -4322,6 +4666,12 @@ export function createStudyNotes(dependencies) {
       activeGesture = { type: "pan", pointerId: event.pointerId, pointerType: event.pointerType, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
     } else if (currentTool === "pan") {
       activeGesture = { type: "pan", pointerId: event.pointerId, pointerType: event.pointerType, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
+    } else if (currentTool === "text" && textEditorSession) {
+      // A tap outside the open text box only finishes it. Creating another
+      // empty box here would keep the iPad keyboard open after "done".
+      textEditorSession.finish();
+      event.preventDefault();
+      return;
     } else if (currentTool === "text" && elementId) {
       openTextEditor(point, elementId);
       return;
@@ -4360,6 +4710,7 @@ export function createStudyNotes(dependencies) {
       }
     } else if (["pen", "highlighter"].includes(currentTool)) {
       if (!recoveredFromMissingPointerdown) drawingDiagnostics.pointerdown += 1;
+      lastDrawingActivityAt = performance.now();
       const now = Number(event.timeStamp || performance.now());
       if (lastPenEndedAt != null) drawingDiagnostics.lastStrokeGapMs = Math.max(0, now - lastPenEndedAt);
       activeGesture = {
@@ -4474,6 +4825,7 @@ export function createStudyNotes(dependencies) {
       cropSession.draft = { crop: clone(image.crop), bounds: clone(image.bounds) };
       renderPage();
     } else if (["pen", "highlighter"].includes(activeGesture.type)) {
+      lastDrawingActivityAt = startedProcessingAt;
       if (raw) {
         activeGesture.rawPreviewPoint = { ...point, pressure: Number(event.pressure || .5) };
         scheduleStrokePreview(activeGesture);
@@ -4678,9 +5030,10 @@ export function createStudyNotes(dependencies) {
       });
       commitChange(gesture.before, "ピクセル消去");
     } else if (gesture.type === "text") {
-      const bounds = normalizedBoundsFromPoints(gesture.start, end, .01);
-      const dragged = Math.abs(end.x - gesture.start.x) > .01 || Math.abs(end.y - gesture.start.y) > .01;
-      if (dragged) textEditorSession?.setBounds(bounds);
+      // A short Pencil drag is a tap: keep a readable default box instead of
+      // a sliver that would wrap every character onto its own line.
+      const resolved = resolveTextBoxFromGesture(gesture.start, end);
+      textEditorSession?.setBounds(resolved);
       textEditorSession?.activate();
     } else if (gesture.type === "shape") {
       const bounds = normalizedBoundsFromPoints(gesture.start, end, .01);
@@ -4776,10 +5129,18 @@ export function createStudyNotes(dependencies) {
     if (textEditorSession && !textEditorSession.finish()) return;
     const existing = currentContent.elements.find(element => element.id === existingId && element.type === "text");
     const before = clone(currentContent);
-    const fallback = requestedBounds || { x: point.x, y: point.y, width: .35, height: .12 };
-    const width = clamp(Number(existing?.bounds?.width || fallback.width), .08, 1);
-    const height = clamp(Number(existing?.bounds?.height || fallback.height), .04, 1);
-    let bounds = clone(existing?.bounds || {
+    const fallback = requestedBounds || { x: point.x, y: point.y, ...NOTE_TEXT_DEFAULT_BOX };
+    const existingBounds = existing?.bounds ? { ...existing.bounds } : null;
+    // Older builds could store a box a few pixels wide when a Pencil tap
+    // moved slightly; such text rendered one character per line. Reopening it
+    // restores a usable width instead of editing inside an invisible column.
+    if (existingBounds && Number(existingBounds.width) < NOTE_TEXT_MIN_DRAG_WIDTH) {
+      existingBounds.width = Math.min(1, NOTE_TEXT_DEFAULT_BOX.width);
+      existingBounds.x = clamp(Number(existingBounds.x), 0, 1 - existingBounds.width);
+    }
+    const width = clamp(Number(existingBounds?.width || fallback.width), existing ? .01 : NOTE_TEXT_MIN_BOX_WIDTH, 1);
+    const height = clamp(Number(existingBounds?.height || fallback.height), existing ? .01 : .04, 1);
+    let bounds = clone(existingBounds || {
       ...fallback,
       x: clamp(Number(fallback.x), 0, 1 - width),
       y: clamp(Number(fallback.y), 0, 1 - height),
@@ -4801,16 +5162,34 @@ export function createStudyNotes(dependencies) {
     editor.classList.toggle("is-sizing", deferFocus);
     editor.dataset.noteTextEditor = "true";
     editor.setAttribute("aria-label", existing ? "テキストを編集" : "テキストを入力");
-    setBoundsStyle(editor, bounds);
+    editor.setAttribute("wrap", "soft");
+    editor.spellcheck = false;
     editor.value = existing?.text || "";
-    editor.style.fontFamily = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
-    editor.style.fontWeight = style.fontWeight || "normal";
-    editor.style.fontStyle = style.fontStyle || "normal";
-    editor.style.setProperty("--note-text-editor-font-size", `${Math.max(16, Number(style.fontSizeRatio || .025) * (ui.stage.clientHeight || 640))}px`);
+    editor.style.fontFamily = noteTextFontStack(style.fontFamily);
+    editor.style.fontWeight = style.fontWeight === "bold" ? "bold" : "normal";
+    editor.style.fontStyle = style.fontStyle === "italic" ? "italic" : "normal";
     editor.style.setProperty("--note-text-editor-line-height", String(style.lineHeight || 1.25));
     editor.style.setProperty("--note-text-editor-align", style.textAlign || "left");
     editor.style.setProperty("--note-text-editor-color", style.color || "#111111");
     editor.style.setProperty("--note-text-editor-opacity", String(style.opacity ?? 1));
+
+    // The overlay must wrap and place text exactly like the committed SVG
+    // text. Its font is kept at 16px or larger (iPad Safari input rules) and
+    // scaled down visually, so the wrap width and glyph size match the page.
+    let editorScale = 1;
+    const applyEditorGeometry = () => {
+      const stageHeight = Math.max(1, ui.stage.clientHeight || 1);
+      const actualFontPx = Math.max(1, Number(style.fontSizeRatio || .025) * stageHeight);
+      const editorFontPx = Math.max(NOTE_TEXT_EDITOR_MIN_FONT_PX, actualFontPx);
+      editorScale = actualFontPx / editorFontPx;
+      editor.style.setProperty("--note-text-editor-font-size", `${editorFontPx}px`);
+      editor.style.left = `${bounds.x * 100}%`;
+      editor.style.top = `${bounds.y * 100}%`;
+      editor.style.width = `${bounds.width * 100 / editorScale}%`;
+      editor.style.height = `${bounds.height * 100 / editorScale}%`;
+      editor.style.transform = editorScale < 0.9999 ? `scale(${editorScale})` : "";
+    };
+    applyEditorGeometry();
     ui.stage.append(editor);
 
     let composing = false;
@@ -4819,12 +5198,12 @@ export function createStudyNotes(dependencies) {
     let cancelled = false;
     const updateAutomaticHeight = () => {
       if (finished || !editor.isConnected) return;
-      editor.style.height = "auto";
-      const minimum = Math.max(60, editor.scrollHeight + 4);
       const stageHeight = Math.max(1, ui.stage.clientHeight || 1);
-      const normalizedHeight = clamp(minimum / stageHeight, .04, Math.max(.04, 1 - bounds.y));
+      editor.style.height = "0px";
+      const contentHeight = editor.scrollHeight * editorScale;
+      const normalizedHeight = clamp(contentHeight / stageHeight, .01, Math.max(.01, 1 - bounds.y));
       bounds = { ...bounds, height: Math.max(bounds.height, normalizedHeight) };
-      setBoundsStyle(editor, bounds);
+      applyEditorGeometry();
     };
     const setEditorBounds = nextBounds => {
       if (finished || existing || !nextBounds) return;
@@ -4836,8 +5215,16 @@ export function createStudyNotes(dependencies) {
         width: nextWidth,
         height: nextHeight
       };
-      setBoundsStyle(editor, bounds);
+      applyEditorGeometry();
     };
+    const resizeObserver = typeof ResizeObserver === "function"
+      ? new ResizeObserver(() => {
+        if (finished || !editor.isConnected) return;
+        applyEditorGeometry();
+        updateAutomaticHeight();
+      })
+      : null;
+    resizeObserver?.observe(ui.stage);
     const keepVisible = () => {
       if (!editor.isConnected) return;
       const visual = globalThis.visualViewport;
@@ -4851,22 +5238,37 @@ export function createStudyNotes(dependencies) {
       if (composing && !force) { pendingFinish = true; cancelled ||= cancel; return false; }
       finished = true;
       cancelled ||= cancel;
+      resizeObserver?.disconnect();
       globalThis.visualViewport?.removeEventListener?.("resize", keepVisible);
       globalThis.visualViewport?.removeEventListener?.("scroll", keepVisible);
       const value = cancelled ? "" : editor.value.trimEnd();
       editor.remove();
       textEditorSession = null;
-      if (!value) { renderPage(); return true; }
-      if (existing) {
-        existing.text = value;
-        existing.autoHeight = true;
-        existing.bounds = normalizeTextElementHeight({ ...existing, text: value, bounds }).bounds;
+      // The page may have been re-rendered while the keyboard was open; edit
+      // the element that is live now rather than a stale reference.
+      const target = existing ? currentContent.elements.find(element => element.id === existing.id && element.type === "text") : null;
+      if (!value) {
+        if (!cancelled && target) {
+          // Clearing every character of an existing box deletes it instead of
+          // silently restoring the previous text.
+          currentContent.elements = currentContent.elements.filter(element => element.id !== target.id);
+          selectedIds = selectedIds.filter(id => id !== target.id);
+          commitChange(before, "テキスト削除");
+          return true;
+        }
+        renderPage();
+        return true;
+      }
+      if (target) {
+        target.text = value;
+        target.autoHeight = true;
+        target.bounds = normalizeTextElementHeight({ ...target, text: value, bounds }).bounds;
       } else currentContent.elements.push(normalizeTextElementHeight({
         id: randomId(), type: "text", bounds, rotation: 0, text: value, autoHeight: true,
         style: clone(style),
         zIndex: elementZIndex(currentContent.elements)
       }));
-      commitChange(before, existing ? "テキスト編集" : "テキスト追加");
+      commitChange(before, target ? "テキスト編集" : "テキスト追加");
       return true;
     };
     const activate = () => {
@@ -4882,6 +5284,7 @@ export function createStudyNotes(dependencies) {
       finish,
       setBounds: setEditorBounds,
       activate,
+      get bounds() { return { ...bounds }; },
       get isComposing() { return composing; }
     };
     editor.addEventListener("compositionstart", () => { composing = true; });
@@ -5182,10 +5585,12 @@ export function createStudyNotes(dependencies) {
     if (!canMutateCurrentNote(currentNote, { page, allowConflict: false })) return;
     targets.forEach(target => { target.background = clone(background); });
     if (scope !== "current") currentNote.defaultBackground = clone(background);
-    await Promise.all([
-      ...targets.map(target => noteStore.updatePage(currentNote.id, target.pageId, { background: target.background }, session.uid)),
-      ...(scope !== "current" ? [noteStore.updateNote(currentNote.id, { defaultBackground: currentNote.defaultBackground }, session.uid)] : [])
-    ]);
+    await noteStore.updatePages(
+      currentNote.id,
+      targets.map(target => ({ pageId: target.pageId, fields: { background: target.background } })),
+      session.uid,
+      { noteFields: scope !== "current" ? { defaultBackground: currentNote.defaultBackground } : null }
+    );
     history.push(before, historySnapshot(), "背景変更");
     renderPageList();
     renderPage();
@@ -5350,6 +5755,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function undo() {
+    if (!prepareEditorAction("元に戻す")) return;
     if (!isEditableNow()) { explainBlockedEdit(); return; }
     if (pendingStrokeWork) { void flushPendingStrokeWork({ render: false }).then(undo); return; }
     const restored = history.undo(historySnapshot()); if (!restored) return;
@@ -5357,6 +5763,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function redo() {
+    if (!prepareEditorAction("やり直し")) return;
     if (!isEditableNow()) { explainBlockedEdit(); return; }
     if (pendingStrokeWork) { void flushPendingStrokeWork({ render: false }).then(redo); return; }
     const restored = history.redo(historySnapshot()); if (!restored) return;
@@ -5393,8 +5800,15 @@ export function createStudyNotes(dependencies) {
     if (!canMutateCurrentNote(note)) return;
     await noteStore.updateNote(note.id, { title }, session.uid); note.title = title;
     assertUserSession(session);
-    if (currentNote?.id === note.id) ui.title.value = title;
-    await refreshNotes();
+    if (currentNote?.id === note.id) {
+      currentNote.title = title;
+      ui.title.value = title;
+    }
+    // A rename changes one field; update the loaded list instead of
+    // re-reading every note, local draft and thumbnail.
+    const listed = notes.find(item => item.id === note.id);
+    if (listed) listed.title = title;
+    if (!dedicatedEditor) renderNoteList();
   }
 
   async function deleteNote(note = currentNote) {
@@ -5411,8 +5825,22 @@ export function createStudyNotes(dependencies) {
     if (!canMutateCurrentNote(note)) return;
     await noteStore.deleteNote(note.id, session.uid);
     assertUserSession(session);
+    if (dedicatedEditor && currentNote?.id === note.id) {
+      // The editor tab has no note list of its own; return to the list page
+      // instead of leaving an empty list inside the editor.
+      editorLease?.release();
+      currentNote = null; pages = []; currentContent = null;
+      globalThis.location.assign(noteListUrl().toString());
+      return;
+    }
     if (currentNote?.id === note.id) { currentNote = null; pages = []; currentContent = null; show("list"); }
-    await refreshNotes();
+    notes = notes.filter(item => item.id !== note.id);
+    renderNoteList();
+    // Orphaned local drafts of the deleted note are recomputed in the
+    // background; the list itself is already up to date.
+    void refreshNotes().catch(error => {
+      if (error?.name !== "NoteSessionChangedError") console.warn("ノート一覧を更新できませんでした。", error);
+    });
   }
 
   async function duplicateNote(noteId) {
@@ -5435,14 +5863,18 @@ export function createStudyNotes(dependencies) {
     });
     const storagePaths = [];
     try {
-      for (let index = 0; index < sourcePages.length; index += 1) {
-        const sourceContent = currentNote?.id === noteId && pages[currentPageIndex]?.pageId === sourcePages[index].pageId ? clone(currentContent) : await noteStore.loadPageContent(noteId, sourcePages[index], { expectedUid: session.uid });
+      // Pages are independent: copy a few at a time instead of paying one
+      // download + upload + commit round trip per page in sequence.
+      await runWithConcurrency(sourcePages, NOTE_COPY_CONCURRENCY, async (sourcePage, index) => {
+        const sourceContent = currentNote?.id === noteId && pages[currentPageIndex]?.pageId === sourcePage.pageId
+          ? clone(currentContent)
+          : await noteStore.loadPageContent(noteId, sourcePage, { expectedUid: session.uid });
         assertUserSession(session);
         sourceContent.elements = sourceContent.elements.map(element => ({ ...element, id: randomId(), assetNoteId: element.type === "image" ? (element.assetNoteId || noteId) : element.assetNoteId }));
         sourceContent.noteMasks = sourceContent.noteMasks.map(mask => ({ ...mask, id: randomId() }));
         const saved = await noteStore.enqueuePageContentSave({ noteId: newId, pageId: newPages[index].pageId, expectedRevision: 0, expectedUid: session.uid }, sourceContent);
         storagePaths.push(saved.contentPath);
-      }
+      });
       await noteStore.finalizeNoteCreation(newId, newPages.length, session.uid);
     } catch (error) {
       await compensateCreationFailure(newId, {
@@ -5453,7 +5885,11 @@ export function createStudyNotes(dependencies) {
       }, error);
       throw error;
     }
-    await refreshNotes();
+    if (dedicatedEditor) {
+      showEditorNotice(`「${sourceNote.title || "無題ノート"} のコピー」を作成しました。ノート一覧から開けます。`);
+    } else {
+      await refreshNotes();
+    }
     return newId;
   }
 
@@ -6344,7 +6780,10 @@ export function createStudyNotes(dependencies) {
               throw new Error("未同期データを端末内に保持しています。通信状態を確認して再試行してください。");
             }
           }
-          setSaveState("saved");
+          [...pageSaveStates.keys()].forEach(pageId => {
+            if (pageSaveStates.get(pageId)?.state !== "conflict") pageSaveStates.delete(pageId);
+          });
+          renderAggregateSaveState();
           closeSavePopover();
           return refreshNotes();
         })

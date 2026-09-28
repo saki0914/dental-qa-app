@@ -1,5 +1,6 @@
 import {
   arrayRemove,
+  arrayUnion,
   collection,
   doc,
   getDoc,
@@ -35,6 +36,8 @@ import {
 } from "../core/note-material-mutation.js";
 import { randomId } from "../core/id.js";
 import { normalizeNoteLineElements } from "../core/note-geometry.js";
+import { sha256Hex } from "../core/sha256.js";
+import { runWithConcurrency } from "../core/bounded-concurrency.js";
 import { createNotePageSaveQueue } from "../core/note-page-save-queue.js";
 
 export class NoteConflictError extends Error {
@@ -68,24 +71,27 @@ class NoteSameWriterRebaseError extends Error {
 }
 
 const nowIso = () => new Date().toISOString();
-const hashText = async text => {
-  const bytes = new TextEncoder().encode(text);
-  if (!globalThis.crypto?.subtle) return `${bytes.byteLength}-${Date.now()}`;
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, "0")).join("");
-};
-const hashBlob = async blob => {
-  if (!globalThis.crypto?.subtle) return `${blob.size}-${blob.type}-${Date.now()}`;
-  const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
-  return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, "0")).join("");
-};
+// HTTP LAN Emulator sessions have no crypto.subtle. The software digest keeps
+// the hash (and therefore the revision path) identical for identical bytes so
+// retried saves stay idempotent instead of creating time-dependent paths.
+const hashText = text => sha256Hex(new TextEncoder().encode(text));
+const hashBlob = async blob => sha256Hex(await blob.arrayBuffer());
 
 const CREATION_BATCH_SIZE = 400;
 const MAX_PENDING_STORAGE_PATHS = 1000;
 const NOTE_CREATION_WAIT_TIMEOUT_MS = 15_000;
 const NOTE_CREATION_POLL_INTERVAL_MS = 250;
 const MAX_SAME_WRITER_REBASE_ATTEMPTS = 1;
+const STORAGE_DELETE_CONCURRENCY = 4;
 const isReadyNote = note => !note?.status || note.status === "ready";
+export function noteTimestampMs(value) {
+  if (!value) return 0;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value.toDate === "function") return value.toDate().getTime();
+  if (Number.isFinite(value.seconds)) return value.seconds * 1000 + Math.floor(Number(value.nanoseconds || 0) / 1e6);
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = async () => {} }) {
@@ -124,31 +130,33 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
 
   async function journalStoragePath(noteId, path, expectedUid) {
     const { uid, db } = writeContext(expectedUid);
-    await runTransaction(db, async transaction => {
-      const reference = noteRef(db, uid, noteId);
-      const snapshot = await transaction.get(reference);
-      context(expectedUid);
-      if (!snapshot.exists() || snapshot.data()?.deletedAt || snapshot.data()?.status === "failed") {
-        throw new Error("Storage書込み先のノートを確認できません。");
-      }
-      const currentPaths = Array.isArray(snapshot.data()?.pendingStoragePaths)
-        ? snapshot.data().pendingStoragePaths
-        : [];
-      const prunedPaths = [...new Set(currentPaths.filter(item => typeof item === "string" && item))];
-      if (prunedPaths.length > MAX_PENDING_STORAGE_PATHS) {
-        throw new Error("未確認のStorageパスが上限を超えているため、クリーンアップ完了までアップロードできません。");
-      }
-      if (!prunedPaths.includes(path)) {
-        if (prunedPaths.length >= MAX_PENDING_STORAGE_PATHS) {
-          throw new Error("未確認のStorageパスが上限に達したため、新しいアップロードを開始できません。");
-        }
-        prunedPaths.push(path);
-      }
-      context(expectedUid);
-      transaction.update(reference, {
-        pendingStoragePaths: prunedPaths,
-        updatedAt: serverTimestamp()
-      });
+    const reference = noteRef(db, uid, noteId);
+    // A plain read followed by an atomic arrayUnion keeps every check of the
+    // former read-modify-write transaction (missing, deleted or failed notes
+    // and a full journal are rejected before anything is uploaded) without
+    // transaction retries, which the SDK backs off by about a second whenever
+    // page saves or PDF page uploads touch the same note document at once.
+    // A note deleted after this read is still rejected by the commit
+    // transaction that follows every upload; it removes the uploaded object
+    // and this journal entry again.
+    const snapshot = await getDoc(reference);
+    context(expectedUid);
+    const data = snapshot.exists() ? snapshot.data() : null;
+    if (!data || data.deletedAt || data.status === "failed") {
+      throw new Error("Storage書込み先のノートを確認できません。");
+    }
+    const currentPaths = new Set((Array.isArray(data.pendingStoragePaths) ? data.pendingStoragePaths : [])
+      .filter(item => typeof item === "string" && item));
+    if (currentPaths.size > MAX_PENDING_STORAGE_PATHS) {
+      throw new Error("未確認のStorageパスが上限を超えているため、クリーンアップ完了までアップロードできません。");
+    }
+    if (!currentPaths.has(path) && currentPaths.size >= MAX_PENDING_STORAGE_PATHS) {
+      throw new Error("未確認のStorageパスが上限に達したため、新しいアップロードを開始できません。");
+    }
+    context(expectedUid);
+    await updateDoc(reference, {
+      pendingStoragePaths: arrayUnion(path),
+      updatedAt: serverTimestamp()
     });
   }
 
@@ -179,15 +187,25 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     }
   }
 
-  async function listNotes({ includeDeleted = false, expectedUid } = {}) {
+  // Every note root document (including creating/failed/deleted ones). The
+  // list screen reads it once and derives both the visible list and the
+  // stale-creation cleanup from the same snapshot.
+  async function listNoteDocuments({ expectedUid } = {}) {
     const { uid, db } = readContext(expectedUid);
     const snapshots = await getDocs(collection(db, "users", uid, "notes"));
     context(expectedUid);
-    return snapshots.docs
-      .map(snapshot => ({ id: snapshot.id, ...snapshot.data() }))
+    return snapshots.docs.map(snapshot => ({ id: snapshot.id, ...snapshot.data() }));
+  }
+
+  function visibleNotes(documents, { includeDeleted = false } = {}) {
+    return documents
       .filter(note => includeDeleted || !note.deletedAt)
       .filter(isReadyNote)
-      .sort((a, b) => String(b.updatedAt?.toDate?.() || b.updatedAt || "").localeCompare(String(a.updatedAt?.toDate?.() || a.updatedAt || "")));
+      .sort((a, b) => noteTimestampMs(b.updatedAt) - noteTimestampMs(a.updatedAt));
+  }
+
+  async function listNotes({ includeDeleted = false, expectedUid, documents = null } = {}) {
+    return visibleNotes(Array.isArray(documents) ? documents : await listNoteDocuments({ expectedUid }), { includeDeleted });
   }
 
   async function getNote(noteId, { expectedUid } = {}) {
@@ -510,10 +528,13 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     return { failedPageIds, orphanedPaths, errors };
   }
 
-  async function cleanupStuckCreatingNotes({ olderThanMs = 24 * 60 * 60 * 1000, now = Date.now(), expectedUid } = {}) {
+  async function cleanupStuckCreatingNotes({ olderThanMs = 24 * 60 * 60 * 1000, now = Date.now(), expectedUid, documents = null } = {}) {
     const { uid, db } = writeContext(expectedUid);
-    const snapshots = await getDocs(collection(db, "users", uid, "notes"));
+    const noteDocuments = Array.isArray(documents) ? documents : await listNoteDocuments({ expectedUid });
     context(expectedUid);
+    const snapshots = {
+      docs: noteDocuments.map(({ id, ...data }) => ({ id, data: () => data }))
+    };
     const stale = snapshots.docs.filter(snapshot => {
       const data = snapshot.data();
       const pendingPaths = Array.isArray(data?.pendingStoragePaths) ? data.pendingStoragePaths : [];
@@ -608,7 +629,9 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
   async function deleteStoragePaths(paths, expectedUid) {
     const { storage } = writeContext(expectedUid);
     const failed = [];
-    for (const path of paths) {
+    // Deletions are independent; a few in parallel keeps compensation of a
+    // large PDF note from taking one round trip per page.
+    await runWithConcurrency(paths, STORAGE_DELETE_CONCURRENCY, async path => {
       try {
         context(expectedUid);
         await deleteObject(storageRef(storage, path));
@@ -616,7 +639,7 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
         if (error?.name === "NoteSessionChangedError") throw error;
         if (error?.code !== "storage/object-not-found") failed.push(path);
       }
-    }
+    });
     return failed;
   }
 
@@ -985,10 +1008,34 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     return nextRevision;
   }
 
-  async function updatePage(noteId, pageId, fields, expectedUid) {
+  // Page metadata updates of one operation are written atomically together
+  // with one update of the note root: its updatedAt is the list screen's
+  // change marker (cached card thumbnails), and `noteFields` carries related
+  // note settings such as defaultBackground. Formerly every page was a
+  // separate write, so a failure could leave some pages changed.
+  async function updatePages(noteId, updates, expectedUid, { noteFields = null } = {}) {
     const { uid, db } = writeContext(expectedUid);
-    context(expectedUid);
-    await updateDoc(pageRef(db, uid, noteId, pageId), { ...fields, updatedAt: serverTimestamp() });
+    const list = (Array.isArray(updates) ? updates : []).filter(update => update?.pageId);
+    const chunks = [];
+    for (let index = 0; index < list.length; index += CREATION_BATCH_SIZE) {
+      chunks.push(list.slice(index, index + CREATION_BATCH_SIZE));
+    }
+    if (!chunks.length) chunks.push([]);
+    for (const [chunkIndex, chunk] of chunks.entries()) {
+      context(expectedUid);
+      const batch = writeBatch(db);
+      chunk.forEach(({ pageId, fields }) => {
+        batch.update(pageRef(db, uid, noteId, pageId), { ...fields, updatedAt: serverTimestamp() });
+      });
+      if (chunkIndex === chunks.length - 1) {
+        batch.update(noteRef(db, uid, noteId), { ...(noteFields || {}), updatedAt: serverTimestamp() });
+      }
+      await batch.commit();
+    }
+  }
+
+  async function updatePage(noteId, pageId, fields, expectedUid) {
+    await updatePages(noteId, [{ pageId, fields }], expectedUid);
   }
 
   async function updateNote(noteId, fields, expectedUid) {
@@ -1075,10 +1122,10 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
   }
 
   return {
-    listNotes, getNote, listNotesByMaterial, listPages, createNote, createCreatingNote, finalizeCreatingNote,
+    listNoteDocuments, listNotes, getNote, listNotesByMaterial, listPages, createNote, createCreatingNote, finalizeCreatingNote,
     finalizeNoteCreation, abortCreatingNote, cleanupStuckCreatingNotes, markCreationFailed,
     uploadSourcePage, uploadRecoveredBackground, deleteStoragePaths, loadPageContent, savePageContent, enqueuePageContentSave, uploadAsset, getAsset,
-    getStorageBlob, cleanupStoragePath, updatePageOrder, createPage, deletePage, updatePage, updateNote,
+    getStorageBlob, cleanupStoragePath, updatePageOrder, createPage, deletePage, updatePage, updatePages, updateNote,
     deleteMaterialLinkedNotes, restoreNote, deleteNote
   };
 }

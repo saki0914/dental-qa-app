@@ -78,11 +78,13 @@ export function createNoteSaveCoordinator({
       throw new TypeError("ローカル下書きの基準リビジョンが不正です。");
     }
     const updatedAt = new Date().toISOString();
+    // `content` is the coordinator's private snapshot (never mutated in
+    // place) and IndexedDB clones it again inside put().
     const draft = {
       key,
       ...identity,
       expectedRevision,
-      content: structuredClone(content),
+      content,
       mutationId,
       updatedAt
     };
@@ -205,7 +207,7 @@ export function createNoteSaveCoordinator({
     clearTimeout(state.timer);
     state.timer = null;
     const effectiveIdentity = { ...state.identity };
-    const localWrite = saveLocal(effectiveIdentity, content, mutationId);
+    const localWrite = saveLocal(effectiveIdentity, state.latest, mutationId);
     state.localWrite = localWrite;
     try {
       const persistedMutation = await localWrite;

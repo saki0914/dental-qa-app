@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { after, before, test } from "node:test";
 import { resolve } from "node:path";
@@ -31,6 +32,10 @@ const FORMALIZATION_REPORT = process.env.DENTAL_ASSISTING_FORMALIZATION_REPORT |
   "subject/runs/20260728-012040-national-exam-semantic-quality-final/" +
   "formalization_report.json";
 const SCRIPT = resolve("scripts/migrate_dental_assisting_345_to_350.mjs");
+// Data-dependent migration checks need the iCloud Drive formalization report.
+const requiresFormalizationReport = existsSync(FORMALIZATION_REPORT)
+  ? {}
+  : { skip: "移行元の正式化レポート（iCloud Drive上のデータ）がこの環境にないためスキップ" };
 const BACKUP_DIR = resolve(".migration-backups/test");
 let testEnvironment;
 let bundle;
@@ -162,6 +167,7 @@ function runCli(userId, ...args) {
 }
 
 before(async () => {
+  if (requiresFormalizationReport.skip) return;
   testEnvironment = await initializeTestEnvironment({ projectId: PROJECT_ID });
   bundle = await loadMigrationBundle(FORMALIZATION_REPORT);
 });
@@ -170,7 +176,7 @@ after(async () => {
   await testEnvironment?.cleanup();
 });
 
-test("Emulatorで345→350、複数ユーザー状態、冪等性、ロールバックを検証する", async () => {
+test("Emulatorで345→350、複数ユーザー状態、冪等性、ロールバックを検証する", requiresFormalizationReport, async () => {
   const users = ["migration-alice", "migration-bob"];
   const sourceSnapshots = {};
   for (const userId of users) {
@@ -230,7 +236,7 @@ test("Emulatorで345→350、複数ユーザー状態、冪等性、ロールバ
   }
 });
 
-test("Emulatorで画像準備後の失敗から同じmigrationIdで再開できる", async () => {
+test("Emulatorで画像準備後の失敗から同じmigrationIdで再開できる", requiresFormalizationReport, async () => {
   const userId = "migration-resume";
   await seedOldFormal(userId, qid => Number(qid.slice(1)) % 5 === 0 ? 2 : null);
   const failed = spawnSync(process.execPath, [

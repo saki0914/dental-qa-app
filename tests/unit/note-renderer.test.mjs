@@ -27,7 +27,12 @@ function createCanvasHarness() {
     stroke() { strokes.push(this.strokeStyle); },
     rect() {},
     clip() {},
-    measureText(value) { return { width: [...String(value)].length * 10 }; },
+    font: "10px sans-serif",
+    measureText(value) {
+      // 1em per character at the current font size, like a CJK font.
+      const size = Number(/([\d.]+)px/.exec(this.font)?.[1] || 10);
+      return { width: [...String(value)].length * size };
+    },
     fillText(value, x, y) { texts.push({ value, x, y, align: this.textAlign }); }
   };
   const canvas = {

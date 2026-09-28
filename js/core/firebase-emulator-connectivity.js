@@ -18,9 +18,7 @@ async function fetchWithTimeout(url, fetchImpl, timeoutMs, options = {}) {
 
 export async function verifyFirebaseEmulatorConnectivity(emulatorHost, {
   fetchImpl = globalThis.fetch,
-  // Firestore rule coverage can take several seconds after a long acceptance
-  // session because the Emulator aggregates accumulated rule evaluations.
-  // Keep the probe bounded, but do not report a healthy local service as down.
+  // Keep each probe bounded, but do not report a healthy local service as down.
   timeoutMs = 8000,
   retries = 3,
   onStatus = () => {},
@@ -30,7 +28,10 @@ export async function verifyFirebaseEmulatorConnectivity(emulatorHost, {
   const encodedProject = encodeURIComponent(projectId);
   const checks = [
     { name: "Auth", url: `http://${emulatorHost}:9099/emulator/v1/projects/${encodedProject}/config` },
-    { name: "Firestore", url: `http://${emulatorHost}:8080/emulator/v1/projects/${encodedProject}:ruleCoverage` },
+    // ruleCoverageは長時間の検証後に評価履歴の集計で数秒以上かかり、正常な
+    // Emulatorを停止中と誤判定してエディタ起動を失敗させる。Firestoreも
+    // ルートへのno-cors到達確認だけを行う（停止時はfetch自体が失敗する）。
+    { name: "Firestore", url: `http://${emulatorHost}:8080/`, request: { mode: "no-cors" }, acceptAnyResponse: true },
     // Storage EmulatorにはRulesに依存しない公開health endpointがないため、
     // no-corsでポートからHTTP応答が返ることだけを確認する。停止時はfetch自体が失敗する。
     { name: "Storage", url: `http://${emulatorHost}:9199/`, request: { mode: "no-cors" }, acceptAnyResponse: true }

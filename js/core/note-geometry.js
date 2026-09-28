@@ -304,7 +304,12 @@ export function normalizeLineElement(element, pageSize = DEFAULT_PAGE_SIZE) {
 
 export function normalizeNoteLineElements(content, pageSize = DEFAULT_PAGE_SIZE) {
   const normalized = structuredClone(content);
-  normalized.elements = (normalized.elements || []).map(element => normalizeLineElement(element, pageSize));
+  // The content was cloned above; only line shapes need a rewritten copy.
+  normalized.elements = (normalized.elements || []).map(element => (
+    element?.type === "shape" && ["line", "arrow"].includes(element.shapeType)
+      ? normalizeLineElement(element, pageSize)
+      : element
+  ));
   return normalized;
 }
 

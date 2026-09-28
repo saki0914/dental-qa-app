@@ -108,3 +108,81 @@ test("全6ストアをv2主キーのユーザー・ノートprefix範囲で取�
     query: { lower: "alice|", upper: "alice|\uffff" }
   });
 });
+
+test("iPad Safariで閉じられたIndexedDB接続は1回だけ開き直して書き込む", async () => {
+  let opens = 0;
+  const writes = [];
+  const makeDatabase = closed => ({
+    close() {},
+    transaction(storeName) {
+      if (closed) {
+        const error = new Error("The database connection is closing.");
+        error.name = "InvalidStateError";
+        throw error;
+      }
+      const transaction = {
+        objectStore() {
+          return {
+            put(value) {
+              writes.push({ storeName, value });
+              const request = { result: value.key };
+              queueMicrotask(() => transaction.oncomplete?.());
+              return request;
+            }
+          };
+        }
+      };
+      return transaction;
+    }
+  });
+  const indexedDb = {
+    open() {
+      opens += 1;
+      const request = { result: makeDatabase(opens === 1) };
+      queueMicrotask(() => request.onsuccess());
+      return request;
+    }
+  };
+  const localStore = createNoteLocalStore(indexedDb, { bound: (lower, upper) => ({ lower, upper }) });
+  await localStore.put("thumbnails", { key: "alice|note-1|page-1|thumbnail", uid: "alice", noteId: "note-1" });
+  assert.equal(opens, 2);
+  assert.equal(writes.length, 1);
+  await localStore.put("thumbnails", { key: "alice|note-1|page-2|thumbnail", uid: "alice", noteId: "note-1" });
+  assert.equal(opens, 2, "開き直した接続を再利用する");
+});
+
+test("IndexedDBを開けなかった失敗はキャッシュせず次回に再試行する", async () => {
+  let opens = 0;
+  const indexedDb = {
+    open() {
+      opens += 1;
+      const request = {};
+      if (opens === 1) {
+        request.error = new Error("quota");
+        queueMicrotask(() => request.onerror());
+      } else {
+        request.result = {
+          close() {},
+          transaction() {
+            const transaction = {
+              objectStore: () => ({
+                get() {
+                  const getRequest = { result: { key: "k", uid: "alice", noteId: "n" } };
+                  queueMicrotask(() => transaction.oncomplete?.());
+                  return getRequest;
+                }
+              })
+            };
+            return transaction;
+          }
+        };
+        queueMicrotask(() => request.onsuccess());
+      }
+      return request;
+    }
+  };
+  const localStore = createNoteLocalStore(indexedDb, { bound: () => null });
+  await assert.rejects(localStore.get("pageDrafts", "k"), /quota/);
+  assert.deepEqual(await localStore.get("pageDrafts", "k"), { key: "k", uid: "alice", noteId: "n" });
+  assert.equal(opens, 2);
+});

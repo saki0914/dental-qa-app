@@ -1,7 +1,15 @@
 import { assertNonEmptyBlob, canvasToVerifiedBlob } from "./file-validator.js";
 import { lineEndpoints } from "./note-geometry.js";
 import { drawStrokeSegments } from "./note-stroke.js";
-import { layoutTextBox } from "./note-text-layout.js";
+import {
+  createNoteTextMeasure,
+  layoutTextBox,
+  measureTextFontMetrics,
+  punctuationSpacingSegments,
+  renderableTextLine,
+  setNoteTextCanvasFont,
+  textLineBaselines
+} from "./note-text-layout.js";
 import { maskVisibilityKey } from "./note-mask-adapter.js";
 
 function loadImage(blob) {
@@ -128,30 +136,58 @@ function drawText(context, element, width, height) {
   const x = bounds.x * width;
   const y = bounds.y * height;
   const boxWidth = bounds.width * width;
-  const fontSize = Math.max(8, Number(style.fontSizeRatio || 0.025) * height);
-  const family = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
+  // No minimum size: thumbnails must wrap exactly like the page does.
+  const fontSize = Math.max(0.5, Number(style.fontSizeRatio || 0.025) * height);
+  const align = style.textAlign === "center" || style.textAlign === "right" ? style.textAlign : "left";
   context.save();
   context.globalAlpha = Number(style.opacity ?? 1);
   context.fillStyle = style.color || "#111111";
-  context.font = `${style.fontStyle || "normal"} ${style.fontWeight || "normal"} ${fontSize}px ${family}`;
-  context.textBaseline = "top";
-  context.textAlign = style.textAlign || "left";
-  const anchorX = style.textAlign === "center" ? boxWidth / 2 : style.textAlign === "right" ? boxWidth : 0;
+  // The editor overlay, the SVG page and this Canvas share one font stack,
+  // one line breaker and the CSS half-leading baseline model.
+  const anchorX = align === "center" ? boxWidth / 2 : align === "right" ? boxWidth : 0;
   const lineHeight = fontSize * Number(style.lineHeight || 1.25);
   const layout = layoutTextBox(element.text, {
     maxWidth: boxWidth,
     lineHeight,
-    measureText: value => context.measureText(value).width
+    measureText: createNoteTextMeasure(context, style, fontSize)
+  });
+  setNoteTextCanvasFont(context, style, fontSize);
+  context.textBaseline = "alphabetic";
+  context.textAlign = align;
+  const baselines = textLineBaselines(layout.lines.length, {
+    top: 0,
+    lineHeight,
+    ...measureTextFontMetrics(context, fontSize)
   });
   const boxHeight = Math.max(bounds.height * height, layout.requiredHeight);
   context.translate(x + boxWidth / 2, y + boxHeight / 2);
   context.rotate(Number(element.rotation || 0) * Math.PI / 180);
   context.translate(-boxWidth / 2, -boxHeight / 2);
-  context.beginPath();
-  context.rect(0, 0, boxWidth, boxHeight);
-  context.clip();
-  layout.lines.forEach((line, index) => context.fillText(line, anchorX, index * lineHeight, boxWidth));
+  layout.lines.forEach((line, index) => {
+    const visible = renderableTextLine(line);
+    if (visible) fillTextLine(context, visible, anchorX, baselines[index], align);
+  });
   context.restore();
+}
+
+// Draws one laid-out line with the same advances the line breaker measured:
+// segments split between adjacent fullwidth punctuation are drawn separately
+// so Canvas cannot kern them closer than the editor and the SVG page show.
+function fillTextLine(context, text, anchorX, baseline, align) {
+  const segments = punctuationSpacingSegments(text);
+  if (segments.length === 1) {
+    context.fillText(text, anchorX, baseline);
+    return;
+  }
+  const widths = segments.map(segment => context.measureText(segment).width);
+  const total = widths.reduce((sum, width) => sum + width, 0);
+  let x = align === "center" ? anchorX - total / 2 : align === "right" ? anchorX - total : anchorX;
+  context.textAlign = "left";
+  segments.forEach((segment, index) => {
+    context.fillText(segment, x, baseline);
+    x += widths[index];
+  });
+  context.textAlign = align;
 }
 
 function shouldDrawMask(mask, source, options) {

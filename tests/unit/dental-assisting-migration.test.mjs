@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
@@ -19,6 +20,13 @@ const formalizationReport = resolve(
     "subject/runs/20260728-012040-national-exam-semantic-quality-final/" +
     "formalization_report.json"
 );
+
+// The 345→350 migration was verified against the formalization report kept in
+// iCloud Drive. Environments without that data (Dev Container, CI, cloud
+// sandboxes) skip only these data-dependent checks instead of failing.
+const requiresFormalizationReport = existsSync(formalizationReport)
+  ? {}
+  : { skip: "移行元の正式化レポート（iCloud Drive上のデータ）がこの環境にないためスキップ" };
 
 let bundlePromise;
 function getBundle() {
@@ -71,7 +79,7 @@ function createImageAssets(bundle) {
   ]));
 }
 
-test("正式化レポートから旧345問・新350問・移行マニフェストを厳密に読み込む", async () => {
+test("正式化レポートから旧345問・新350問・移行マニフェストを厳密に読み込む", requiresFormalizationReport, async () => {
   const bundle = await getBundle();
   assert.equal(bundle.oldByQid.size, 345);
   assert.equal(bundle.newByQid.size, 350);
@@ -79,7 +87,7 @@ test("正式化レポートから旧345問・新350問・移行マニフェス�
   assert.equal(bundle.imageNames.length, 17);
 });
 
-test("345→350のdry-run計画は書込みを行わず期待件数を返す", async () => {
+test("345→350のdry-run計画は書込みを行わず期待件数を返す", requiresFormalizationReport, async () => {
   const bundle = await getBundle();
   const source = createSourceState(bundle, qid => Number(qid.slice(1)) % 3 || null);
   const plan = buildMigrationPlan(source, bundle);
@@ -93,7 +101,7 @@ test("345→350のdry-run計画は書込みを行わず期待件数を返す", a
   assert.equal(report.operations.removedSourceRecords, 16);
 });
 
-test("移行後350問は新正式questions.jsonと全件一致しexplanationも更新される", async () => {
+test("移行後350問は新正式questions.jsonと全件一致しexplanationも更新される", requiresFormalizationReport, async () => {
   const bundle = await getBundle();
   const source = createSourceState(bundle);
   const plan = buildMigrationPlan(source, bundle);
@@ -112,7 +120,7 @@ test("移行後350問は新正式questions.jsonと全件一致しexplanationも�
   assert.equal(verification.imageAssetCount, 17);
 });
 
-test("引継ぎ問題のruntime idと学習状態を維持する", async () => {
+test("引継ぎ問題のruntime idと学習状態を維持する", requiresFormalizationReport, async () => {
   const bundle = await getBundle();
   const source = createSourceState(bundle, qid => qid === "Q0001" ? 1 : null);
   const plan = buildMigrationPlan(source, bundle);
@@ -125,7 +133,7 @@ test("引継ぎ問題のruntime idと学習状態を維持する", async () => {
   assert.equal(migrated.progressDocument.questionStatuses[q0001.id], 1);
 });
 
-test("REPLACEDとNEWは決定的IDを使い未回答で開始する", async () => {
+test("REPLACEDとNEWは決定的IDを使い未回答で開始する", requiresFormalizationReport, async () => {
   const bundle = await getBundle();
   const source = createSourceState(bundle, () => 1);
   const plan = buildMigrationPlan(source, bundle);
@@ -160,7 +168,7 @@ test("MERGEDは全てできるなら1、いずれかまだなら2、未回答を
   assert.equal(aggregateMergedState([null, null]), null);
 });
 
-test("統合元の学習状態を集約し孤立状態を残さない", async () => {
+test("統合元の学習状態を集約し孤立状態を残さない", requiresFormalizationReport, async () => {
   const bundle = await getBundle();
   const source = createSourceState(bundle, qid => {
     if (qid === "Q0125") return 1;
@@ -183,7 +191,7 @@ test("統合元の学習状態を集約し孤立状態を残さない", async ()
   );
 });
 
-test("旧問題不足・余分問題・不明状態では書込み計画を作らず停止する", async () => {
+test("旧問題不足・余分問題・不明状態では書込み計画を作らず停止する", requiresFormalizationReport, async () => {
   const bundle = await getBundle();
   const missing = createSourceState(bundle);
   missing.allQuestions.pop();
@@ -194,7 +202,7 @@ test("旧問題不足・余分問題・不明状態では書込み計画を作�
   assert.throws(() => buildMigrationPlan(unknown, bundle), /不明な学習状態/);
 });
 
-test("移行後の学習状態件数を再計算できる", async () => {
+test("移行後の学習状態件数を再計算できる", requiresFormalizationReport, async () => {
   const bundle = await getBundle();
   const source = createSourceState(bundle, qid => {
     const number = Number(qid.slice(1));

@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { initializeTestEnvironment } from "@firebase/rules-unit-testing";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
@@ -51,6 +52,7 @@ function findMigrationQuestion(bundle, classification) {
 }
 
 test("@authenticated @migration 345→350移行後のiPad表示と回答判定を確認する", async ({ page }) => {
+  test.skip(!existsSync(DEFAULT_FORMALIZATION_REPORT), "移行元の正式化レポート（iCloud Drive上のデータ）がこの環境にないためスキップ");
   test.setTimeout(180_000);
   const blockedRequests = await guardProductionFirebase(page);
   const pageErrors = [];
