@@ -6,7 +6,10 @@ import {
 import { initializeFirebaseServices, verifyFirebaseEmulatorConnectivity } from "./config/firebase.js";
 import { restoreLegacyQuestionStatuses } from "./core/cloud-sync-state.js";
 import { createSaveCoordinator } from "./core/save-coordinator.js";
-import { selectNoteFeatureUser } from "./core/note-editor-state.js";
+import {
+  isNoteEditorReady as isNoteEditorSessionReady,
+  selectNoteFeatureUser
+} from "./core/note-editor-state.js";
 import {
   escapeDisplayText,
   escapeHtml,
@@ -36,6 +39,7 @@ import { createStudyNotes } from "./features/study-notes.js";
 import {
   CloudSaveConflictError,
   readCloudState,
+  readNoteEditorMaterialState,
   UnsafeEmptyOverwriteError,
   writeSplitDocuments
 } from "./services/cloud-store.js";
@@ -212,6 +216,17 @@ function isInteractionReady() {
     isSyncSessionCurrent(activeSyncSession);
 }
 
+function isNoteEditorReady() {
+  const session = activeSyncSession;
+  return isNoteEditorSessionReady({
+    dedicatedEditor: noteEditorRoute,
+    user: currentUser,
+    session,
+    activeSession: activeSyncSession,
+    authEpoch
+  });
+}
+
 function getSaveFailureMessage(error) {
   if (error instanceof CloudSaveConflictError) {
     return (
@@ -332,12 +347,23 @@ studyNotes = createStudyNotes({
   // restore an IndexedDB draft when the legacy app-wide cloud load failed.
   getCurrentUser: () => selectNoteFeatureUser({
     dedicatedEditor: noteEditorRoute,
+    noteEditorReady: isNoteEditorReady(),
     user: currentUser,
     interactionReady: isInteractionReady()
   }),
   getDb: () => db,
   getStorage: () => storage,
   getMaterials: () => imageMemory.getMaterials(),
+  prepareNoteResources: async note => {
+    if (!noteEditorRoute || note?.type !== "material-linked") return;
+    const result = await loadNoteEditorMaterials({ session: activeSyncSession });
+    if (result.stale) return;
+    el.cloudStatus.textContent = result.source === "legacy"
+      ? "Firebase接続済みです。旧形式の教材データを読み込みました。通常画面で次回保存すると、以後は分割データから読み込みます。"
+      : result.loaded
+        ? "Firebase接続済みです。ノート用の教材データを読み込みました。"
+        : "Firebase接続済みですが、連携教材データが見つかりません。";
+  },
   ensureMaterialDefaultNoteId: (materialId, preferredNoteId) =>
     imageMemory.ensureMaterialDefaultNoteId(materialId, preferredNoteId),
   activateSection: mode => {
@@ -1392,12 +1418,28 @@ async function initFirebase() {
       else showTab("auth");
 
       try {
-        const result = await loadFromCloud({
-          session,
-          silentNoData: true,
-          autoMode: true
-        });
+        const result = noteEditorRoute
+          ? { loaded: false, source: "note-editor", stale: false }
+          : await loadFromCloud({
+              session,
+              silentNoData: true,
+              autoMode: true
+            });
         if (!isSyncSessionCurrent(session) || result.stale) return;
+
+        if (noteEditorRoute) {
+          // Dedicated-note readiness is independent from app-wide state. Keep
+          // `loaded` false; linked material data is fetched only after the note
+          // metadata proves it is needed.
+          session.noteEditorReady = true;
+          syncPhase = "note-editor-ready";
+          el.authStatus.textContent = `ログイン中: ${user.email || "メール不明"}`;
+          el.cloudStatus.textContent = "Firebase接続済みです。ノートを読み込みます。";
+          updateLoginLockedUI();
+          showDedicatedNoteEditorShell("loading-note-metadata", "現在の処理：ノート情報を読み込み中");
+          void studyNotes.refresh();
+          return;
+        }
 
         session.loaded = true;
         syncPhase = "ready";
@@ -1408,12 +1450,7 @@ async function initFirebase() {
             : "Firebase接続済みです。クラウド内容を自動反映しました。"
           : "Firebase接続済みです。クラウド保存データがないため、空の初期状態を表示しています。";
         updateLoginLockedUI();
-        if (noteEditorRoute) {
-          showTab("pdf");
-          setCombinedImageNoteMode("note");
-        } else {
-          showTab("study");
-        }
+        showTab("study");
         void studyNotes.refresh();
       } catch (error) {
         if (!isSyncSessionCurrent(session)) return;
@@ -1612,6 +1649,22 @@ async function loadFromCloud(options = {}) {
   }
   return {
     loaded: true,
+    source: result.source,
+    stale: false
+  };
+}
+
+async function loadNoteEditorMaterials({ session = activeSyncSession } = {}) {
+  if (!db || !session) {
+    return { loaded: false, source: "none", stale: false };
+  }
+  const result = await readNoteEditorMaterialState(db, session.userId);
+  if (!isSyncSessionCurrent(session)) {
+    return { loaded: false, source: result.source, stale: true };
+  }
+  imageMemory.apply(result.state);
+  return {
+    loaded: result.hasData,
     source: result.source,
     stale: false
   };

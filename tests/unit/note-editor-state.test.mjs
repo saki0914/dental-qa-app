@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   createNoteEditorDiagnosticSnapshot,
+  isNoteEditorReady,
   rebaseRecoveredNoteContent,
   reorderNoteMasks,
   resolveNoteEditorTabId,
@@ -131,9 +132,46 @@ test("診断URLは既知の接続・編集識別子だけを残す", () => {
   });
 });
 
-test("専用エディタはアプリ全体同期失敗中も認証ユーザーで復旧できる", () => {
+test("専用エディタは現行認証セッションの起動準備完了後だけユーザーを利用できる", () => {
   const user = { uid: "user-a" };
-  assert.equal(selectNoteFeatureUser({ dedicatedEditor: true, user, interactionReady: false }), user);
+  const currentSession = { epoch: 2, userId: user.uid, noteEditorReady: true };
+  const notReadySession = { epoch: 2, userId: user.uid };
+  const oldSession = { epoch: 1, userId: user.uid, noteEditorReady: true };
+
+  assert.equal(isNoteEditorReady({
+    dedicatedEditor: true,
+    user,
+    session: currentSession,
+    activeSession: currentSession,
+    authEpoch: 2
+  }), true);
+  assert.equal(isNoteEditorReady({
+    dedicatedEditor: true,
+    user,
+    session: notReadySession,
+    activeSession: notReadySession,
+    authEpoch: 2
+  }), false);
+  assert.equal(isNoteEditorReady({
+    dedicatedEditor: true,
+    user,
+    session: oldSession,
+    activeSession: currentSession,
+    authEpoch: 2
+  }), false);
+
+  assert.equal(selectNoteFeatureUser({
+    dedicatedEditor: true,
+    noteEditorReady: false,
+    user,
+    interactionReady: false
+  }), null);
+  assert.equal(selectNoteFeatureUser({
+    dedicatedEditor: true,
+    noteEditorReady: true,
+    user,
+    interactionReady: false
+  }), user);
   assert.equal(selectNoteFeatureUser({ dedicatedEditor: false, user, interactionReady: false }), null);
   assert.equal(selectNoteFeatureUser({ dedicatedEditor: false, user, interactionReady: true }), user);
 });

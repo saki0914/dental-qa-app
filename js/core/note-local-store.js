@@ -1,4 +1,7 @@
 const DATABASE_NAME = "dentalQaNoteLocal";
+// The v2 keyPath already groups records as uid|noteId|... in its primary
+// B-tree. Prefix ranges keep lookups indexed without a schema upgrade that
+// could be blocked by another app tab (notably on iPad/Safari).
 const VERSION = 2;
 const STORES = ["pageDrafts", "pendingAssets", "pendingSaves", "conflicts", "pendingCleanups", "thumbnails"];
 
@@ -15,9 +18,12 @@ export function localRecordMatches(current, expected) {
     (current.updatedAt || current.createdAt) === expectedTimestamp;
 }
 
-export function createNoteLocalStore(indexedDb = globalThis.indexedDB) {
+export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange = globalThis.IDBKeyRange) {
   let connectionPromise;
   async function serializeForStore(storeName, value) {
+    if (!value?.uid || !value?.noteId) {
+      throw new TypeError(`${storeName}のローカル保存にはuidとnoteIdが必要です。`);
+    }
     if (!(value?.blob instanceof Blob)) {
       return structuredClone(value);
     }
@@ -54,6 +60,11 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB) {
       request.onerror = () => reject(request.error);
     });
     return connectionPromise;
+  }
+
+  function prefixRange(prefix) {
+    if (!keyRange?.bound) throw new Error("IndexedDBの範囲検索を利用できません。");
+    return keyRange.bound(prefix, `${prefix}\uffff`);
   }
 
   async function run(storeName, mode, callback) {
@@ -185,9 +196,23 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB) {
       });
     },
     async listForUser(store, uid) {
-      const values = await run(store, "readonly", objectStore => objectStore.getAll()) || [];
+      if (!uid) throw new Error("ローカル保存のユーザー識別子が不足しています。");
+      const prefix = `${uid}|`;
+      const values = await run(store, "readonly", objectStore => (
+        objectStore.getAll(prefixRange(prefix))
+      )) || [];
       return values
         .filter(value => value.uid === uid)
+        .map(value => restoreFromStore(store, value));
+    },
+    async listForNote(store, uid, noteId) {
+      if (!uid || !noteId) throw new Error("ローカル保存のノート識別子が不足しています。");
+      const prefix = `${uid}|${noteId}|`;
+      const values = await run(store, "readonly", objectStore => (
+        objectStore.getAll(prefixRange(prefix))
+      )) || [];
+      return values
+        .filter(value => value.uid === uid && value.noteId === noteId)
         .map(value => restoreFromStore(store, value));
     },
     async clearUser(uid) {
@@ -196,8 +221,16 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB) {
         await Promise.all(entries.map(entry => this.delete(store, entry.key)));
       }
     },
-    close: async () => (await open()).close()
+    close: async () => {
+      const activeConnection = connectionPromise;
+      connectionPromise = undefined;
+      if (activeConnection) (await activeConnection).close();
+    }
   };
 }
 
-export { DATABASE_NAME as NOTE_LOCAL_DATABASE, STORES as NOTE_LOCAL_STORES };
+export {
+  DATABASE_NAME as NOTE_LOCAL_DATABASE,
+  STORES as NOTE_LOCAL_STORES,
+  VERSION as NOTE_LOCAL_DATABASE_VERSION
+};

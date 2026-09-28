@@ -226,6 +226,68 @@ async function seedLinkedMaterial(uid) {
   }
 }
 
+async function seedLegacyLinkedMaterial(uid, { legacyPayloadBytes = 400 * 1024 } = {}) {
+  const environment = await initializeTestEnvironment({ projectId: "demo-dental-qa", firestore: { host: "127.0.0.1", port: 8080 } });
+  const materialId = `legacy-material-${crypto.randomUUID()}`;
+  const noteId = `legacy-note-${crypto.randomUUID()}`;
+  const pageId = `legacy-page-${crypto.randomUUID()}`;
+  try {
+    await environment.withSecurityRulesDisabled(async context => {
+      const db = context.firestore();
+      await Promise.all([
+        setDoc(doc(db, "users", uid, "app", "main"), {
+          pdfMaterials: [{
+            id: materialId,
+            title: "旧形式E2E教材",
+            subject: "E2E",
+            categories: [],
+            tags: [],
+            pages: [],
+            masks: [],
+            sourceType: "images",
+            sourceName: ""
+          }],
+          pdfRevealStates: {},
+          selectedPdfId: materialId,
+          selectedMaskId: null,
+          pdfSearchQuery: "",
+          // Reproduce the transfer cost of a pre-split document containing
+          // unrelated app-wide state while staying clear of Firestore's 1 MiB
+          // per-document limit.
+          legacyPerformancePayload: "x".repeat(legacyPayloadBytes)
+        }),
+        setDoc(doc(db, "users", uid, "notes", noteId), {
+          schemaVersion: 1,
+          title: "旧形式fallback E2Eノート",
+          type: "material-linked",
+          sourceMaterialId: materialId,
+          materialRefs: [materialId],
+          status: "ready",
+          pageCount: 1,
+          orderRevision: 1,
+          deletedAt: null
+        }),
+        setDoc(doc(db, "users", uid, "notes", noteId, "pages", pageId), {
+          schemaVersion: 1,
+          noteId,
+          order: 1,
+          pageType: "blank",
+          contentRevision: 0,
+          contentPath: "",
+          contentHash: "",
+          noteMaskCount: 0,
+          deletedAt: null,
+          size: { width: 1240, height: 1754 },
+          background: { type: "blank", paperColor: "#FFFFFF" }
+        })
+      ]);
+    });
+    return { materialId, noteId, pageId, legacyPayloadBytes };
+  } finally {
+    await environment.cleanup();
+  }
+}
+
 async function seedOpenableMaterial(uid) {
   const environment = await initializeTestEnvironment({
     projectId: "demo-dental-qa",
@@ -263,10 +325,10 @@ async function seedOpenableMaterial(uid) {
   }
 }
 
-async function seedReadyNote(uid, title, { legacyWithoutStatus = false } = {}) {
+async function seedReadyNote(uid, title, { legacyWithoutStatus = false, pageCount = 1 } = {}) {
   const environment = await initializeTestEnvironment({ projectId: "demo-dental-qa", firestore: { host: "127.0.0.1", port: 8080 } });
   const noteId = `note-session-${crypto.randomUUID()}`;
-  const pageId = `page-session-${crypto.randomUUID()}`;
+  const pageIds = Array.from({ length: pageCount }, () => `page-session-${crypto.randomUUID()}`);
   try {
     const db = environment.authenticatedContext(uid).firestore();
     await Promise.all([
@@ -275,27 +337,27 @@ async function seedReadyNote(uid, title, { legacyWithoutStatus = false } = {}) {
         title,
         type: "standalone",
         ...(legacyWithoutStatus ? {} : { status: "ready" }),
-        pageCount: 1,
+        pageCount,
         noteMaskCount: 0,
         orderRevision: 1,
         materialRefs: [],
         deletedAt: null
       }),
-      setDoc(doc(db, "users", uid, "notes", noteId, "pages", pageId), {
-        schemaVersion: 1,
-        noteId,
-        order: 1,
-        pageType: "blank",
-        contentRevision: 0,
-        contentPath: "",
-        contentHash: "",
-        noteMaskCount: 0,
-        deletedAt: null,
-        size: { width: 1240, height: 1754 },
-        background: { type: "blank", paperColor: "#FFFFFF" }
-      })
+      ...pageIds.map((pageId, index) => setDoc(doc(db, "users", uid, "notes", noteId, "pages", pageId), {
+          schemaVersion: 1,
+          noteId,
+          order: index + 1,
+          pageType: "blank",
+          contentRevision: 0,
+          contentPath: "",
+          contentHash: "",
+          noteMaskCount: 0,
+          deletedAt: null,
+          size: { width: 1240, height: 1754 },
+          background: { type: "blank", paperColor: "#FFFFFF" }
+        }))
     ]);
-    return { noteId, pageId };
+    return { noteId, pageId: pageIds[0], pageIds };
   } finally {
     await environment.cleanup();
   }
@@ -352,7 +414,7 @@ async function updateNotePage(uid, noteId, pageId, fields) {
 async function localNoteStoreCounts(page) {
   return page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("dentalQaNoteLocal", 2);
+      const request = indexedDB.open("dentalQaNoteLocal");
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -443,6 +505,113 @@ async function openPageSidebar(page) {
   }
   await expect(sidebar).toBeVisible();
 }
+
+test("IndexedDB v2の全6ストアを主キーprefix範囲でユーザー・ノート別に取得する", async ({ page }) => {
+  await page.goto("/js/core/note-local-store.js");
+  const result = await page.evaluate(async () => {
+    const databaseName = "dentalQaNoteLocal";
+    const stores = ["pageDrafts", "pendingAssets", "pendingSaves", "conflicts", "pendingCleanups", "thumbnails"];
+    const getAllCalls = [];
+    const originalGetAll = IDBObjectStore.prototype.getAll;
+    IDBObjectStore.prototype.getAll = function getAll(...args) {
+      const query = args[0];
+      getAllCalls.push({
+        store: this.name,
+        lower: query?.lower,
+        upper: query?.upper
+      });
+      return originalGetAll.apply(this, args);
+    };
+    const deleteDatabase = () => new Promise((resolve, reject) => {
+      const request = indexedDB.deleteDatabase(databaseName);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+    await deleteDatabase();
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open(databaseName, 2);
+      request.onupgradeneeded = () => {
+        stores.forEach(name => request.result.createObjectStore(name, { keyPath: "key" }));
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(stores, "readwrite");
+        stores.forEach(name => {
+          transaction.objectStore(name).put({
+            key: `alice|note-1|page-1|${name}`,
+            uid: "alice",
+            noteId: "note-1",
+            pageId: "page-1",
+            marker: `${name}-target`
+          });
+          transaction.objectStore(name).put({
+            key: `alice|note-10|page-2|${name}`,
+            uid: "alice",
+            noteId: "note-10",
+            pageId: "page-2",
+            marker: `${name}-same-user-other-note`
+          });
+          transaction.objectStore(name).put({
+            key: `bob|note-1|page-3|${name}`,
+            uid: "bob",
+            noteId: "note-1",
+            pageId: "page-3",
+            marker: `${name}-other-user`
+          });
+        });
+        transaction.oncomplete = () => {
+          database.close();
+          resolve();
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+    });
+
+    const { createNoteLocalStore } = await import("/js/core/note-local-store.js");
+    const localStore = createNoteLocalStore();
+    const records = {};
+    for (const name of stores) {
+      records[name] = {
+        note: (await localStore.listForNote(name, "alice", "note-1")).map(value => value.marker),
+        user: (await localStore.listForUser(name, "alice")).map(value => value.marker).sort()
+      };
+    }
+    await localStore.close();
+
+    const schema = await new Promise((resolve, reject) => {
+      const request = indexedDB.open(databaseName);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const database = request.result;
+        const indexes = Object.fromEntries(stores.map(name => {
+          const transaction = database.transaction(name, "readonly");
+          const store = transaction.objectStore(name);
+          return [name, { names: [...store.indexNames] }];
+        }));
+        const value = { version: database.version, indexes };
+        database.close();
+        resolve(value);
+      };
+    });
+    await deleteDatabase();
+    IDBObjectStore.prototype.getAll = originalGetAll;
+    return { records, schema, getAllCalls };
+  });
+
+  expect(result.schema.version).toBe(2);
+  for (const storeName of ["pageDrafts", "pendingAssets", "pendingSaves", "conflicts", "pendingCleanups", "thumbnails"]) {
+    expect(result.records[storeName]).toEqual({
+      note: [`${storeName}-target`],
+      user: [`${storeName}-same-user-other-note`, `${storeName}-target`]
+    });
+    expect(result.schema.indexes[storeName]).toEqual({ names: [] });
+    expect(result.getAllCalls.filter(call => call.store === storeName)).toEqual([
+      { store: storeName, lower: "alice|note-1|", upper: "alice|note-1|\uffff" },
+      { store: storeName, lower: "alice|", upper: "alice|\uffff" }
+    ]);
+  }
+});
 
 test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2ページPDFを書き出す", async ({ page }) => {
   test.setTimeout(120_000);
@@ -2038,7 +2207,122 @@ test("@authenticated 不正なノートURLでも灰色画面だけにならず�
   expect(blockedRequests).toEqual([]);
 });
 
-test("@authenticated アプリ初期読込失敗中も専用エディタを明示的な読み取り専用で復旧できる", async ({ page }) => {
+test("@authenticated 専用エディタは対象外ノート一覧を構築せずローカル4ストアを各1回だけ走査する", async ({ page }) => {
+  test.setTimeout(90_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  await page.addInitScript(() => {
+    globalThis.__noteLocalObjectStoreGetAllCalls = [];
+    const originalObjectStoreGetAll = IDBObjectStore.prototype.getAll;
+    IDBObjectStore.prototype.getAll = function getAll(...args) {
+      const query = args[0];
+      globalThis.__noteLocalObjectStoreGetAllCalls.push({
+        database: this.transaction.db.name,
+        store: this.name,
+        lower: query?.lower,
+        upper: query?.upper
+      });
+      return originalObjectStoreGetAll.apply(this, args);
+    };
+  });
+  const user = await createUser();
+  const target = await seedReadyNote(user.uid, "直行読込E2Eノート");
+  await Promise.all([
+    seedReadyNote(user.uid, "対象外E2Eノート1"),
+    seedReadyNote(user.uid, "対象外E2Eノート2"),
+    seedReadyNote(user.uid, "対象外E2Eノート3")
+  ]);
+  await login(page, user);
+
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${target.noteId}&editorTabId=${crypto.randomUUID()}`, {
+    waitUntil: "domcontentloaded"
+  });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
+  await expect(page.locator("#noteTitleInput")).toHaveValue("直行読込E2Eノート");
+  await expect(page.locator("#noteList").locator(":scope > *")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => globalThis.__noteLocalObjectStoreGetAllCalls
+    .filter(call => call.database === "dentalQaNoteLocal")
+    .sort((left, right) => left.store.localeCompare(right.store)))).toEqual(
+    ["conflicts", "pendingSaves", "pendingAssets", "pageDrafts"].sort().map(store => ({
+      database: "dentalQaNoteLocal",
+      store,
+      lower: `${user.uid}|${target.noteId}|`,
+      upper: `${user.uid}|${target.noteId}|\uffff`
+    }))
+  );
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated split未整備では大きい旧mainへfallbackしても許容時間内に専用エディタを開く", async ({ page }, testInfo) => {
+  test.setTimeout(90_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  await login(page, user);
+  // Seed after the normal login so this navigation cannot reuse material data
+  // already applied by the full-app loader.
+  const seeded = await seedLegacyLinkedMaterial(user.uid);
+
+  const startedAt = Date.now();
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${seeded.noteId}&editorTabId=${crypto.randomUUID()}`, {
+    waitUntil: "domcontentloaded"
+  });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
+  const elapsedMs = Date.now() - startedAt;
+
+  await testInfo.attach("legacy-main-fallback-timing.json", {
+    body: JSON.stringify({ elapsedMs, legacyPayloadBytes: seeded.legacyPayloadBytes }, null, 2),
+    contentType: "application/json"
+  });
+  await expect(page.locator("#noteTitleInput")).toHaveValue("旧形式fallback E2Eノート");
+  await expect(page.locator("#cloudStatus")).toContainText("旧形式の教材データを読み込みました");
+  expect(elapsedMs, "400 KiBのlegacy main fallbackを含む専用エディタ起動時間").toBeLessThan(10_000);
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated ページサムネイルはエディタready後に最大2件ずつ生成する", async ({ page }) => {
+  test.setTimeout(90_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  await page.addInitScript(() => {
+    globalThis.__noteThumbnailMetrics = { active: 0, maxActive: 0, started: 0, completed: 0, startedBeforeReady: 0 };
+    const originalToBlob = HTMLCanvasElement.prototype.toBlob;
+    HTMLCanvasElement.prototype.toBlob = function toBlob(callback, ...args) {
+      const params = new URL(location.href).searchParams;
+      if (params.get("noteEditor") !== "1") return originalToBlob.call(this, callback, ...args);
+      const metrics = globalThis.__noteThumbnailMetrics;
+      metrics.active += 1;
+      metrics.started += 1;
+      metrics.maxActive = Math.max(metrics.maxActive, metrics.active);
+      if (document.getElementById("noteEditorStartup")?.dataset.state !== "ready") {
+        metrics.startedBeforeReady += 1;
+      }
+      setTimeout(() => {
+        originalToBlob.call(this, blob => {
+          metrics.active -= 1;
+          metrics.completed += 1;
+          callback(blob);
+        }, ...args);
+      }, 80);
+    };
+  });
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "サムネイルキューE2Eノート", { pageCount: 6 });
+  await login(page, user);
+
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, {
+    waitUntil: "domcontentloaded"
+  });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
+  await expect(page.locator("#notePageList > li")).toHaveCount(6);
+  await expect.poll(() => page.evaluate(() => globalThis.__noteThumbnailMetrics.completed), { timeout: 20_000 }).toBe(6);
+  expect(await page.evaluate(() => globalThis.__noteThumbnailMetrics)).toMatchObject({
+    maxActive: 2,
+    started: 6,
+    completed: 6,
+    startedBeforeReady: 0
+  });
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 質問データの初期読込失敗に専用エディタは巻き込まれず通常画面では全状態を再読込する", async ({ page }) => {
   test.setTimeout(90_000);
   const blockedRequests = await guardProductionFirebase(page);
   const user = await createUser();
@@ -2056,27 +2340,12 @@ test("@authenticated アプリ初期読込失敗中も専用エディタを明�
   await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${editorTabId}`, {
     waitUntil: "domcontentloaded"
   });
-  await expect(page.locator("#noteEditorStartup")).toBeVisible({ timeout: 20_000 });
-  await expect(page.locator("#noteEditorStartupTitle")).toHaveText("ノートを開けませんでした");
-  await expect(page.locator('[data-startup-action="local"]')).toBeVisible();
-  await expect(page.locator('[data-startup-action="cloud"]')).toBeVisible();
-  await expect(page.locator('[data-startup-action="readonly"]')).toBeVisible();
-
-  await page.locator('[data-startup-action="readonly"]').click();
   await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
   await expect(page.locator("#noteTitleInput")).toHaveValue("初期読込失敗復旧E2Eノート");
-  await expect(page.locator("#noteEditorView")).toHaveClass(/is-readonly/);
-
-  await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
-  await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
-  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
-  await expect(page.locator("#noteEditorView")).toHaveClass(/is-readonly/);
-  expect(await page.evaluate(expectedTabId => {
-    const uid = Object.keys(localStorage).find(key => key.startsWith("dentalQaNoteClientInstance:"))?.split(":").at(-1);
-    const noteId = new URL(location.href).searchParams.get("noteId");
-    const lease = JSON.parse(localStorage.getItem(`dentalQaNoteEditorLease:${uid}:${noteId}`) || "null");
-    return lease?.editorTabId === expectedTabId;
-  }, editorTabId)).toBe(false);
+  await expect(page.locator("#noteEditorView")).not.toHaveClass(/is-readonly/);
+  await page.locator("#closeNoteBtn").click();
+  await page.waitForURL(url => url.searchParams.get("noteEditor") !== "1", { timeout: 20_000 });
+  await expect(page.locator("#cloudStatus")).toContainText("クラウドデータの初期読込に失敗", { timeout: 20_000 });
   expect(blockedRequests).toEqual([]);
 });
 

@@ -70,6 +70,7 @@ import { createNoteSaveCoordinator } from "../core/note-save-coordinator.js";
 import { canStraightenStroke, straightenedPoints, NOTE_STRAIGHTEN_HOLD_MS, NOTE_STRAIGHTEN_MOVE_PX } from "../core/note-straightener.js";
 import { createNoteToolSettingsStore, normalizeNoteToolSettings } from "../core/note-tool-settings.js";
 import {
+  applyRecoveredPageMetadata,
   loadSessionBoundBackgroundBlob,
   loadSessionBoundMaterialDimensions
 } from "../core/note-session-loading.js";
@@ -188,6 +189,7 @@ export function createStudyNotes(dependencies) {
     getDb,
     getStorage,
     getMaterials = () => [],
+    prepareNoteResources = async () => {},
     ensureMaterialDefaultNoteId = null,
     activateSection = () => {}
   } = dependencies;
@@ -320,6 +322,9 @@ export function createStudyNotes(dependencies) {
   let editingHiddenMaskIds = new Set();
   let assetCache = new Map();
   let contentCache = new Map();
+  let contentLoadPromises = new Map();
+  let backgroundBlobCache = new Map();
+  let backgroundBlobPromises = new Map();
   let hasSeenPen = false;
   let toolSettingsStore = null;
   let toolSettings = normalizeNoteToolSettings();
@@ -340,6 +345,16 @@ export function createStudyNotes(dependencies) {
   let userSessionGeneration = 0;
   let cropSession = null;
   const thumbnailTokens = new Map();
+  const pageThumbnailConcurrency = 2;
+  let pageThumbnailGeneration = 0;
+  let pageThumbnailQueue = [];
+  let activePageThumbnails = 0;
+  let pageThumbnailIdleHandle = 0;
+  let pageThumbnailIdleKind = "";
+  const noteCardThumbnailConcurrency = 2;
+  let noteCardThumbnailGeneration = 0;
+  let noteCardThumbnailQueue = [];
+  let activeNoteCardThumbnails = 0;
   let startupState = dedicatedEditor ? "initializing" : "ready";
   let startupSlowTimer = null;
   let lastStartupError = null;
@@ -1423,9 +1438,9 @@ export function createStudyNotes(dependencies) {
   }
 
   async function queueCleanupRecord({ uid = getCurrentUser()?.uid, noteId = "", path, kind = "storage", error }) {
-    if (!uid || !path) throw new TypeError("クリーンアップ記録にはuidとpathが必要です。");
+    if (!uid || !noteId || !path) throw new TypeError("クリーンアップ記録にはuid、noteId、pathが必要です。");
     const timestamp = new Date().toISOString();
-    const key = `${uid}|cleanup|${randomId()}`;
+    const key = noteLocalKey(uid, noteId, "cleanup", randomId());
     try {
       await localStore.put("pendingCleanups", {
         key, uid, noteId, path, kind,
@@ -1562,6 +1577,25 @@ export function createStudyNotes(dependencies) {
     if (dedicatedEditor && !routeOpened) setEditorStartupState("loading-note-metadata");
     setListStatus("ノートを読み込んでいます...");
     try {
+      // A dedicated editor already has an explicit target. Avoid loading every
+      // note, aggregating every local draft, and rendering the hidden list
+      // before that target can open.
+      if (dedicatedEditorCreateMode === "pdf") {
+        if (!routeOpened) {
+          routeOpened = true;
+          ui.newTitle.value = "新しいPDFノート";
+          show("create");
+        }
+        return;
+      }
+      if (dedicatedEditor) {
+        if (!routeOpened) {
+          await openNote(dedicatedEditorNoteId, { study: routeParams.get("study") === "1", inline: true });
+          routeOpened = true;
+        }
+        return;
+      }
+
       const loadedNotes = await noteStore.listNotes({ expectedUid: session.uid });
       assertUserSession(session);
       const [conflicts, pendingSaves, pendingAssets, pageDrafts] = await Promise.all([
@@ -1597,15 +1631,7 @@ export function createStudyNotes(dependencies) {
       setListStatus(notes.length
         ? `${notes.length}件のノートがあります。${unsyncedCount ? ` 端末内に未同期の変更が${unsyncedCount}ページあります。` : ""}${orphanedDrafts.length ? ` 一覧にないノートの下書きが${orphanedDrafts.length}件あります。` : ""}`
         : orphanedDrafts.length ? `一覧にないノートの下書きが${orphanedDrafts.length}件あります。復元できます。` : "ノートはまだありません。");
-      if (dedicatedEditorCreateMode === "pdf" && !routeOpened) {
-        routeOpened = true;
-        ui.newTitle.value = "新しいPDFノート";
-        show("create");
-      } else if (dedicatedEditor && !routeOpened) {
-        await openNote(dedicatedEditorNoteId, { study: routeParams.get("study") === "1", inline: true });
-        routeOpened = true;
-      }
-      if ((!readOnlyEditor || !dedicatedEditor) && !localRecoverySuppressed) {
+      if (!localRecoverySuppressed) {
         void recoverAllPendingWork(session).catch(error => {
           if (error?.name !== "NoteSessionChangedError") console.warn("未送信ノートの自動再送を継続できませんでした。", error);
         });
@@ -1628,6 +1654,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function renderNoteList() {
+    cancelNoteCardThumbnailQueue();
     ui.list.querySelectorAll("img[data-thumbnail-url]").forEach(image => {
       URL.revokeObjectURL(image.dataset.thumbnailUrl);
     });
@@ -1698,13 +1725,38 @@ export function createStudyNotes(dependencies) {
       preview.addEventListener("keydown", event => {
         if (["Enter", " "].includes(event.key)) { event.preventDefault(); openEditorTab(note.id); }
       });
-      void hydrateNoteCardThumbnail(note, preview).catch(error => {
-        preview.classList.remove("loading");
-        preview.classList.add("fallback");
-        preview.textContent = noteTypeLabel(note);
-        console.warn(`「${note.title || "無題ノート"}」のサムネイルを作成できませんでした。`, error);
-      });
+      enqueueNoteCardThumbnail(note, preview);
     });
+  }
+
+  function cancelNoteCardThumbnailQueue() {
+    noteCardThumbnailGeneration += 1;
+    noteCardThumbnailQueue = [];
+  }
+
+  function enqueueNoteCardThumbnail(note, preview) {
+    noteCardThumbnailQueue.push({ note, preview, generation: noteCardThumbnailGeneration });
+    pumpNoteCardThumbnailQueue();
+  }
+
+  function pumpNoteCardThumbnailQueue() {
+    while (activeNoteCardThumbnails < noteCardThumbnailConcurrency && noteCardThumbnailQueue.length) {
+      const task = noteCardThumbnailQueue.shift();
+      if (task.generation !== noteCardThumbnailGeneration || !task.preview.isConnected) continue;
+      activeNoteCardThumbnails += 1;
+      void hydrateNoteCardThumbnail(task.note, task.preview)
+        .catch(error => {
+          if (task.generation !== noteCardThumbnailGeneration || !task.preview.isConnected) return;
+          task.preview.classList.remove("loading");
+          task.preview.classList.add("fallback");
+          task.preview.textContent = noteTypeLabel(task.note);
+          console.warn(`「${task.note.title || "無題ノート"}」のサムネイルを作成できませんでした。`, error);
+        })
+        .finally(() => {
+          activeNoteCardThumbnails -= 1;
+          pumpNoteCardThumbnailQueue();
+        });
+    }
   }
 
   async function hydrateNoteCardThumbnail(note, preview) {
@@ -1744,8 +1796,8 @@ export function createStudyNotes(dependencies) {
       ? cached.blob
       : null;
     if (!blob) {
-      const pendingAssets = await localStore.listForUser("pendingAssets", session.uid);
-      pendingAssets.filter(item => item.noteId === note.id && item.blob instanceof Blob)
+      const pendingAssets = await localStore.listForNote("pendingAssets", session.uid, note.id);
+      pendingAssets.filter(item => item.blob instanceof Blob)
         .forEach(item => assetCache.set(`${note.id}|${item.assetId}`, item.blob));
       const sourceWidth = Number(page.size?.width || A4_SIZE.width);
       const sourceHeight = Number(page.size?.height || A4_SIZE.height);
@@ -1819,9 +1871,12 @@ export function createStudyNotes(dependencies) {
       title, type: "standalone", defaultBackground: page.background, pages: [page], expectedUid: session.uid
     });
     assertUserSession(session);
-    await refreshNotes();
-    assertUserSession(session);
     openEditorTab(noteId, {}, reservedWindow);
+    // The newly created note is already ready. Do not keep its reserved editor
+    // tab waiting for the main window to rebuild the complete note list.
+    void refreshNotes().catch(error => {
+      if (error?.name !== "NoteSessionChangedError") console.warn("ノート一覧を更新できませんでした。", error);
+    });
   }
 
   function renderMaterialPicker() {
@@ -1955,11 +2010,13 @@ export function createStudyNotes(dependencies) {
       if (!notePages.length) throw new Error("PDFにページがありません。");
       await noteStore.finalizeCreatingNote(noteId, notePages, session.uid);
       assertUserSession(session);
-      await refreshNotes();
       if (dedicatedEditorCreateMode === "pdf") {
         globalThis.location.replace(editorUrl(noteId).toString());
       } else {
         openEditorTab(noteId, {}, reservedWindow);
+        void refreshNotes().catch(refreshError => {
+          if (refreshError?.name !== "NoteSessionChangedError") console.warn("ノート一覧を更新できませんでした。", refreshError);
+        });
       }
     } catch (error) {
       await compensateCreationFailure(noteId, {
@@ -1981,17 +2038,28 @@ export function createStudyNotes(dependencies) {
   async function pageContent(page, { preferCloud = false } = {}) {
     const session = captureUserSession();
     assertUserSession(session);
+    const noteId = currentNote?.id;
+    if (!noteId) throw new Error("読込対象のノートが見つかりません。");
     const cached = preferCloud ? null : contentCache.get(page.pageId);
     if (cached) return clone(cached);
-    const local = preferCloud ? null : await localStore.get("pageDrafts", noteLocalKey(session.uid, currentNote.id, page.pageId));
-    assertUserSession(session);
-    const content = normalizeNoteLineElements(
-      local?.uid === session.uid ? local.content : await noteStore.loadPageContent(currentNote.id, page, { expectedUid: session.uid }),
-      page.size
-    );
-    assertUserSession(session);
-    contentCache.set(page.pageId, clone(content));
-    return content;
+    const loadKey = `${noteId}|${page.pageId}|${preferCloud ? "cloud" : "local"}`;
+    const existing = contentLoadPromises.get(loadKey);
+    if (existing) return clone(await existing);
+    const loading = (async () => {
+      const local = preferCloud ? null : await localStore.get("pageDrafts", noteLocalKey(session.uid, noteId, page.pageId));
+      assertUserSession(session);
+      const content = normalizeNoteLineElements(
+        local?.uid === session.uid ? local.content : await noteStore.loadPageContent(noteId, page, { expectedUid: session.uid }),
+        page.size
+      );
+      assertUserSession(session);
+      if (currentNote?.id === noteId) contentCache.set(page.pageId, clone(content));
+      return content;
+    })().finally(() => {
+      if (contentLoadPromises.get(loadKey) === loading) contentLoadPromises.delete(loadKey);
+    });
+    contentLoadPromises.set(loadKey, loading);
+    return clone(await loading);
   }
 
   function preloadAdjacentPages() {
@@ -2003,6 +2071,16 @@ export function createStudyNotes(dependencies) {
           .then(() => ["pdf-source-page", "material-page"].includes(page.background?.type) ? resolveBackgroundBlob(page) : null)
           .catch(error => console.debug("隣接ページの先読みを完了できませんでした。", error));
       });
+  }
+
+  async function loadNoteLocalRecords(uid, noteId) {
+    const [conflicts, pendingSaves, pendingAssets, pageDrafts] = await Promise.all([
+      localStore.listForNote("conflicts", uid, noteId),
+      localStore.listForNote("pendingSaves", uid, noteId),
+      localStore.listForNote("pendingAssets", uid, noteId),
+      localStore.listForNote("pageDrafts", uid, noteId)
+    ]);
+    return { conflicts, pendingSaves, pendingAssets, pageDrafts };
   }
 
   async function openNote(noteId, { study = false, inline = false, preferCloud = false, forceReadOnly = false } = {}) {
@@ -2024,6 +2102,8 @@ export function createStudyNotes(dependencies) {
     currentNote = await noteStore.getNote(noteId, { expectedUid: session.uid });
     assertUserSession(session);
     if (!currentNote || currentNote.deletedAt) throw new Error("ノートが見つかりません。");
+    await prepareNoteResources(currentNote);
+    assertUserSession(session);
     setEditorStartupState("loading-pages");
     pages = await noteStore.listPages(noteId, { expectedUid: session.uid });
     assertUserSession(session);
@@ -2032,36 +2112,46 @@ export function createStudyNotes(dependencies) {
     await establishEditorLease(noteId, session, { forceReadOnly });
     currentPageIndex = 0;
     applyToolSettingsToUi();
-    contentCache = new Map(); assetCache = new Map(); selectedIds = [];
+    contentCache = new Map(); contentLoadPromises = new Map();
+    assetCache = new Map(); backgroundBlobCache = new Map(); backgroundBlobPromises = new Map(); selectedIds = [];
     revealedMaskIds = new Set(); editingHiddenMaskIds = new Set();
+    const localRecords = await loadNoteLocalRecords(session.uid, noteId);
+    assertUserSession(session);
+    let pendingForNote = localRecords.pendingSaves;
+    let pendingAssetsForNote = localRecords.pendingAssets;
+    let localConflicts = localRecords.conflicts;
     // Choosing the cloud version must only read cloud state. Local drafts and
     // assets remain durable in IndexedDB until the user explicitly retries or
     // creates a recovered copy from the save-status popover.
     if (shouldRecoverLocalNoteState({ readOnly: readOnlyEditor, preferCloud })) {
       setEditorStartupState("loading-assets");
-      await recoverPendingAssets(noteId);
+      pendingAssetsForNote = await recoverPendingAssets(noteId, session, localRecords);
       setEditorStartupState("reconciling-local-draft");
-      await recoverPendingSaves(noteId, pages);
+      const recovered = await recoverPendingSaves(noteId, pages, session, {
+        ...localRecords,
+        pendingAssets: pendingAssetsForNote
+      });
+      pendingForNote = recovered.pendingSaves;
+      localConflicts = recovered.conflicts;
     }
-    pages = await noteStore.listPages(noteId, { expectedUid: session.uid });
     assertUserSession(session);
-    const localConflicts = await localStore.listForUser("conflicts", session.uid);
-    assertUserSession(session);
-    conflictPageIds = new Set(localConflicts.filter(conflict => conflict.noteId === noteId).map(conflict => conflict.pageId));
-    currentNote.conflicts = localConflicts.filter(conflict => conflict.noteId === noteId);
+    if (!preferCloud) {
+      const pagesById = new Map(pages.map(page => [page.pageId, page]));
+      localRecords.pageDrafts.forEach(draft => {
+        const page = pagesById.get(draft.pageId);
+        if (page && draft.content && !contentCache.has(page.pageId)) {
+          contentCache.set(page.pageId, normalizeNoteLineElements(draft.content, page.size));
+        }
+      });
+    }
+    conflictPageIds = new Set(localConflicts.map(conflict => conflict.pageId));
+    currentNote.conflicts = localConflicts;
     currentNote.hasConflict = conflictPageIds.size > 0;
     history.clear();
     ui.title.value = currentNote.title || "無題ノート";
     show("editor");
     setEditorStartupState("loading-content");
     await loadCurrentPage({ preferCloud });
-    const [pendingForNote, pendingAssetsForNote] = await Promise.all([
-      localStore.listForUser("pendingSaves", session.uid),
-      localStore.listForUser("pendingAssets", session.uid)
-    ]).then(([pendingSaves, pendingAssets]) => [
-      pendingSaves.filter(item => item.noteId === noteId),
-      pendingAssets.filter(item => item.noteId === noteId)
-    ]);
     setLocalDraftRecoveryAvailable(pendingForNote.length > 0 || pendingAssetsForNote.length > 0);
     if (pendingForNote.length || pendingAssetsForNote.length) {
       const pendingDetail = [
@@ -2079,6 +2169,7 @@ export function createStudyNotes(dependencies) {
     setMarkupMode(true);
     setStudyMode(study);
     setEditorStartupState("ready");
+    schedulePageThumbnails();
   }
 
   async function loadCurrentPage(options = {}) {
@@ -2091,11 +2182,13 @@ export function createStudyNotes(dependencies) {
     currentContent = await pageContent(page, options);
     ui.conflictBanner.classList.toggle("hidden", !conflictPageIds.has(page.pageId));
     renderPageList();
-    renderPage();
+    await renderPage();
     preloadAdjacentPages();
+    if (startupState === "ready") schedulePageThumbnails();
   }
 
   function renderPageList() {
+    cancelPageThumbnailQueue();
     releaseThumbnailUrls();
     ui.pageList.replaceChildren();
     pages.forEach((page, index) => {
@@ -2112,13 +2205,85 @@ export function createStudyNotes(dependencies) {
         button.addEventListener("click", () => pageAction(action, index).catch(reportError)); actions.append(button);
       });
       item.append(open, actions); ui.pageList.append(item);
-      void hydratePageThumbnail(page, open).catch(error => {
-        open.classList.remove("loading");
-        open.classList.add("fallback");
-        console.warn(`${index + 1}ページのサムネイルを作成できませんでした。`, error);
-      });
     });
     ui.pageCounter.textContent = `${currentPageIndex + 1} / ${pages.length}`;
+  }
+
+  function cancelPageThumbnailQueue() {
+    pageThumbnailGeneration += 1;
+    pageThumbnailQueue = [];
+    if (pageThumbnailIdleHandle) {
+      if (pageThumbnailIdleKind === "idle") globalThis.cancelIdleCallback?.(pageThumbnailIdleHandle);
+      else clearTimeout(pageThumbnailIdleHandle);
+    }
+    pageThumbnailIdleHandle = 0;
+    pageThumbnailIdleKind = "";
+  }
+
+  function enqueuePageThumbnail(page, button, { force = false, front = false } = {}) {
+    if (!page || !button?.isConnected) return;
+    const generation = pageThumbnailGeneration;
+    pageThumbnailQueue = pageThumbnailQueue.filter(task => (
+      task.generation !== generation || task.page.pageId !== page.pageId
+    ));
+    const task = { page, button, force, generation };
+    if (front) pageThumbnailQueue.unshift(task);
+    else pageThumbnailQueue.push(task);
+    pumpPageThumbnailQueue();
+  }
+
+  function pumpPageThumbnailQueue() {
+    while (activePageThumbnails < pageThumbnailConcurrency && pageThumbnailQueue.length) {
+      const task = pageThumbnailQueue.shift();
+      if (
+        task.generation !== pageThumbnailGeneration ||
+        !task.button.isConnected ||
+        task.button.dataset.pageId !== task.page.pageId
+      ) {
+        continue;
+      }
+      activePageThumbnails += 1;
+      void hydratePageThumbnail(task.page, task.button, { force: task.force })
+        .catch(error => {
+          if (task.generation !== pageThumbnailGeneration || !task.button.isConnected) return;
+          task.button.classList.remove("loading");
+          task.button.classList.add("fallback");
+          const index = pages.findIndex(page => page.pageId === task.page.pageId);
+          console.warn(`${index + 1}ページのサムネイルを作成できませんでした。`, error);
+        })
+        .finally(() => {
+          activePageThumbnails -= 1;
+          pumpPageThumbnailQueue();
+        });
+    }
+  }
+
+  function schedulePageThumbnails() {
+    if (!currentNote || !pages.length) return;
+    const ordered = pages
+      .map((page, index) => ({ page, index, distance: Math.abs(index - currentPageIndex) }))
+      .sort((a, b) => a.distance - b.distance || a.index - b.index);
+    const enqueue = ({ page }) => {
+      const button = ui.pageList.querySelector(`[data-page-id="${CSS.escape(page.pageId)}"]`);
+      enqueuePageThumbnail(page, button);
+    };
+    ordered.filter(item => item.distance <= 1).forEach(enqueue);
+    const deferred = ordered.filter(item => item.distance > 1);
+    if (!deferred.length) return;
+    const generation = pageThumbnailGeneration;
+    const enqueueDeferred = () => {
+      pageThumbnailIdleHandle = 0;
+      pageThumbnailIdleKind = "";
+      if (generation !== pageThumbnailGeneration) return;
+      deferred.forEach(enqueue);
+    };
+    if (typeof globalThis.requestIdleCallback === "function") {
+      pageThumbnailIdleKind = "idle";
+      pageThumbnailIdleHandle = globalThis.requestIdleCallback(enqueueDeferred, { timeout: 700 });
+    } else {
+      pageThumbnailIdleKind = "timeout";
+      pageThumbnailIdleHandle = setTimeout(enqueueDeferred, 120);
+    }
   }
 
   function releaseThumbnailUrls() {
@@ -2202,11 +2367,12 @@ export function createStudyNotes(dependencies) {
     const page = pages[currentPageIndex];
     const button = page && [...ui.pageList.querySelectorAll("[data-page-id]")]
       .find(candidate => candidate.dataset.pageId === page.pageId);
-    if (page && button) void hydratePageThumbnail(page, button, { force: true }).catch(error => {
-      button.classList.remove("loading");
-      button.classList.add("fallback");
-      console.warn("編集中ページのサムネイルを更新できませんでした。", error);
-    });
+    if (page && button) {
+      // Invalidate an in-flight result immediately, then put the edited page at
+      // the front without exceeding the shared thumbnail concurrency limit.
+      thumbnailTokens.set(page.pageId, Number(thumbnailTokens.get(page.pageId) || 0) + 1);
+      enqueuePageThumbnail(page, button, { force: true, front: true });
+    }
   }
 
   async function switchPage(index, { localOnly = false, direction = "" } = {}) {
@@ -2258,15 +2424,26 @@ export function createStudyNotes(dependencies) {
 
   async function resolveBackgroundBlob(page) {
     const session = captureUserSession();
-    const blob = await loadSessionBoundBackgroundBlob({
+    assertUserSession(session);
+    const noteId = page?.noteId || currentNote?.id || "note";
+    const key = `${noteId}|${page?.pageId || "page"}|${createNoteBackgroundSignature(page, noteId)}`;
+    if (backgroundBlobCache.has(key)) return backgroundBlobCache.get(key);
+    if (backgroundBlobPromises.has(key)) return backgroundBlobPromises.get(key);
+    const loading = loadSessionBoundBackgroundBlob({
       page,
       session,
       assertUserSession,
       getStorageBlob: (path, options) => noteStore.getStorageBlob(path, options),
       getMaterialSourcePage: materialSourcePage
+    }).then(blob => {
+      assertUserSession(session);
+      backgroundBlobCache.set(key, blob);
+      return blob;
+    }).finally(() => {
+      if (backgroundBlobPromises.get(key) === loading) backgroundBlobPromises.delete(key);
     });
-    assertUserSession(session);
-    return blob;
+    backgroundBlobPromises.set(key, loading);
+    return loading;
   }
 
   async function resolveAssetBlob(assetId, sourceNoteId = currentNote.id) {
@@ -2286,7 +2463,7 @@ export function createStudyNotes(dependencies) {
     } catch (error) {
       if (error?.name === "NoteSessionChangedError") throw error;
     }
-    const pending = (await localStore.listForUser("pendingAssets", session.uid))
+    const pending = (await localStore.listForNote("pendingAssets", session.uid, sourceNoteId))
       .filter(item => item.noteId === sourceNoteId && item.assetId === assetId && item.blob instanceof Blob && item.blob.size > 0)
       .sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))[0];
     assertUserSession(session);
@@ -2295,18 +2472,24 @@ export function createStudyNotes(dependencies) {
     return pending.blob;
   }
 
-  async function recoverPendingAssets(noteId, session = captureUserSession()) {
+  async function recoverPendingAssets(noteId, session = captureUserSession(), localRecords = null) {
     if (!session) return;
     assertUserSession(session);
     const key = recoveryKey(session, noteId);
     if (pendingAssetRecoveryPromises.has(key)) return pendingAssetRecoveryPromises.get(key);
     const recovery = (async () => {
-      const pending = (await localStore.listForUser("pendingAssets", session.uid)).filter(item => item.noteId === noteId);
+      const pending = Array.isArray(localRecords?.pendingAssets)
+        ? localRecords.pendingAssets.filter(item => item.noteId === noteId)
+        : await localStore.listForNote("pendingAssets", session.uid, noteId);
       assertUserSession(session);
+      const remaining = [];
       for (const item of pending) {
         assertUserSession(session);
         assetCache.set(`${noteId}|${item.assetId}`, item.blob);
-        if (navigator.onLine === false) continue;
+        if (navigator.onLine === false) {
+          remaining.push(item);
+          continue;
+        }
         try {
           assertUserSession(session);
           await noteStore.uploadAsset(noteId, item.blob, { assetId: item.assetId, expectedUid: session.uid });
@@ -2315,9 +2498,11 @@ export function createStudyNotes(dependencies) {
           assertUserSession(session);
         } catch (error) {
           if (error?.name === "NoteSessionChangedError") throw error;
+          remaining.push(item);
           console.warn("未送信画像は端末内に保持しています。", error);
         }
       }
+      return remaining;
     })().finally(() => {
       if (pendingAssetRecoveryPromises.get(key) === recovery) pendingAssetRecoveryPromises.delete(key);
     });
@@ -2346,12 +2531,13 @@ export function createStudyNotes(dependencies) {
       restored.revision = cloudRevision;
       if (currentNote?.id === noteId) contentCache.set(page.pageId, restored);
       await localStore.deleteSavePairIfUnchanged(key, { draft, pending });
-      return {
+      const saved = {
         revision: cloudRevision,
         contentPath: page.contentPath,
-        contentHash: page.contentHash,
-        idempotent: true
+        contentHash: page.contentHash
       };
+      applyRecoveredPageMetadata(page, saved, mutationId);
+      return { ...saved, idempotent: true };
     }
     if (cloudRevision !== expectedRevision) {
       throw new NoteConflictError("別の端末でこのページが更新されています。", cloudRevision);
@@ -2376,21 +2562,14 @@ export function createStudyNotes(dependencies) {
     // compare-and-delete guard.
     await localStore.deleteSavePairIfUnchanged(key, { draft, pending });
     assertUserSession(session);
-    if (saved.revision >= Number(page.contentRevision || 0)) {
-      Object.assign(page, {
-        contentRevision: saved.revision,
-        contentPath: saved.contentPath,
-        contentHash: saved.contentHash,
-        lastClientMutationId: mutationId
-      });
-    }
+    applyRecoveredPageMetadata(page, saved, mutationId);
     const restored = { ...normalizedContent, revision: saved.revision };
     if (currentNote?.id === noteId) contentCache.set(page.pageId, restored);
     return saved;
   }
 
   async function recordRecoveredDraftFailure({ error, uid, noteId, pageId, draft, key }) {
-    if (error?.name !== "NoteConflictError") return;
+    if (error?.name !== "NoteConflictError") return null;
     const conflict = {
       key, uid, noteId, pageId,
       expectedRevision: Number(draft.expectedRevision ?? draft.content?.revision),
@@ -2410,42 +2589,68 @@ export function createStudyNotes(dependencies) {
         conflict
       ];
     }
+    return conflict;
   }
 
-  async function recoverPendingSaves(noteId, notePages = pages, session = captureUserSession()) {
-    if (!session) return;
+  async function recoverPendingSaves(noteId, notePages = pages, session = captureUserSession(), localRecords = null) {
+    if (!session) return { pendingSaves: [], conflicts: [] };
     assertUserSession(session);
-    if (navigator.onLine === false) return;
     const recoveryKeyForNote = recoveryKey(session, noteId);
     if (pendingRecoveryPromises.has(recoveryKeyForNote)) return pendingRecoveryPromises.get(recoveryKeyForNote);
     const recovery = (async () => {
-      const [pendingSaves, pendingAssets, conflicts] = await Promise.all([
-        localStore.listForUser("pendingSaves", session.uid),
-        localStore.listForUser("pendingAssets", session.uid),
-        localStore.listForUser("conflicts", session.uid)
-      ]);
+      const supplied = localRecords && ["pendingSaves", "pendingAssets", "conflicts", "pageDrafts"]
+        .every(key => Array.isArray(localRecords[key]));
+      const [pendingSaves, pendingAssets, conflicts, pageDrafts] = supplied
+        ? [
+            localRecords.pendingSaves,
+            localRecords.pendingAssets,
+            localRecords.conflicts,
+            localRecords.pageDrafts
+          ]
+        : await Promise.all([
+            localStore.listForNote("pendingSaves", session.uid, noteId),
+            localStore.listForNote("pendingAssets", session.uid, noteId),
+            localStore.listForNote("conflicts", session.uid, noteId),
+            localStore.listForNote("pageDrafts", session.uid, noteId)
+          ]);
       assertUserSession(session);
+      const pendingForNote = pendingSaves.filter(item => item.noteId === noteId);
+      const conflictsForNote = conflicts.filter(item => item.noteId === noteId);
+      if (navigator.onLine === false) {
+        return { pendingSaves: pendingForNote, conflicts: conflictsForNote };
+      }
       const blockedPages = new Set([
         ...pendingAssets.filter(item => item.noteId === noteId).map(item => item.pageId),
-        ...conflicts.filter(item => item.noteId === noteId).map(item => item.pageId)
+        ...conflictsForNote.map(item => item.pageId)
       ]);
-      for (const pending of pendingSaves.filter(item => item.noteId === noteId)) {
+      const draftsByKey = new Map(
+        pageDrafts.filter(item => item.noteId === noteId).map(item => [item.key, item])
+      );
+      const remaining = [];
+      const updatedConflicts = [...conflictsForNote];
+      for (const pending of pendingForNote) {
         assertUserSession(session);
-        if (blockedPages.has(pending.pageId)) continue;
+        if (blockedPages.has(pending.pageId)) {
+          remaining.push(pending);
+          continue;
+        }
         const page = notePages.find(item => item.pageId === pending.pageId);
         const key = noteLocalKey(session.uid, noteId, pending.pageId);
-        const draft = await localStore.get("pageDrafts", key);
-        assertUserSession(session);
-        if (!page || draft?.uid !== session.uid || !draft.content) continue;
+        const draft = draftsByKey.get(key);
+        if (!page || draft?.uid !== session.uid || !draft.content) {
+          remaining.push(pending);
+          continue;
+        }
         try {
           const expectedRevision = getRecoveryExpectedRevision(pending, draft);
           assertUserSession(session);
-          await persistRecoveredDraft({ noteId, page, draft, pending, key, expectedRevision, session });
+          const saved = await persistRecoveredDraft({ noteId, page, draft, pending, key, expectedRevision, session });
           assertUserSession(session);
+          if (saved?.skipped) remaining.push(pending);
         } catch (error) {
           if (error?.name === "NoteSessionChangedError") throw error;
           assertUserSession(session);
-          await recordRecoveredDraftFailure({
+          const conflict = await recordRecoveredDraftFailure({
             error,
             uid: session.uid,
             noteId,
@@ -2453,10 +2658,17 @@ export function createStudyNotes(dependencies) {
             draft,
             key
           });
+          remaining.push(pending);
+          if (conflict) {
+            const index = updatedConflicts.findIndex(item => item.key === conflict.key);
+            if (index >= 0) updatedConflicts[index] = conflict;
+            else updatedConflicts.push(conflict);
+          }
           assertUserSession(session);
           console.warn("未送信のページ下書きは端末内に保持しています。", error);
         }
       }
+      return { pendingSaves: remaining, conflicts: updatedConflicts };
     })().finally(() => {
       if (pendingRecoveryPromises.get(recoveryKeyForNote) === recovery) pendingRecoveryPromises.delete(recoveryKeyForNote);
     });
@@ -2999,6 +3211,7 @@ export function createStudyNotes(dependencies) {
     elementLayer.className = "note-layer note-elements-layer";
     elementLayer.dataset.layer = "elements";
     elementLayer.style.zIndex = "10";
+    const assetRenderPromises = [];
     const ordered = [...currentContent.elements].sort((a, b) => Number(a.zIndex || 0) - Number(b.zIndex || 0));
     for (const [stackIndex, element] of ordered.entries()) {
       const layerZIndex = String(stackIndex + 1);
@@ -3011,10 +3224,11 @@ export function createStudyNotes(dependencies) {
         const crop = element.crop || { x: 0, y: 0, width: 1, height: 1 };
         image.style.position = "absolute"; image.style.width = `${100 / crop.width}%`; image.style.height = `${100 / crop.height}%`;
         image.style.left = `${-crop.x / crop.width * 100}%`; image.style.top = `${-crop.y / crop.height * 100}%`;
-        resolveAssetBlob(element.assetId, element.assetNoteId || currentNote.id).then(blob => {
+        const assetRender = resolveAssetBlob(element.assetId, element.assetNoteId || currentNote.id).then(blob => {
           if (token !== renderToken) return;
           const url = URL.createObjectURL(blob); objectUrls.push(url); image.src = url; image.dataset.noteObjectUrl = url;
         }).catch(error => { wrap.title = error.message; });
+        assetRenderPromises.push(assetRender);
         wrap.append(image); elementLayer.append(wrap);
         continue;
       }
@@ -3114,6 +3328,9 @@ export function createStudyNotes(dependencies) {
     requestAnimationFrame(() => {
       if (token === renderToken) validatePageLayerGeometry();
     });
+    // The initial editor load awaits renderPage(), so current-page images and
+    // background always receive priority over the deferred thumbnail queue.
+    await Promise.allSettled(assetRenderPromises);
   }
 
   function commitChange(before, label) {
@@ -5286,12 +5503,12 @@ export function createStudyNotes(dependencies) {
     const session = captureUserSession();
     assertUserSession(session);
     const [drafts, pending] = await Promise.all([
-      localStore.listForUser("pageDrafts", session.uid),
-      localStore.listForUser("pendingSaves", session.uid)
+      localStore.listForNote("pageDrafts", session.uid, dedicatedEditorNoteId),
+      localStore.listForNote("pendingSaves", session.uid, dedicatedEditorNoteId)
     ]);
-    const pendingByKey = new Map(pending.filter(item => item.noteId === dedicatedEditorNoteId).map(item => [item.key, item]));
+    const pendingByKey = new Map(pending.map(item => [item.key, item]));
     const items = drafts
-      .filter(item => item.noteId === dedicatedEditorNoteId && item.content)
+      .filter(item => item.content)
       .map(draft => ({ key: draft.key, pageId: draft.pageId, content: draft.content, draft, pending: pendingByKey.get(draft.key) || null }));
     if (!items.length) throw new Error("このノートの端末内下書きが見つかりません。");
     setEditorStartupState("reconciling-local-draft", { detail: "端末内の下書きから独立した復元コピーを作成中" });
@@ -5354,7 +5571,8 @@ export function createStudyNotes(dependencies) {
     if (currentNote && !await flushAllWithDecision("ノートを閉じる操作")) return;
     editorLease?.release();
     currentNote = null; pages = []; currentContent = null; selectedIds = []; history.clear();
-    resetPageRender(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
+    contentLoadPromises.clear(); backgroundBlobCache.clear(); backgroundBlobPromises.clear();
+    resetPageRender(); cancelPageThumbnailQueue(); cancelNoteCardThumbnailQueue(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
     if (dedicatedEditor) {
       globalThis.location.assign(noteListUrl().toString());
       return;
@@ -5373,9 +5591,10 @@ export function createStudyNotes(dependencies) {
     pendingAssetRecoveryPromises.clear(); pendingRecoveryPromises.clear(); pendingRecoverySweeps.clear();
     editorLease?.dispose(); editorLease = null;
     currentNote = null; pages = []; currentContent = null; notes = []; orphanedDrafts = []; contentCache.clear(); assetCache.clear();
+    contentLoadPromises.clear(); backgroundBlobCache.clear(); backgroundBlobPromises.clear();
     selectedIds = []; activeTouchPointerIds.clear(); swipeGesture = null; activeGesture = null;
     markupMode = true; localRecoverySuppressed = false; explicitReadOnlyMode = false;
-    history.clear(); resetPageRender(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
+    history.clear(); resetPageRender(); cancelPageThumbnailQueue(); cancelNoteCardThumbnailQueue(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
     ui.list.replaceChildren(); show("list"); setListStatus("ログイン後にノートを読み込みます。");
     if (dedicatedEditor) {
       show("editor");
@@ -5719,11 +5938,11 @@ export function createStudyNotes(dependencies) {
           if (failure) throw failure;
           if (uid && noteId) {
             const [pendingSaves, pendingAssets] = await Promise.all([
-              localStore.listForUser("pendingSaves", uid),
-              localStore.listForUser("pendingAssets", uid)
+              localStore.listForNote("pendingSaves", uid, noteId),
+              localStore.listForNote("pendingAssets", uid, noteId)
             ]);
-            const remainingSaves = pendingSaves.filter(item => item.noteId === noteId).length;
-            const remainingAssets = pendingAssets.filter(item => item.noteId === noteId).length;
+            const remainingSaves = pendingSaves.length;
+            const remainingAssets = pendingAssets.length;
             if (remainingSaves || remainingAssets) {
               setSaveState("recoverable-error", { detail: [
                 remainingSaves ? `下書き再送待ち ${remainingSaves}件` : "",

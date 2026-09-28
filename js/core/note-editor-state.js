@@ -139,6 +139,27 @@ export function sanitizeDiagnosticUrlParameters(entries = []) {
     .map(([key, value]) => [String(key), String(value)]));
 }
 
-export function selectNoteFeatureUser({ dedicatedEditor = false, user = null, interactionReady = false } = {}) {
-  return user && (dedicatedEditor || interactionReady) ? user : null;
+export function isNoteEditorReady({
+  dedicatedEditor = false,
+  user = null,
+  session = null,
+  activeSession = null,
+  authEpoch
+} = {}) {
+  return dedicatedEditor === true &&
+    Boolean(user?.uid) &&
+    Boolean(session) &&
+    session === activeSession &&
+    session.noteEditorReady === true &&
+    session.userId === user.uid &&
+    session.epoch === authEpoch;
+}
+
+export function selectNoteFeatureUser({
+  dedicatedEditor = false,
+  noteEditorReady = false,
+  user = null,
+  interactionReady = false
+} = {}) {
+  return user && ((dedicatedEditor && noteEditorReady) || interactionReady) ? user : null;
 }

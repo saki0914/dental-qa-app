@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyRecoveredPageMetadata,
   loadSessionBoundBackgroundBlob,
   loadSessionBoundMaterialDimensions
 } from "../../js/core/note-session-loading.js";
@@ -212,4 +213,69 @@ test("教材寸法取得は通常の取得失敗だけ既定比率へフォー�
   assert.equal(result, null);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0][0], /既定比率/);
+});
+
+test("復旧成功ページだけを保存結果で更新し、listPages再取得相当のmetadataにする", () => {
+  const pages = [
+    {
+      pageId: "page-1",
+      order: 1,
+      contentRevision: 0,
+      contentPath: "",
+      contentHash: "",
+      lastClientMutationId: "",
+      deletedAt: null,
+      background: { type: "blank" }
+    },
+    {
+      pageId: "page-2",
+      order: 2,
+      contentRevision: 3,
+      contentPath: "users/alice/notes/note-1/pages/page-2/revisions/existing.json",
+      contentHash: "existing-hash",
+      lastClientMutationId: "external-mutation",
+      deletedAt: null,
+      background: { type: "ruled" }
+    }
+  ];
+  const untouchedPage = structuredClone(pages[1]);
+
+  assert.equal(applyRecoveredPageMetadata(pages[0], {
+    revision: 1,
+    contentPath: "users/alice/notes/note-1/pages/page-1/revisions/recovered.json",
+    contentHash: "recovered-hash"
+  }, "recovered-mutation"), true);
+
+  const listPagesEquivalent = [
+    {
+      pageId: "page-1",
+      order: 1,
+      contentRevision: 1,
+      contentPath: "users/alice/notes/note-1/pages/page-1/revisions/recovered.json",
+      contentHash: "recovered-hash",
+      lastClientMutationId: "recovered-mutation",
+      deletedAt: null,
+      background: { type: "blank" }
+    },
+    untouchedPage
+  ];
+  assert.deepEqual(pages, listPagesEquivalent);
+  assert.deepEqual(pages[1], untouchedPage);
+});
+
+test("復旧保存結果が古い場合はページmetadataを巻き戻さない", () => {
+  const page = {
+    pageId: "page-1",
+    contentRevision: 2,
+    contentPath: "newer.json",
+    contentHash: "newer-hash",
+    lastClientMutationId: "newer-mutation"
+  };
+  const original = structuredClone(page);
+  assert.equal(applyRecoveredPageMetadata(page, {
+    revision: 1,
+    contentPath: "stale.json",
+    contentHash: "stale-hash"
+  }, "stale-mutation"), false);
+  assert.deepEqual(page, original);
 });

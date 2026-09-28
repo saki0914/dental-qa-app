@@ -1,5 +1,6 @@
 import {
   doc,
+  getDoc,
   runTransaction,
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
@@ -83,6 +84,53 @@ export function getSplitDocRefs(db, userId) {
     progress: doc(db, "users", userId, "app", "progress"),
     settings: doc(db, "users", userId, "app", "settings"),
     sync: doc(db, "users", userId, "app", "sync")
+  };
+}
+
+const NOTE_EDITOR_MATERIAL_KEYS = [
+  "pdfMaterials",
+  "pdfRevealStates",
+  "selectedPdfId",
+  "selectedMaskId",
+  "pdfSearchQuery"
+];
+
+function selectNoteEditorMaterialState(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    NOTE_EDITOR_MATERIAL_KEYS
+      .filter(key => Object.hasOwn(value, key))
+      .map(key => [key, value[key]])
+  );
+}
+
+export async function readNoteEditorMaterialState(db, userId) {
+  const refs = getSplitDocRefs(db, userId);
+  const splitSnapshot = await getDoc(refs.pdfMaterials);
+  if (splitSnapshot.exists()) {
+    const state = selectNoteEditorMaterialState(splitSnapshot.data());
+    if (Object.keys(state).length > 0) {
+      return {
+        hasData: true,
+        source: "split",
+        state
+      };
+    }
+  }
+
+  // Older accounts can still have image materials only in the legacy main
+  // document. Read it only when the split document is absent or incomplete so
+  // the dedicated note editor normally waits for one small Firestore document.
+  // A later save from the normal app writes the split document, making this a
+  // transitional cost for accounts that have not completed that migration yet.
+  const legacySnapshot = await getDoc(refs.main);
+  const state = selectNoteEditorMaterialState(
+    legacySnapshot.exists() ? legacySnapshot.data() : null
+  );
+  return {
+    hasData: Object.keys(state).length > 0,
+    source: Object.keys(state).length > 0 ? "legacy" : "none",
+    state
   };
 }
 

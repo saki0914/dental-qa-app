@@ -64,3 +64,18 @@ export async function loadSessionBoundMaterialDimensions({
     return null;
   }
 }
+
+export function applyRecoveredPageMetadata(page, saved, mutationId) {
+  const revision = Number(saved?.revision);
+  if (!page || !Number.isInteger(revision) || revision < Number(page.contentRevision || 0)) return false;
+  if (!saved?.contentPath || !saved?.contentHash || !mutationId) {
+    throw new TypeError("復旧したページの保存結果が不足しています。");
+  }
+  Object.assign(page, {
+    contentRevision: revision,
+    contentPath: saved.contentPath,
+    contentHash: saved.contentHash,
+    lastClientMutationId: mutationId
+  });
+  return true;
+}
