@@ -591,7 +591,7 @@ body.note-editor-dedicated .local-environment-details{
 }
 .note-input-debug{
   position:fixed;
-  z-index:120;
+  z-index:160;
   inset-inline-end:max(10px,env(safe-area-inset-right));
   inset-block-start:max(72px,calc(env(safe-area-inset-top) + 64px));
   inline-size:min(310px,calc(100vw - 20px));
