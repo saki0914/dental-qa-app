@@ -520,3 +520,87 @@ test("復旧保存中に新しい編集が入っても同一ページを直列�
   assert.equal(maxInFlight, 1);
   assert.equal(localStore.records.has("conflicts:u|n|p"), false);
 });
+
+test("書込み中はdebounce後のクラウド保存を保留し、保留が解けてから1回だけ保存する", async () => {
+  const localStore = memoryStore();
+  const calls = [];
+  let holding = true;
+  const holdRequests = [];
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 5,
+    cloudSaveHoldMs: request => {
+      holdRequests.push(request);
+      return holding ? 10 : 0;
+    },
+    persist: async (_identity, content) => {
+      calls.push(content);
+      return { revision: calls.length };
+    }
+  });
+  const identity = { uid: "u", noteId: "n", pageId: "p" };
+  await coordinator.schedule(identity, { revision: 0, elements: [{ id: "a" }], noteMasks: [] });
+  await wait(60);
+  assert.equal(calls.length, 0, "保留中はクラウド保存を始めない");
+  assert.ok(holdRequests.length >= 2, "保留中は一定間隔で再判定する");
+  assert.ok(holdRequests.at(-1).heldMs > holdRequests[0].heldMs, "保留時間を渡す");
+  assert.equal(coordinator.getState(identity).dirty, true);
+  await coordinator.schedule(identity, { revision: 0, elements: [{ id: "a" }, { id: "b" }], noteMasks: [] });
+  holding = false;
+  await wait(60);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].elements.map(element => element.id), ["a", "b"]);
+  assert.equal(localStore.records.has("pageDrafts:u|n|p"), false);
+});
+
+test("明示flushは書込み中の保留に関係なくすぐクラウド保存する", async () => {
+  const localStore = memoryStore();
+  const calls = [];
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 5,
+    cloudSaveHoldMs: () => 60_000,
+    persist: async (...args) => { calls.push(args); return { revision: 1 }; }
+  });
+  const identity = { uid: "u", noteId: "n", pageId: "p" };
+  await coordinator.schedule(identity, { revision: 0, elements: [], noteMasks: [] });
+  await wait(20);
+  assert.equal(calls.length, 0);
+  await coordinator.flush(identity);
+  assert.equal(calls.length, 1);
+});
+
+test("保存中に入った編集の再保存も書込み中は保留する", async () => {
+  const localStore = memoryStore();
+  let releaseFirst;
+  let notifyFirstStarted;
+  const firstStarted = new Promise(resolve => { notifyFirstStarted = resolve; });
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const calls = [];
+  let holding = false;
+  const coordinator = createNoteSaveCoordinator({
+    localStore,
+    debounceMs: 5,
+    cloudSaveHoldMs: () => (holding ? 10 : 0),
+    persist: async (_identity, content) => {
+      calls.push(content.elements.map(element => element.id));
+      if (calls.length === 1) {
+        notifyFirstStarted();
+        await firstGate;
+      }
+      return { revision: calls.length };
+    }
+  });
+  const identity = { uid: "u", noteId: "n", pageId: "p" };
+  await coordinator.schedule(identity, { revision: 0, elements: [{ id: "first" }], noteMasks: [] });
+  await firstStarted;
+  holding = true;
+  await coordinator.schedule(identity, { revision: 0, elements: [{ id: "first" }, { id: "second" }], noteMasks: [] });
+  releaseFirst();
+  await wait(60);
+  assert.deepEqual(calls, [["first"]], "書込み中は後続generationを直ちに再送しない");
+  holding = false;
+  await wait(60);
+  assert.deepEqual(calls, [["first"], ["first", "second"]]);
+  assert.equal(coordinator.getState(identity).dirty, false);
+});

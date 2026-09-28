@@ -3964,6 +3964,66 @@ test("@authenticated @ipad-input-core moveなしの1点strokeはドラフトと�
   }
 });
 
+test("@authenticated @ipad-input-core 連続筆記中はページ全体の保存処理を保留し、確定形状のdraftを休止後にまとめて確定する", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("連続筆記保留E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
+  await expect(page.locator("#noteSaveStatus")).toHaveAttribute("data-state", "saved", { timeout: 20_000 });
+  await page.evaluate(() => {
+    window.__notePageDraftPuts = [];
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function recordPageDraftPut(...args) {
+      if (this.name === "pageDrafts") window.__notePageDraftPuts.push(performance.now());
+      return put.apply(this, args);
+    };
+  });
+
+  const stage = page.locator("#notePageStage");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  const point = (x, y) => ({ clientX: box.x + box.width * x, clientY: box.y + box.height * y });
+  const writeStroke = async (pointerId, row) => {
+    const y = .2 + row * .08;
+    await capture.dispatchEvent("pointerdown", {
+      pointerId, pointerType: "pen", button: 0, buttons: 1, ...point(.2, y), width: 2, height: 2, pressure: .5
+    });
+    for (let step = 1; step <= 6; step += 1) {
+      await capture.dispatchEvent("pointermove", {
+        pointerId, pointerType: "pen", button: 0, buttons: 1,
+        ...point(.2 + step * .05, y + (step % 2 ? .012 : -.012)), width: 2, height: 2, pressure: .5
+      });
+    }
+    await capture.dispatchEvent("pointerup", {
+      pointerId, pointerType: "pen", button: 0, buttons: 0, ...point(.5, y), width: 2, height: 2, pressure: 0
+    });
+  };
+
+  // 画の間隔（0.4秒）は、改訂2までの保存予約（220ms）を超え、休止判定（1秒）には届かない。
+  for (let index = 0; index < 5; index += 1) {
+    await writeStroke(3100 + index, index);
+    await page.waitForTimeout(400);
+  }
+  const settled = stage.locator('[data-note-draft="settled"] path[data-element-id]');
+  await expect(settled, "書込み中の画は確定形状のdraftで表示する").toHaveCount(5);
+  expect(
+    await page.evaluate(() => window.__notePageDraftPuts.length),
+    "書込み中はページ全体の端末内下書き保存を行わない"
+  ).toBe(0);
+  const settledPath = await settled.first().getAttribute("d");
+  expect(settledPath, "筆跡は中点を結ぶ曲線で描く").toMatch(/ Q /);
+
+  await expect.poll(() => page.evaluate(() => window.__notePageDraftPuts.length), { timeout: 10_000 }).toBeGreaterThan(0);
+  const committed = stage.locator('[data-layer="elements"] path[data-element-id]');
+  await expect(committed, "休止後に5画を1回でまとめて確定する").toHaveCount(5);
+  await expect(stage.locator('[data-note-draft="settled"]')).toHaveCount(0);
+  expect(await committed.first().getAttribute("d"), "確定前後で線の形を変えない").toBe(settledPath);
+  await expect(page.locator("#noteSaveStatus")).toHaveAttribute("data-state", "saved", { timeout: 20_000 });
+});
+
 test("@authenticated @ipad-input-core Apple Pencilのtouchはページで確保し、指とテキスト入力は妨げない", async ({ page }) => {
   test.setTimeout(90_000);
   const user = await createUser();

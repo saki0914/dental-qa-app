@@ -20,6 +20,8 @@ function createCanvasHarness() {
     beginPath() {},
     moveTo() {},
     lineTo() {},
+    quadraticCurveTo() {},
+    arc() {},
     translate() {},
     rotate() {},
     setLineDash() {},
@@ -100,6 +102,39 @@ test("異なる要素種別もzIndex順に描画する", async t => {
   });
 
   assert.deepEqual(strokes, ["highlighter-bottom", "stroke-middle", "shape-top"]);
+});
+
+test("固定幅のstrokeと半透明highlighterはSVGと同じ1本の曲線pathとして描画する", async t => {
+  const { canvas, strokes } = createCanvasHarness();
+  const context = canvas.getContext("2d");
+  let curves = 0;
+  context.quadraticCurveTo = () => { curves += 1; };
+  const previousDocument = globalThis.document;
+  globalThis.document = { createElement: () => canvas };
+  t.after(() => { globalThis.document = previousDocument; });
+  const points = [
+    { x: .1, y: .1, pressure: .5 }, { x: .2, y: .15, pressure: .5 }, { x: .3, y: .12, pressure: .5 },
+    { x: .4, y: .2, pressure: .5 }, { x: .5, y: .18, pressure: .5 }
+  ];
+
+  await renderNotePageToCanvas({
+    page: { background: { type: "blank" } },
+    content: {
+      elements: [
+        { id: "highlighter", type: "highlighter", points, style: { color: "highlighter", widthRatio: .02, opacity: .3 }, zIndex: 1 },
+        { id: "stroke", type: "stroke", points, style: { color: "stroke", widthRatio: .01 }, zIndex: 2 }
+      ],
+      noteMasks: []
+    },
+    resolveBackgroundBlob: async () => { throw new Error("背景画像は不要です"); },
+    resolveAssetBlob: async () => { throw new Error("貼付画像は不要です"); },
+    width: 100,
+    height: 120
+  });
+
+  // 区間ごとに重ね描きすると半透明の継ぎ目が濃くなるため、要素ごとに1回だけstrokeする。
+  assert.deepEqual(strokes, ["highlighter", "stroke"]);
+  assert.equal(curves, 2 * (points.length - 2));
 });
 
 test("AI共有用ではマスクを除外し学習用では教材・ノートマスクを描画する", async t => {

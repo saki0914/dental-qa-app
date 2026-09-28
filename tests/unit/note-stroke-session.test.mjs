@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   appendPointerSamples,
-  copyStrokePointsForCommit,
   createStrokeRecoveryCooldown,
   createStrokeSession,
   delayedPointerdownJoinsRecoveredSession,
@@ -68,22 +67,6 @@ test("pointercancel終端のcoalesced点を既存の安全判定へ渡す", () =
   assert.equal(cancelledStrokeCanBeCommitted({
     type: "pen", pointerType: "pen", reason: "pointercancel", points
   }), true);
-});
-
-test("確定ストロークはgestureの点配列と各点を共有しない", () => {
-  const gesturePoints = [
-    { x: .1, y: .2, pressure: .4 },
-    { x: .7, y: .8, pressure: .6 }
-  ];
-  const committedPoints = copyStrokePointsForCommit(gesturePoints);
-
-  gesturePoints.push({ x: .9, y: .9, pressure: .5 });
-  gesturePoints[0].x = .5;
-
-  assert.deepEqual(committedPoints, [
-    { x: .1, y: .2, pressure: .4 },
-    { x: .7, y: .8, pressure: .6 }
-  ]);
 });
 
 test("別sessionの同一座標・同一timestampは別strokeの最初の点として保持する", () => {

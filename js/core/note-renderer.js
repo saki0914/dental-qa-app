@@ -1,6 +1,6 @@
 import { assertNonEmptyBlob, canvasToVerifiedBlob } from "./file-validator.js";
 import { lineEndpoints } from "./note-geometry.js";
-import { drawStrokeSegments } from "./note-stroke.js";
+import { drawStrokeOnCanvas } from "./note-stroke.js";
 import {
   createNoteTextMeasure,
   layoutTextBox,
@@ -236,7 +236,7 @@ export async function renderNotePageToCanvas({
       context.globalAlpha = Number(element.style?.opacity ?? 0.3);
       context.strokeStyle = element.style?.color || "#fff176";
       context.lineCap = "round"; context.lineJoin = "round";
-      drawStrokeSegments(context, element.points, Number(element.style?.widthRatio || 0.025), canvas.width, canvas.height);
+      drawStrokeOnCanvas(context, element.points, Number(element.style?.widthRatio || 0.025), canvas.width, canvas.height);
       context.restore();
     } else if (element.type === "stroke") {
       context.save();
@@ -244,7 +244,7 @@ export async function renderNotePageToCanvas({
       context.strokeStyle = element.style?.color || "#111111";
       context.lineWidth = Number(element.style?.widthRatio || 0.0025) * canvas.width;
       context.lineCap = "round"; context.lineJoin = "round";
-      drawStrokeSegments(context, element.points, Number(element.style?.widthRatio || 0.0025), canvas.width, canvas.height, {
+      drawStrokeOnCanvas(context, element.points, Number(element.style?.widthRatio || 0.0025), canvas.width, canvas.height, {
         pressureEnabled: element.pressureEnabled === true
       });
       context.restore();

@@ -37,7 +37,6 @@ import { createNoteHistory } from "../core/note-history.js";
 import { getStandaloneNoteCreationErrorMessage } from "../core/note-errors.js";
 import {
   appendPointerSamples,
-  copyStrokePointsForCommit,
   createStrokeRecoveryCooldown,
   createStrokeSession,
   delayedPointerdownJoinsRecoveredSession,
@@ -77,6 +76,7 @@ import {
   isMaterialArchiving
 } from "../core/note-material-mutation.js";
 import { createNoteSaveCoordinator } from "../core/note-save-coordinator.js";
+import { cloudSaveHoldDelay, strokeFlushDelay, thumbnailRefreshDelay } from "../core/note-work-timing.js";
 import { canStraightenStroke, straightenedPoints, NOTE_STRAIGHTEN_HOLD_MS, NOTE_STRAIGHTEN_MOVE_PX } from "../core/note-straightener.js";
 import { createNoteToolSettingsStore, normalizeNoteToolSettings } from "../core/note-tool-settings.js";
 import {
@@ -84,7 +84,7 @@ import {
   loadSessionBoundBackgroundBlob,
   loadSessionBoundMaterialDimensions
 } from "../core/note-session-loading.js";
-import { strokeSvgNodes } from "../core/note-stroke.js";
+import { prepareStrokePointsForCommit, strokePathData, strokeSvgNodes } from "../core/note-stroke.js";
 import {
   NOTE_TEXT_DEFAULT_BOX,
   NOTE_TEXT_EDITOR_MIN_FONT_PX,
@@ -143,7 +143,6 @@ const TOOL_LABELS = {
   "eraser-object": "消しゴム", "eraser-pixel": "ピクセル消しゴム", shape: "図形",
   text: "テキスト", image: "画像", mask: "暗記マスク", study: "暗記モード"
 };
-const PENDING_STROKE_IDLE_MS = 220;
 const NOTE_COPY_CONCURRENCY = 3;
 const PDF_UPLOAD_CONCURRENCY = 2;
 const TOUCH_PREEMPT_POLICY = Object.freeze({
@@ -338,9 +337,7 @@ export function createStudyNotes(dependencies) {
   let selectedIds = [];
   let activeGesture = null;
   let pendingStrokeWork = null;
-  let pendingStrokeIdleHandle = 0;
-  let pendingStrokeIdleKind = "";
-  let pendingStrokeIdleSince = 0;
+  let pendingStrokeFlushTimer = 0;
   let pendingThumbnailTimer = 0;
   let lastDrawingActivityAt = 0;
   let swipeGesture = null;
@@ -1415,6 +1412,14 @@ export function createStudyNotes(dependencies) {
   const saveCoordinator = createNoteSaveCoordinator({
     localStore,
     debounceMs: 850,
+    // The upload serializes and validates the whole page; hold it while the
+    // user is writing (see note-work-timing.js).
+    cloudSaveHoldMs: ({ heldMs }) => cloudSaveHoldDelay({
+      now: performance.now(),
+      gestureActive: Boolean(activeGesture),
+      lastInputAt: lastDrawingActivityAt,
+      heldMs
+    }),
     isSessionCurrent: identity => (
       getCurrentUser()?.uid === identity.uid &&
       userSessionGeneration === identity.sessionGeneration &&
@@ -1457,7 +1462,11 @@ export function createStudyNotes(dependencies) {
       if (currentNote?.id === identity.noteId) {
         if (pages[currentPageIndex]?.pageId === identity.pageId && currentContent) {
           currentContent.revision = result.revision;
-          contentCache.set(identity.pageId, clone(currentContent));
+          // Queued strokes already cache the live content object itself (reads
+          // clone it); only a detached cache entry needs a new snapshot.
+          if (contentCache.get(identity.pageId) !== currentContent) {
+            contentCache.set(identity.pageId, clone(currentContent));
+          }
         } else {
           const cached = contentCache.get(identity.pageId);
           contentCache.set(identity.pageId, { ...clone(cached || content), revision: result.revision });
@@ -1580,7 +1589,13 @@ export function createStudyNotes(dependencies) {
   function scheduleLocalSave(saveIdentity, content) {
     const key = localSaveKey(saveIdentity);
     const page = pages.find(item => item.pageId === saveIdentity.pageId);
-    const normalizedContent = normalizeNoteLineElements(content, page?.size);
+    // The coordinator snapshots the content synchronously; only pages with
+    // line shapes need the normalized copy (which would be a second clone of
+    // the whole page otherwise).
+    const hasLineShapes = (content?.elements || []).some(element => (
+      element?.type === "shape" && ["line", "arrow"].includes(element.shapeType)
+    ));
+    const normalizedContent = hasLineShapes ? normalizeNoteLineElements(content, page?.size) : content;
     const task = saveCoordinator.schedule(saveIdentity, normalizedContent);
     pendingLocalSavePromises.set(key, task);
     const clear = () => {
@@ -3754,7 +3769,7 @@ export function createStudyNotes(dependencies) {
       });
     }
     return [createSvgElement("path", {
-      d: pathData(element.points, metrics), fill: "none", stroke: element.style?.color || "#111111",
+      d: strokePathData(element.points, metrics.width, metrics.height), fill: "none", stroke: element.style?.color || "#111111",
       "stroke-width": Math.max(1, metrics.widthRatio(element.style?.widthRatio || .0025)),
       "stroke-opacity": element.style?.opacity ?? defaultOpacity,
       "stroke-linecap": "round", "stroke-linejoin": "round",
@@ -4050,6 +4065,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function commitChange(before, label) {
+    settlePendingStrokes();
     if (!isEditableNow()) {
       currentContent = clone(before);
       renderPage();
@@ -4177,57 +4193,45 @@ export function createStudyNotes(dependencies) {
   }
 
   function cancelPendingStrokeSchedule() {
-    if (!pendingStrokeIdleHandle) return;
-    if (pendingStrokeIdleKind === "idle") globalThis.cancelIdleCallback?.(pendingStrokeIdleHandle);
-    else clearTimeout(pendingStrokeIdleHandle);
-    pendingStrokeIdleHandle = 0;
-    pendingStrokeIdleKind = "";
+    clearTimeout(pendingStrokeFlushTimer);
+    pendingStrokeFlushTimer = 0;
   }
 
-  function schedulePendingStrokeFlush() {
+  // Queued strokes are flushed (history, local draft, final DOM) in writing
+  // pauses; see note-work-timing.js. `afterLift` is set right after a stroke
+  // was committed, when an overdue batch may run before the next stroke.
+  function schedulePendingStrokeFlush({ afterLift = false } = {}) {
     cancelPendingStrokeSchedule();
-    const armTimeout = delay => {
-      pendingStrokeIdleKind = "timeout";
-      pendingStrokeIdleHandle = setTimeout(run, Math.max(16, delay));
-    };
-    const armIdleCallback = () => {
-      pendingStrokeIdleKind = "idle";
-      pendingStrokeIdleHandle = globalThis.requestIdleCallback(run, { timeout: 500 });
-    };
-    const run = () => {
-      const firedKind = pendingStrokeIdleKind;
-      pendingStrokeIdleHandle = 0;
-      pendingStrokeIdleKind = "";
-      if (!pendingStrokeWork) return;
-      if (activeGesture) {
-        pendingStrokeIdleSince = 0;
-        armTimeout(60);
-        return;
-      }
-      const now = performance.now();
-      if (!pendingStrokeIdleSince) pendingStrokeIdleSince = now;
-      const quietRemaining = PENDING_STROKE_IDLE_MS - (now - pendingStrokeIdleSince);
-      if (quietRemaining > 0) {
-        armTimeout(quietRemaining);
-        return;
-      }
-      if (typeof globalThis.requestIdleCallback === "function" && firedKind !== "idle") {
-        armIdleCallback();
-        return;
-      }
+    if (!pendingStrokeWork) return;
+    const delay = strokeFlushDelay({
+      now: performance.now(),
+      gestureActive: Boolean(activeGesture),
+      lastInputAt: lastDrawingActivityAt,
+      pendingSince: pendingStrokeWork.queuedAt,
+      pendingStrokes: pendingStrokeWork.historyEntries.length,
+      afterLift
+    });
+    if (delay <= 0) {
       void flushPendingStrokeWork();
-    };
-    const quietRemaining = pendingStrokeIdleSince
-      ? PENDING_STROKE_IDLE_MS - (performance.now() - pendingStrokeIdleSince)
-      : PENDING_STROKE_IDLE_MS;
-    armTimeout(quietRemaining);
+      return;
+    }
+    pendingStrokeFlushTimer = setTimeout(() => {
+      pendingStrokeFlushTimer = 0;
+      schedulePendingStrokeFlush();
+    }, delay);
+  }
+
+  // Non-stroke edits record their own history entry and may change the page
+  // in place. Queued strokes are settled first, so their history entries stay
+  // in edit order and their snapshots are taken before the page changes.
+  function settlePendingStrokes() {
+    if (pendingStrokeWork) void flushPendingStrokeWork({ render: false });
   }
 
   async function flushPendingStrokeWork({ render = true, throwOnError = false } = {}) {
     cancelPendingStrokeSchedule();
     const work = pendingStrokeWork;
     pendingStrokeWork = null;
-    pendingStrokeIdleSince = 0;
     if (!work) return;
     pushStrokeHistoryEntries(work.historyEntries || []);
     ui.undo.disabled = !history.canUndo();
@@ -4290,29 +4294,37 @@ export function createStudyNotes(dependencies) {
     }
   }
 
-  // Thumbnail rendering draws the whole page into a canvas. Keep it out of
-  // the middle of handwriting: wait until the Pencil has been idle for a while.
-  function scheduleCurrentPageThumbnailRefresh(noteId, pageId, delay = 900) {
+  // Thumbnail rendering fingerprints and redraws the whole page. Keep it out
+  // of handwriting: wait until the Pencil has been idle for a while.
+  function scheduleCurrentPageThumbnailRefresh(noteId, pageId, delay = null) {
     clearTimeout(pendingThumbnailTimer);
+    const nextDelay = () => thumbnailRefreshDelay({
+      now: performance.now(),
+      gestureActive: Boolean(activeGesture),
+      strokesPending: Boolean(pendingStrokeWork),
+      lastInputAt: lastDrawingActivityAt
+    });
     pendingThumbnailTimer = setTimeout(() => {
+      pendingThumbnailTimer = 0;
       if (currentNote?.id !== noteId || pages[currentPageIndex]?.pageId !== pageId) return;
-      const quietFor = performance.now() - lastDrawingActivityAt;
-      if (activeGesture || pendingStrokeWork || quietFor < 900) {
-        scheduleCurrentPageThumbnailRefresh(noteId, pageId, Math.max(250, 900 - quietFor));
+      const remaining = nextDelay();
+      if (remaining > 0) {
+        scheduleCurrentPageThumbnailRefresh(noteId, pageId, remaining);
         return;
       }
       refreshCurrentPageThumbnail();
-    }, delay);
+    }, Math.max(16, delay ?? nextDelay()));
   }
 
   function queueStrokeWork(before, after, label) {
     const pageId = pages[currentPageIndex].pageId;
     contentCache.set(pageId, after);
-    if (!pendingStrokeWork) pendingStrokeWork = { identity: identity(), content: after, historyEntries: [] };
+    if (!pendingStrokeWork) {
+      pendingStrokeWork = { identity: identity(), content: after, historyEntries: [], queuedAt: performance.now() };
+    }
     pendingStrokeWork.content = after;
     pendingStrokeWork.historyEntries.push({ before, after, label });
-    pendingStrokeIdleSince = performance.now();
-    schedulePendingStrokeFlush();
+    schedulePendingStrokeFlush({ afterLift: true });
     ui.undo.disabled = false;
   }
 
@@ -4585,7 +4597,6 @@ export function createStudyNotes(dependencies) {
       event.preventDefault();
       return;
     }
-    if (pendingStrokeWork) pendingStrokeIdleSince = 0;
     if (event.target?.closest?.("[data-crop-action]")) return;
     if (!studyMode && !isEditableNow()) { explainBlockedEdit(); return; }
     const touchCount = event.pointerType === "touch" ? activeTouchPointerIds.size : 0;
@@ -4907,7 +4918,7 @@ export function createStudyNotes(dependencies) {
     gesture.committed = true;
     const isHighlighter = gesture.type === "highlighter";
     const element = {
-      id: randomId(), type: isHighlighter ? "highlighter" : "stroke", points: copyStrokePointsForCommit(gesture.points),
+      id: randomId(), type: isHighlighter ? "highlighter" : "stroke", points: prepareStrokePointsForCommit(gesture.points, strokePixelScale(gesture)),
       pressureEnabled: false,
       straightened: gesture.straightened === true,
       style: {
@@ -4918,14 +4929,40 @@ export function createStudyNotes(dependencies) {
       zIndex: elementZIndex(currentContent.elements), createdAt: new Date().toISOString()
     };
     currentContent = { ...currentContent, elements: [...currentContent.elements, element] };
-    // Promote the already visible draft before any idle render. This avoids a
-    // blank frame and makes an interrupted previous stroke immediately final.
-    gesture.previewPath?.setAttribute("data-element-id", element.id);
-    gesture.previewPath?.classList.add("note-element");
-    gesture.previewNode?.setAttribute("data-note-draft", "settled");
+    // Promote the already visible draft before the queued flush renders the
+    // element. This avoids a blank frame, makes an interrupted previous stroke
+    // immediately final, and shows exactly the committed geometry (including
+    // the samples of the last frame and the pen lift) while strokes are queued.
+    promoteDraftToElement(gesture, element);
     queueStrokeWork(gesture.before, currentContent, isHighlighter ? "ハイライト追加" : "ペン追加");
     drawingDiagnostics.strokesCommitted += 1;
     return true;
+  }
+
+  // Committed strokes that wait for the queued flush share one layer, so a
+  // long writing streak does not stack a page-sized SVG per stroke.
+  function settledDraftLayer(metrics) {
+    const existing = [...ui.stage.querySelectorAll('svg[data-note-draft="settled"]')]
+      .find(layer => layer.getAttribute("viewBox") === metrics.viewBox);
+    if (existing) return existing;
+    const layer = createSvgElement("svg", {
+      viewBox: metrics.viewBox, preserveAspectRatio: "none", class: "note-layer", "data-note-draft": "settled"
+    });
+    layer.style.zIndex = "30";
+    ui.stage.append(layer);
+    return layer;
+  }
+
+  function promoteDraftToElement(gesture, element) {
+    const node = gesture?.previewNode;
+    if (!node?.isConnected) return;
+    const metrics = gesture.pageMetrics || notePageMetrics(pages[currentPageIndex]?.size);
+    const nodes = strokeElementNodes(element, metrics);
+    nodes.forEach(item => item.setAttribute("pointer-events", "none"));
+    settledDraftLayer(metrics).append(...nodes);
+    node.remove();
+    gesture.previewNode = null;
+    gesture.previewPath = nodes[0] || null;
   }
 
   function finishPointerGesture(reason = "pointercancel", event = null, { interrupted = false } = {}) {
@@ -4942,6 +4979,7 @@ export function createStudyNotes(dependencies) {
     ui.editorView.classList.remove("pen-contact-active");
     clearStraightenTimer(gesture);
     const drawingGesture = ["pen", "highlighter"].includes(gesture.type);
+    if (drawingGesture) lastDrawingActivityAt = startedProcessingAt;
     if (drawingGesture && gesture.straightened) {
       if (event && event.pointerId === gesture.pointerId) {
         const terminal = gesturePoint(event, gesture.pageRect);
@@ -5120,7 +5158,15 @@ export function createStudyNotes(dependencies) {
       else gesture.previewNode.append(path);
       gesture.previewPath = path;
     }
-    gesture.previewPath.setAttribute("d", pathData(points, metrics));
+    // The draft shows the geometry the stroke will be committed with, so the
+    // line does not shift when the pen lifts.
+    gesture.previewPath.setAttribute("d", strokePathData(prepareStrokePointsForCommit(points, strokePixelScale(gesture)), metrics.width, metrics.height));
+  }
+
+  // Smoothing and thinning work in the CSS pixels of the page as it was shown
+  // while the stroke was written.
+  function strokePixelScale(gesture) {
+    return { pixelWidth: Number(gesture?.pageRect?.width) || 0, pixelHeight: Number(gesture?.pageRect?.height) || 0 };
   }
 
   function drawSelectionRect(start, end) {
@@ -5364,6 +5410,7 @@ export function createStudyNotes(dependencies) {
     if (!isEditableNow()) { explainBlockedEdit(); return; }
     const session = captureUserSession();
     assertUserSession(session);
+    settlePendingStrokes();
     const initialContext = {
       uid: session.uid,
       noteId: currentNote.id,
@@ -5465,6 +5512,10 @@ export function createStudyNotes(dependencies) {
     const actionPage = pages[index] || pages[currentPageIndex];
     if (!canMutateCurrentNote(currentNote, { page: actionPage, allowConflict: false })) return;
     const session = captureUserSession();
+    assertUserSession(session);
+    // Page actions can delete or replace the current page. Settle the current
+    // page's Pencil queue first, as addPage does.
+    await flushPendingStrokeWork({ throwOnError: true });
     assertUserSession(session);
     if (action === "up" || action === "down") {
       const target = action === "up" ? index - 1 : index + 1;
@@ -5573,6 +5624,7 @@ export function createStudyNotes(dependencies) {
     const base = scope === "future" ? currentNote.defaultBackground : page.background;
     const choice = prompt("背景を選択してください: blank / ruled", base?.type || "blank")?.trim().toLowerCase();
     if (!choice || !["blank", "ruled"].includes(choice)) return;
+    settlePendingStrokes();
     const before = historySnapshot();
     const background = {
       ...DEFAULT_BACKGROUND,
@@ -5674,6 +5726,7 @@ export function createStudyNotes(dependencies) {
     const elements = selectedElements();
     const masks = selectedMasks();
     if (!elements.length && !masks.length) return;
+    settlePendingStrokes();
     const before = clone(currentContent);
     if (action === "delete") {
       if (masks.length > 1 && !confirm(`選択した${masks.length}個のマスクを削除しますか？`)) return;
@@ -5760,6 +5813,7 @@ export function createStudyNotes(dependencies) {
   function pasteSelection() {
     if (!internalClipboard.length) return;
     if (!isEditableNow()) { explainBlockedEdit(); return; }
+    settlePendingStrokes();
     const before = clone(currentContent); const ids = [];
     internalClipboard.forEach(item => {
       const copy = { ...clone(item), id: randomId() };

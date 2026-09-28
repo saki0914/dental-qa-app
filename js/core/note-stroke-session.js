@@ -134,8 +134,3 @@ export function flushStrokePoints(session, { ensureRenderable: _ensureRenderable
   }
   return session.points;
 }
-
-export function copyStrokePointsForCommit(points) {
-  if (!Array.isArray(points)) return [];
-  return points.map(point => ({ ...point }));
-}

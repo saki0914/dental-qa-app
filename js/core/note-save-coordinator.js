@@ -5,6 +5,11 @@ export function createNoteSaveCoordinator({
   localStore,
   persist,
   debounceMs = 850,
+  // How many more milliseconds a debounced cloud save should wait, for
+  // example while the user is still writing. It receives how long the save
+  // has already been held. Explicit flush(), flushAll() and recover() never
+  // wait.
+  cloudSaveHoldMs = () => 0,
   onStatus = () => {},
   isSessionCurrent = () => true
 }) {
@@ -62,7 +67,8 @@ export function createNoteSaveCoordinator({
       latestMutation: null,
       lastError: null,
       conflicted: false,
-      disposed: false
+      disposed: false,
+      heldSince: 0
     });
     const state = states.get(key);
     state.identity = mergeIdentity(state.identity, identity, {
@@ -111,6 +117,7 @@ export function createNoteSaveCoordinator({
     const generation = state.generation;
     const content = structuredClone(state.latest);
     state.dirty = false;
+    state.heldSince = 0;
     onStatus(globalThis.navigator?.onLine === false ? "offline" : "saving", activeIdentity);
     const running = (async () => {
       try {
@@ -182,7 +189,7 @@ export function createNoteSaveCoordinator({
         if (state.running === running) state.running = null;
         if (isStateStillValid(state, { identity: state.identity, requireDirty: true }) &&
             state.latest && state.generation !== generation) {
-          void execute(state.identity, state).catch(() => {});
+          armCloudSave(state, state.identity, state.generation, 0);
         }
       }
     })();
@@ -227,12 +234,32 @@ export function createNoteSaveCoordinator({
     if (!isStateStillValid(state, { generation, identity: effectiveIdentity, requireDirty: true })) return;
     onStatus("local-saved", effectiveIdentity);
     onStatus("editing", effectiveIdentity);
+    armCloudSave(state, effectiveIdentity, generation, debounceMs);
+  }
+
+  // Starts the cloud save of `generation` after `delay`, and keeps
+  // postponing it while the host holds cloud saves.
+  function armCloudSave(state, identity, generation, delay) {
+    clearTimeout(state.timer);
+    state.timer = null;
     const timer = setTimeout(() => {
       if (state.timer === timer) state.timer = null;
-      if (!isStateStillValid(state, { generation, identity: effectiveIdentity, requireDirty: true })) return;
-      void execute(effectiveIdentity, state).catch(() => {});
-    }, debounceMs);
-    if (isStateStillValid(state, { generation, identity: effectiveIdentity, requireDirty: true })) state.timer = timer;
+      if (!isStateStillValid(state, { generation, identity, requireDirty: true })) return;
+      const now = Date.now();
+      if (!state.heldSince) state.heldSince = now;
+      let hold = 0;
+      try {
+        hold = Math.max(0, Number(cloudSaveHoldMs({ identity, heldMs: now - state.heldSince })) || 0);
+      } catch (error) {
+        console.warn("クラウド保存の保留判定に失敗したため、保存を続けます。", error);
+      }
+      if (hold > 0) {
+        armCloudSave(state, identity, generation, hold);
+        return;
+      }
+      void execute(identity, state).catch(() => {});
+    }, Math.max(0, Number(delay) || 0));
+    if (isStateStillValid(state, { generation, identity, requireDirty: true })) state.timer = timer;
     else clearTimeout(timer);
   }
 
