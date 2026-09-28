@@ -1,0 +1,28 @@
+name: Verify e8c4f8e E2E
+
+on:
+  push:
+    branches:
+      - codex/verify-e8c4f8e
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium webkit
+      - run: npm run test:e2e
+      - run: npm run test:e2e:authenticated
