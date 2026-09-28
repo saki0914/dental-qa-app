@@ -7,13 +7,14 @@
 | 文書名 | Dental QA App 学習ノート機能 仕様書・詳細設計書 |
 | 対象リポジトリ | `/Users/sakin/dev/dental-qa-app` |
 | 調査基準HEAD | `e8c4f8e95e6401d722fa5e1dcb035ec044f583b1` |
+| 改訂1 | 2026-09-28。不具合修正と水平展開、CRUD高速化、テキスト描画の修正を実装し本文へ反映（コミット`7315b12`、変更一覧は付録C） |
 | 作成日 | 2026-09-28 |
 | 対象クライアント | iPad Safari、Desktop Safari／Chrome、ホーム画面追加版 |
 | 本番配信 | GitHub Pages |
 | バックエンド | Firebase Authentication、Firestore、Storage |
 | ローカル検証 | Firebase Local Emulator Suite、project ID `demo-dental-qa` |
-| 文書状態 | 設計ドラフト。現行実装の監査結果と目標仕様を分離して記載したもので、受入値の合意や全項目の実装済みを意味しない |
-| 今回の検証 | 文書構成・整合性の確認のみ。製品コードの自動テストとiPad実機テストは未実行 |
+| 文書状態 | 設計ドラフト（改訂1）。現行実装の監査結果と目標仕様を分離して記載したもので、受入値の合意や全項目の実装済みを意味しない。「改訂1」と明記した記述は改訂1のコミットで実装済みの事実を表す |
+| 今回の検証 | 改訂1: `npm run check`、unit、Rules、E2E（未認証・認証）をLinux Chromium＋`demo-dental-qa` Emulatorで実行し成功（結果は付録C.6）。WebKit（iPad Portrait／Landscape）プロジェクトとiPad実機テストは未実行 |
 
 > **最重要事項**
 > 2026-09-28時点で、GitHub Pages上のiPad実機における「ノートを開いてから操作可能になるまでの時間」は、利用者が改善を体感できていない。自動テストが成功しても、それだけで実機の性能達成を意味しない。本書では読込遅延を未解決のP0として扱い、実測値が受入基準を満たすまで「改善済み」と判定しない。
@@ -85,6 +86,7 @@
 | command型Undo | 未実装または部分実装 | 入力hot pathから全ページcloneを外す目標設計 |
 | `startupDebug=1`による安全な本番観測 | 未実装 | 実機P95判定の前提工程 |
 | 読込性能 | 実機で未達または未立証 | P0の既知不具合 |
+| テキスト入力と確定表示の一致 | 改訂1で実装・Chromiumで自動検証済み、iPad実機確認要 | 9.5節と25.5節の規則を回帰条件とする |
 
 ---
 
@@ -107,6 +109,8 @@
 | Mac LAN + iPad | iPad実機受入 | `demo-dental-qa` Emulator |
 
 `?firebaseEmulator=1`が指定された場合はAuth、Firestore、Storageの全てをEmulatorへ接続し、一つでも接続確認に失敗した場合はクラウド操作を停止する。本番Firebaseへフォールバックしてはならない。
+
+Firestore Emulatorの接続確認は、ルートへの`no-cors`到達確認で行う（改訂1）。以前の`ruleCoverage`取得は長時間の検証後に集計へ数秒以上かかり、正常なEmulatorを停止中と誤判定してエディタ起動を`fatal-error`にしていた。
 
 ## 5. 画面構成
 
@@ -173,11 +177,14 @@ emulatorHost={MAC_LAN_IP}
 
 サムネイルはキャッシュを利用し、一覧表示のたびに全ページを高解像度描画しない。生成失敗時のみ種別ラベルへフォールバックする。
 
+改訂1: ノートルートの`updatedAt`がキャッシュ時と一致し、端末内に未同期の下書き・保存待ち・未送信画像がない場合は、IndexedDB `thumbnails`ストアの一覧サムネイル索引（kind `note-card-thumbnail-index`）から表示し、ページ一覧とページJSONの取得を省略する。教材連携ページは教材の画像とマスクの識別子も一致を確認する。ページ内容の保存、ページ背景・種別の変更、並び替え、追加、削除はいずれもノートルートの`updatedAt`を更新する。
+
 ### 6.2 一覧対象
 
 - `status`が未設定または`ready`で、`deletedAt`がないノートだけを通常一覧へ表示する。
 - `creating`、`failed`、`deleting`は通常一覧へ表示しない。
 - 復旧可能な失敗ノートは、専用の復旧導線から再試行または削除できる。
+- 最終編集日時の新しい順に並べる。比較はタイムスタンプの数値で行う（改訂1で、日付文字列の辞書順比較により曜日名順に並ぶ不具合を修正）。
 
 ## 7. ノート作成
 
@@ -316,6 +323,14 @@ fatal-error
 - `autoHeight: true`を既定とし、内容に必要な高さ未満へ切り詰めない。
 - 左、中央、右揃え、フォント、太字、斜体、色、透明度、行間、ボックス幅を再編集できる。
 - 編集画面とPDFで同じ行分割、行高、配置を用いる。
+- テキストツールで短くタップした場合（ドラッグ幅がページ幅の4%未満）は、既定のボックス（ページ幅の35%、高さ12%）を作る。ドラッグした場合は最小幅8%、最小高さ4%とする。Apple Pencilの微小な揺れで、1文字ごとに改行される極細ボックスを作らない（改訂1）。
+- 旧版で保存された幅4%未満のボックスは、再編集時に既定幅へ補正する（改訂1）。
+- テキストツールの当たり判定はテキスト要素だけを対象とし、上に描いた線や図形でテキストの再編集を妨げない（改訂1）。
+- 入力中にボックスの外をタップした場合は入力を確定するだけで、新しいボックスを作らない。iPadのキーボードを閉じられることを優先する（改訂1）。
+- 既存テキストの文字を全て消して確定した場合は要素を削除し、Undoで戻せる。履歴名は「テキスト削除」とする（改訂1）。
+- 入力中の`textarea`は16px以上で描画し、実寸が16px未満の場合はCSS transformで縮小表示する。折返し幅、文字サイズ、行位置は確定後のSVG表示と一致させ、ズームや画面回転でページ寸法が変わった場合も追従する（改訂1）。
+- 日本語変換中はUndo／Redoと確定を行わず、変換確定を促す。描画操作中のUndo／Redoも操作終了後に行う（改訂1）。
+- 行分割、計測、ベースラインの規則は25.5節に従う。
 
 ### 9.6 画像
 
@@ -352,7 +367,9 @@ fatal-error
 - ページ追加、複製、削除、並び替えを行う。
 - Apple Pencilモードでは、Pencilを描画、1本指をパン／左右ページ移動、2本指をピンチズームへ割り当てる。
 - ページ移動設定は「左右スワイプ」「ボタンのみ」を持つ。
-- ページ切替前にIndexedDB下書きを確定し、クラウド保存は直列キューへ送る。
+- ページ切替前にIndexedDB下書きを確定し、クラウド保存は直列キューへ送る。ページ切替はIndexedDB下書きの確定だけを待ち、クラウド保存の完了を待たない（改訂1で既定化）。
+- 離れたページのクラウド保存の失敗・競合は保存状態へ集約して表示し（13.2節）、ページ一覧の該当ページに競合表示を付ける（改訂1）。
+- ページ切替ではページ一覧を再構築せず、生成済みサムネイルを保持する（改訂1）。
 - 現在ページの前後1ページだけを軽量に先読みする。
 
 ## 11. ズーム・パン
@@ -412,6 +429,7 @@ conflict
 - 4文字分を基本とし、長い表示は三点リーダーで省略する。
 - 完全な説明はタップ時ポップオーバー、`title`、`aria-label`で確認できる。
 - 状態切替でヘッダー、ページ位置、ズーム、スクロール、ツールパレット位置を変えない。
+- 保存状態はページごとに保持し、次の優先順で一つを表示する（改訂1）: 現在ページの競合、他ページの競合、端末内保存の失敗、クラウド保存の失敗、オフライン、保存中、現在ページの未保存、他ページのクラウド保存待ち、保存済み。原因が他ページの場合は、詳細文にページ番号を示す。
 
 ### 13.3 保存失敗
 
@@ -583,7 +601,7 @@ baseRevision
 - Emulator URLから本番へフォールバックしない。
 - Auth確定前は、他セッションのIndexedDB manifestやsnapshotをDOMへ描画しない。読込み途中のAuth変更は`authEpoch`とuidを再確認して古い応答を破棄する。
 - `contentHash`はキャッシュ整合性と冪等再送の根拠であり、認可の境界ではない。認可はFirebase RulesとAuth uidで強制する。
-- 現行実装は`crypto.subtle`非対応時に`Date.now()`を含む非決定的な代替値を作るため、HTTP LAN環境では同一内容のhashが変わる既知不具合がある。目標設計は同梱した決定的SHA-256 fallbackを使い、`crypto.subtle`と同じcanonical bytesから同じdigestを生成する。提供できない環境ではcloud mutationを開始せず`offline-local`とする。
+- `crypto.subtle`非対応または失敗時は、同梱した決定的SHA-256（`js/core/sha256.js`）で`crypto.subtle`と同じbytesから同じdigestを生成する（改訂1）。以前の`Date.now()`を含む非決定的な代替値は廃止し、HTTP LAN環境でも同一内容の再送が同じhashとrevision pathになる。
 
 ---
 
@@ -608,7 +626,9 @@ baseRevision
 | `js/core/note-input-guard.js` | pen／touch分離、掌抑止、入力診断capture |
 | `js/core/note-geometry.js` | 正規化座標、選択、変形、投げ縄、線端点 |
 | `js/core/note-renderer.js` | Canvas／PDF向け共通レンダリング |
-| `js/core/note-text-layout.js` | 日本語折返し、必要高さ、行分割 |
+| `js/core/note-text-layout.js` | 日本語折返し、禁則、共通フォント、基準サイズ計測、ベースライン、必要高さ、テキスト枠の既定値 |
+| `js/core/sha256.js` | 決定的SHA-256（`crypto.subtle`非対応環境用、改訂1） |
+| `js/core/bounded-concurrency.js` | 同時実行数を制限した並列処理。失敗後は新規開始を止め、開始済みの完了を待って最初のエラーを返す（改訂1） |
 | `js/core/note-pdf-export.js` | PDF用途、範囲、フッター、ファイル名、共有 |
 
 ### 21.1 設計上の分離目標
@@ -875,6 +895,8 @@ DB名は`dentalQaNoteLocal`、現行versionは2とする。
 
 ユーザー切替時に他ユーザーのrecordを読まない。
 
+改訂1: iPad Safariがバックグラウンド等で接続を閉じた場合（`InvalidStateError`、connection lost）は、保持している接続を破棄し、同じ操作を新しい接続で1回だけ再試行する。transactionは同期的に開始し、閉じた接続では書込み前に失敗するため、再試行で二重書込みにならない。失敗したopenは保持せず、次の保存で再試行する。`versionchange`を受けた接続は閉じる。DB versionは2のまま変更しない。`thumbnails`ストアへ一覧サムネイル索引（kind `note-card-thumbnail-index`、再生成可能）を保存するが、ストアとキー構造は変更しない。
+
 version upgradeは`onblocked`を表示し、旧タブの`versionchange`でDBをcloseさせる。複数タブが残っている状態でupgrade transactionを無限待ちせず、読み取り専用、再試行、一覧へ戻る操作を示す。
 
 `cache-valid`ページsnapshotとresourceは`contentHash`、byte size、MIME、asset signatureを持つindex recordから参照する。dirty draft、pending save、pending asset、conflictは再生成可能なresource cacheと同じprune対象に入れない。
@@ -896,13 +918,13 @@ sequenceDiagram
   A->>F: SDK初期化・Auth状態待機
   F-->>A: user
   A->>E: refresh/openNote
-  E->>S: getNote
-  par 並列
+  par 並列（改訂1: getNoteも同時に開始）
+    E->>S: getNote
+    E->>S: listPages
     E->>E: editor lease確保
     E->>I: 4 storeをnote prefix検索
-    E->>S: listPages
-    E->>E: linked material準備
   end
+  Note over E: linked material準備はgetNote完了直後に開始し、上の並列処理と重ねる
   E->>I: pending asset/save復旧
   E->>S: current page JSON取得
   E->>S: background/assets取得
@@ -915,8 +937,8 @@ sequenceDiagram
 次はコードから確認できるクリティカルパスであり、実機計測により寄与率を確定する。
 
 1. Firebase SDK初期化とAuth状態確定がノートmetadata取得より前に必要。
-2. Firestoreのノートルート取得とページ一覧取得が別round trip。
-3. 編集リースのclaim確認待ちが初回編集可能時刻へ含まれる。
+2. Firestoreのノートルート取得とページ一覧取得が別round trip（改訂1で同時開始に変更）。
+3. 編集リースのclaim確認待ちが初回編集可能時刻へ含まれる（改訂1でノート取得と同時に開始し、待ち時間を重ねる）。
 4. IndexedDBの4 store検索とBlob復元が初回表示前へ入る。
 5. pending asset復旧とpending save復旧が、データが存在する場合に直列となる。
 6. 現在ページJSON、背景Blob、貼付画像の取得が初回表示のcritical pathへ入る一方、現行の`first-visible-page`系markは画像decodeと実paintの完了を保証しない。
@@ -1154,6 +1176,28 @@ function clientToNormalizedPagePoint(clientX, clientY, pageRoot) {
 - 非選択要素は静的レイヤーへ保持する。
 - 変形中は選択要素プレビューとUIだけを更新する。
 - 背景Blobを`pointermove`ごとに再取得・再decodeしない。
+- 連続するベクター要素（線、図形、テキスト）は一つのSVGへまとめる。画像を挟む場合はSVGを分け、zIndex順を保つ（改訂1。以前は要素ごとにページ全面のSVGを作っていた）。
+- ストロークの確定は、選択・トリミング中でなく既存要素の順序が変わっていない場合に限り、既存SVGへの追記だけで反映し、ページ全体を再描画しない（改訂1）。
+- 現在ページのサムネイル再生成は、手書き入力が900ms以上途切れるまで遅延する（改訂1）。
+- ページ座標rootと各レイヤーの一致判定は、ズーム倍率に応じてclient座標の許容誤差を広げる（1 CSS px×ズーム倍率）。ズーム中の丸め誤差で入力面を無効にしない（改訂1）。
+
+### 25.5 テキストの行分割・計測（改訂1）
+
+`note-text-layout.js`が、入力中の`textarea`、SVGページ、Canvas（サムネイル、PDF）の行分割、行高、ベースラインを一元的に決める。
+
+| 項目 | 規則 |
+|---|---|
+| フォント | `system-sans`は"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Noto Sans CJK JP", "Yu Gothic", YuGothic, Meiryo, sans-serif。明朝体、等幅も同様に全描画面で同じスタックを使う。SVGの`font-family`属性は汎用名とし、同じスタックをCSSで指定する |
+| 分割単位 | 明示改行（CRLFはLF）、空白、英単語（ハイフン後は分割可）、CJKは1文字。書記素クラスタ（`Intl.Segmenter`）を分割しない。タブは空白4つ |
+| 空白 | 行末の空白はぶら下げとし、折返しを起こさず描画もしない（中央・右揃えをずらさない） |
+| 禁則 | CSS `line-break: normal`相当。行頭禁止は句読点、閉じ括弧類、`々`などの繰返し記号、`・`、`％`など。行末禁止は開き括弧類、`￥`、`＄`。小書き仮名と長音は行頭に置ける（`strict`はブラウザ間で実装差が大きいため採用しない） |
+| はみ出し | 1行に収まらない単位は、禁則を無視して書記素単位で分割する（`overflow-wrap: anywhere`と同じ） |
+| 計測 | Canvasの基準サイズ100pxで計測して比例換算する。小さい描画サイズの丸め差で、ページ、サムネイル、PDF、入力中の表示が別の位置で改行しないようにする。許容誤差は幅の0.005%（最小0.01px） |
+| 字間 | カーニングを無効化する（CSS `font-kerning: none`、Canvas `fontKerning = "none"`）。全角約物の詰めを無効化し（CSS `text-spacing-trim: space-all`、`text-autospace: no-autospace`）、Canvasでは隣接する全角約物の間で計測・描画の区間を分ける |
+| ベースライン | CSSのhalf-leadingと同じく`(行高 - (ascent + descent)) / 2 + ascent`。ascent／descentは`fontBoundingBoxAscent／Descent`、取得できない環境では0.88／0.12倍。SVGは各行を絶対y座標の`tspan`で置き、空行も行送りする |
+| 縮小描画 | サムネイルとPDFのCanvas描画に最小フォントサイズを設けず、ページと同じ改行位置で縮小描画する |
+
+検証: Linux Chromiumで、2書体×4文字サイズ×3行間×4幅×9文例の864件について、入力中の`textarea`と同じ条件のDOM行分割と本レイアウトの結果を比較し、861件が完全一致した。残る3件はLinuxのフォントサイズ量子化による境界ケース（1文字の移動）である。iPad Safariでの一致は37章の実機受入で確認する。
 
 ## 26. Apple Pencil入力詳細設計
 
@@ -1237,6 +1281,8 @@ AddStrokeCommand
 
 Undoは`strokeId`削除、Redoは同じ位置への再追加とする。
 
+改訂1（部分実装）: 手書きの履歴は、バッチの先頭で追記前の内容を1回だけcloneし、以降は要素配列の構造共有で作る。ページメタデータのsnapshotもバッチ内で共有する。履歴snapshotは読出し時に必ずcloneして使い、共有部分を書き換えない。command型への移行は目標設計のまま残す。
+
 ## 27. 保存詳細設計
 
 ### 27.1 ローカル先行保存
@@ -1269,10 +1315,12 @@ sequenceDiagram
 
 アップロード前にルート文書の`pendingStoragePaths`へpathを追加する。Firestore確定後にjournalから外す。失敗時は物理削除し、削除失敗は`pendingCleanups`へ記録する。
 
+改訂1: journalの追加は、ノートルートの読取りと`arrayUnion`による1回の更新で行う。読取りでノートが存在しない、削除済み、作成失敗、またはjournalが上限（1000件）に達している場合は、アップロードせずに拒否する。上限はFirestore Rulesでも強制する。以前の読取り＋書込みtransactionは、同じノートへ複数ページの保存やPDFページのアップロードが重なると再試行と待機を繰り返していた。読取り後にノートが削除された場合は、アップロード後のcommit transactionが拒否し、アップロード済みobjectとjournalの項目を補償削除する。
+
 ### 27.4 hash・再送・遅延応答
 
 - JSONはキー順、数値表現、改行、Unicodeを固定したcanonical bytesからSHA-256を作る。Blobはそのbyte sequence自体をhash化する。
-- `crypto.subtle`がないHTTP LAN環境でも同一digestになる決定的fallbackを同梱する。現行の時刻依存fallbackは冪等性を満たさないため使用しない。
+- `crypto.subtle`がないHTTP LAN環境でも同一digestになる決定的fallbackを同梱した（改訂1、`js/core/sha256.js`）。冪等性を満たさない時刻依存fallbackは廃止した。
 - mutationごとにcanonical payload、hash、pathを`pendingSaves`へ先に耐久化し、結果不明の再送で同じ組を使う。
 - Firestore transactionのexpected revision不一致だけをrebaseの契機とし、Storageの既存object、hash不一致、認可失敗は別エラーとする。
 - クラウド再検証やsave応答は`authEpoch`、`verificationGeneration`、`localMutationGeneration`、`clientMutationId`を照合し、古い世代の応答で現在のrevisionやsave stateを上書きしない。
@@ -1288,6 +1336,18 @@ sequenceDiagram
 | pending cleanup | 失敗path、発生日時、最終試行、retry count、エラー分類を保持し、指数backoffで再試行 |
 
 GCは保存hot pathで同期実行しない。物理削除前にFirestoreの参照とIndexedDBのpendingを再確認し、結果不明時は削除せず再試行する。
+
+### 27.6 CRUDの並列化・バッチ化（改訂1）
+
+| 操作 | 設計 |
+|---|---|
+| 一覧 | ノートコレクションの読込み1回と端末内4ストアの走査を並列に行い、同じ読込み結果を一覧表示と作成中ノートの補償判定に使う。補償判定（24時間以上`creating`のノート）は10分に1回だけ行う。復旧処理後の一覧再描画は、競合・未同期件数が変わった場合だけ行う |
+| 起動 | 23.1節のとおり、ノート、ページ一覧、編集リース、端末記録を同時に読み込む |
+| 更新 | ページ背景・種別の変更は、対象ページとノートルートの`updatedAt`（必要なら`defaultBackground`）を一つのbatchで原子的に書き込む（400ページごとに分割）。以前はページごとに別の書込みで、途中失敗時に一部のページだけが変わり得た。名前変更は読込み済み一覧の該当ノートだけを更新する |
+| 作成 | PDFノートはページ画像のアップロードを次ページの変換と重ね、同時アップロードを最大2件とする。失敗時は開始済みアップロードの完了を待ってから補償削除する |
+| 複製 | ページ内容のコピーを最大3ページ並列で行う。失敗時は開始済みの処理を待ってから補償する。専用エディタでは一覧を読み込まず、完了を通知する |
+| 削除 | 一覧から即時に除外し、端末内下書きの再計算は背景で行う。専用エディタで削除した場合はノート一覧画面へ戻る。Storageの補償削除は最大4件並列とする |
+| 端末内保存 | IndexedDB下書き保存時の余分な`structuredClone`を削除する（IndexedDBがput時に複製する）。線要素の正規化は直線・矢印だけを複製する |
 
 ## 28. 一時UI詳細設計
 
@@ -1406,6 +1466,8 @@ Canvas描画は編集画面と共通の`note-renderer.js`および`note-text-lay
 | E2E authenticated | 実Auth／Firestore／Storage処理 | `demo-dental-qa` Emulator |
 | iPad実機 | Pencil、Safari、体感性能、gesture | LAN Emulator／本番候補 |
 
+移行元の正式化レポート（iCloud Drive上のデータ）に依存するテストは、レポートが存在しない環境では理由を表示してskipする（改訂1）。レポートがあるMacでは従来どおり実行する。
+
 ## 33. 起動性能テスト
 
 ### 33.1 データセット
@@ -1506,7 +1568,7 @@ Canvas描画は編集画面と共通の`note-renderer.js`および`note-text-lay
 - Firebase SDKはブラウザとnpmで12.16.0へ固定されている。
 - 専用エディタルートでは画像暗記・問題管理moduleの動的importを省略する。
 - 起動spanとcounterを`__noteEditorStartupMetrics`へ公開する。
-- note metadata取得後、editor lease、IndexedDB、page metadata、教材準備を並行開始する。
+- note metadata、page metadata、editor lease、IndexedDB走査を同時に開始し、教材準備はnote metadata取得直後に開始する（改訂1）。
 - Cache APIとIndexedDBに背景resource cacheを持つ。
 - page単位保存queue、mutation識別子、編集リース、復旧状態を持つ。
 - 起動エラーUI、保存状態、診断JSON、ローカルEmulator接続が実装されている。
@@ -1523,7 +1585,7 @@ Canvas描画は編集画面と共通の`note-renderer.js`および`note-text-lay
 | 作成中revision | `note-store.js` の`createNote()`、`createCreatingNote()`、`pageDocument()`、`finalizeNoteCreation()` | unit/Emulator E2E | 未実行 |
 | 復元コピーの自立化 | `study-notes.js` の`createRecoveredDraftCopy()` | authenticated E2E | 未実行 |
 
-この表はコード上の存在とテストの存在を示すだけで、本書作成時点のテスト成功を意味しない。
+この表はコード上の存在とテストの存在を示すだけで、本書作成時点のテスト成功を意味しない。改訂1での実行結果は付録C.6に記載する。
 
 ### 38.2 未解決
 
@@ -1537,15 +1599,19 @@ Canvas描画は編集画面と共通の`note-renderer.js`および`note-text-lay
 | GAP-ASSET-01 | PDF取込用pdf.jsが外部CDN依存 | P1 |
 | GAP-ASSET-02 | Firebase browser moduleが`www.gstatic.com`外部originに依存 | P1 |
 | GAP-DEVICE-01 | Apple Pencil／gestureは自動テストだけで完全再現できない | P0実機確認 |
-| GAP-HASH-01 | HTTP LANで`crypto.subtle`がない場合の現行hashが非決定的 | P0 |
+| GAP-HASH-01 | HTTP LANで`crypto.subtle`がない場合の現行hashが非決定的 | 解消（改訂1） |
 | GAP-STAGING-01 | 本番相当の専用performance stagingがない | P1 |
 | GAP-RACE-01 | cloud再検証timeout後の遅延応答を世代で無効化する仕組みが未実装 | P0 |
+| GAP-TEXT-01 | テキストの入力中表示と確定表示の改行一致をiPad Safari実機で未確認（Linux Chromiumでは864件中861件一致） | P1実機確認 |
+| GAP-TEST-01 | 改訂1でWebKit（iPad Portrait／Landscape）のE2Eプロジェクトを未実行 | P1 |
 
 ### 38.3 結論
 
 現行実装には性能対策のコードがあるが、利用者が報告した実機遅延は解決したと判断できない。次の作業は新しい最適化案の追加ではなく、同一実機のstartup診断を採取し、最長spanとLong Taskを特定し、1ボトルネックずつ除去してP95を再測定することから開始する。
 
 ## 39. 実装優先順位
+
+改訂1の運用: コードから原因と効果が明らかな不具合修正とクリティカルパス短縮（直列round trip、不要なclone、全体再描画、transaction競合）は、Phase 0-0／Phase 0の計測を待たずに実施する。読込性能の完了判定（40章）は引き続き実機計測を必須とする。
 
 ### Phase 0-0: 診断基盤の実装と取得可能性確認
 
@@ -1621,6 +1687,13 @@ npm run local:smoke
 
 # 全自動テスト
 npm run test:all
+
+# 個別実行（改訂1で使用）
+npm run check
+npm run test:unit
+npm run test:rules
+npm run test:e2e
+npm run test:e2e:authenticated
 ```
 
 LAN環境はHTTPのため、Clipboard APIとWeb Share APIを利用できない場合がある。長押しペースト、写真／ファイル選択、PDFダウンロードを代替とする。
@@ -1637,3 +1710,82 @@ LAN環境はHTTPのため、Clipboard APIとWeb Share APIを利用できない�
 - [ ] 失敗時に復旧UIと一覧へ戻る操作があるか
 - [ ] Emulator以外の本番データをテストで操作していないか
 - [ ] 自動テスト結果とiPad実機結果を混同していないか
+
+## 付録C 改訂1（2026-09-28）の変更一覧
+
+コードの変更はコミット`7315b12`（`fix: note text rendering parity, save-state visibility and faster CRUD`）、本書の更新はその次のコミットで行った。
+
+### C.1 不具合修正（文字描画）
+
+| 不具合 | 影響 | 修正 |
+|---|---|---|
+| テキストツールのタップでPencilがわずかに動くと、極細のボックスが作られた | 1文字ごとに改行され、文字が縦に並ぶ | ドラッグ幅4%未満は既定ボックスとし、旧データは再編集時に補正 |
+| 入力欄（16px未満の文字も16pxで表示、汎用フォント）と確定後のSVG（実寸、別の計測）で文字サイズと折返し幅が違った | 確定した瞬間に改行位置や行数が変わる | 共通フォントスタック、16px以上＋縮小表示、共通計測 |
+| SVGの1行目を上端＋フォントサイズに置き、以降を`dy`で累積していた | 入力中と行位置がずれ、空行が消える | half-leadingの絶対ベースライン、空行を保持 |
+| 禁則処理がなく、英単語の途中でも折り返していた | 句読点や閉じ括弧が行頭に来る。単語が分断される | 25.5節の規則 |
+| 行末の空白で折返しが発生し、中央・右揃えがずれた | 余分な改行、配置ずれ | 空白のぶら下げと描画時の除去 |
+| サムネイル・PDFのCanvas描画に最小8pxがあった | サムネイルで改行位置が変わり、枠外へはみ出す | 最小値を撤廃し比例縮小 |
+| Chromeは入力欄（DOM）でだけ仮名のカーニングと約物の詰めを行い、Canvasでは行わない | 入力中と確定後で改行位置が変わる | カーニングと約物の詰めを全描画面で無効化 |
+| テキストツールで線の上をタップすると新しい空ボックスになった | 既存テキストを再編集できない | テキストだけを当たり判定の対象にする |
+| 入力中にボックス外をタップすると新しいボックスが開いた | キーボードを閉じられない | 外側のタップは確定だけを行う |
+| 既存テキストの文字を全て消して確定すると元の文字に戻った | テキストを消せない | 要素を削除（Undo可能） |
+| 入力中にページが再描画されると、確定が古い要素へ書き込まれた | 編集内容が反映されない場合がある | 確定時に現在の要素を再取得 |
+| 変換中・描画中にUndo／Redoできた | 入力途中の内容が失われる | 確定・操作終了後に実行するよう案内 |
+
+### C.2 不具合修正（保存・データ・起動）
+
+| 不具合 | 影響 | 修正 |
+|---|---|---|
+| `crypto.subtle`がないHTTP LANでhashが時刻依存だった | 同一内容の再送が別のrevision pathになる（GAP-HASH-01） | 決定的SHA-256 |
+| 表示中以外のページの保存状態通知を捨てていた | ページ切替後の保存失敗・競合が表示されない | ページ別状態の集約表示とページ一覧の競合表示 |
+| ページ切替がクラウド保存の完了を待っていた（10章と不一致） | 通信状況によって切替が遅い | 端末内の確定だけを待つ |
+| iPad SafariがIndexedDB接続を閉じると、以後の下書き保存が全て失敗した | 再読込みまで端末内保存ができない | 再接続して1回再試行し、失敗したopenを保持しない |
+| 一覧の並び順を日付文字列の辞書順で比較していた | 最終編集日時の順にならない | 数値で比較 |
+| Firestore Emulatorの接続確認に`ruleCoverage`を使っていた | 長時間の検証後にエディタが起動失敗になる | `no-cors`の到達確認 |
+| ズーム時のレイヤー一致判定が1 CSS pxの丸め誤差で失敗した | 入力面の検証が不合格になる | 許容誤差をズーム倍率に比例させる |
+| ページ背景の一括変更をページごとに別々に書き込んでいた | 途中失敗で一部のページだけが変わる | batchで原子的に書き込む |
+
+### C.3 水平展開
+
+- 文字の計測・描画規則を、入力欄、SVGページ、サムネイル、PDFの全描画面へ適用した。
+- 不要なcloneの削除を、IndexedDB保存、保存coordinator、線要素の正規化、手書き履歴へ適用した。
+- 同時実行数を制限した並列処理を、Storageの補償削除、ノート複製、PDFノート作成へ適用した。
+- ページ別の保存状態を、保存通知、起動時の未送信データ、再試行成功時の状態更新へ適用した。
+- ノートルート`updatedAt`の更新をページメタデータ（背景、種別）の変更にも適用し、一覧サムネイル索引の判定を全変更経路で成立させた。
+
+### C.4 CRUD高速化とユーザビリティ（27.6節）
+
+| 操作 | 改訂前 | 改訂1 |
+|---|---|---|
+| 一覧表示 | コレクション読込みと端末内4ストア走査が直列。一覧更新のたびにコレクションを再読込みして補償判定。全カードでページ一覧とページJSONを取得 | 読込み1回と端末内走査を並列。補償判定は10分に1回。変更のないカードは索引から表示 |
+| ノートを開く | ノート取得の完了後にページ一覧、編集リース、端末内走査 | 4処理を同時に開始し、Firestore 1往復分と編集リースの確認待ちを重ねる |
+| 保存 | journal追加がtransaction（読取り＋書込み。同時保存では再試行と待機） | 読取り＋`arrayUnion` |
+| 手書きの確定 | ストロークごとにページ全体を2回clone、全要素を再描画、650ms後にサムネイル生成 | 構造共有、追記描画、入力が900ms途切れてからサムネイル生成 |
+| ページ切替 | クラウド保存の完了待ち、ページ一覧とサムネイルを毎回再構築 | 端末内の確定だけを待ち、一覧は状態だけ更新 |
+| 名前変更・削除 | 全ノート、端末内記録、サムネイルを再読込み | 読込み済みの一覧を更新（削除後の端末内記録は背景で再計算）。専用エディタでの削除後は一覧画面へ戻る |
+| PDFノート作成 | 変換とアップロードを1ページずつ直列 | アップロードを次ページの変換と重ねる（最大2件） |
+| ノート複製 | 1ページずつ直列 | 最大3ページを並列 |
+
+### C.5 データ安全性
+
+- Firestore／Storageのスキーマ、フィールド、パス、Security Rulesは変更していない。IndexedDBのversion（2）とストア構成も変更していない。
+- 新たに書き込むのは、ページメタデータ変更時のノートルート`updatedAt`と、再生成可能な`thumbnails`ストアの索引レコードだけである。
+- journalは改訂前と同じ事前検査（未存在、削除済み、作成失敗、上限）を行い、同じ補償処理を使う。
+- 検証は`demo-dental-qa` Emulatorだけで行い、本番Firebaseへの接続・書込み、Hosting／Rulesのデプロイは行っていない。
+
+### C.6 検証結果（2026-09-28、Linux Chromium＋Emulator）
+
+| 項目 | 結果 |
+|---|---|
+| `npm run check` | 成功 |
+| unit | 295件中287件成功、8件skip（移行元レポートなし） |
+| Rules | 19件中17件成功、2件skip（同上） |
+| E2E 未認証（Desktop Chromium） | 12件成功 |
+| E2E 認証（Desktop Chromium） | 63件中61件成功、1件skip（同上）。入力hot pathの時間判定1件は、別の処理と並行した回に18.4ms（基準16.7ms未満）となり、単独での再実行4回は全て成功（最大1.5ms） |
+| テキスト改行の一致（25.5節） | 864件中861件一致 |
+| 未実行 | WebKit（Desktop WebKit、iPhone、iPad Portrait／Landscape）のE2E、iPad実機受入（37章） |
+
+### C.7 省略した手順
+
+- `CLAUDE.md`／`AGENTS.md`にあるCodexとClaude CodeのAI会議・レビュー往復は、利用者の指示により省略した。代わりに差分の自己レビューとC.6の自動テストを行った。
+- 39章のPhase 0-0／Phase 0（実機診断基盤の実装と予備計測）は、コードから原因と効果が明らかな修正の前提にしなかった（39章冒頭の運用）。読込性能の完了判定は40章のとおり実機計測を必要とし、GAP-PERF-01〜03は未解決のまま残す。
