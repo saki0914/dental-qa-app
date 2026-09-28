@@ -5,7 +5,7 @@ import { deleteObject, ref, uploadBytes } from "firebase/storage";
 import { PDFDocument } from "pdf-lib";
 import { deflateSync } from "node:zlib";
 import { guardProductionFirebase } from "../helpers/readOnlyApp.mjs";
-import { createPdfFixture } from "../helpers/pdf-fixture.mjs";
+import { createPdfFixture, PDF_PAGE_GEOMETRY_FIXTURES } from "../helpers/pdf-fixture.mjs";
 
 const TEST_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -140,7 +140,7 @@ async function readNoteAssets(uid, noteId) {
   }
 }
 
-async function seedNotePageBackground(uid, noteId, pageId) {
+async function seedNotePageBackground(uid, noteId, pageId, { image = TEST_PNG, size = null } = {}) {
   const environment = await initializeTestEnvironment({
     projectId: "demo-dental-qa",
     firestore: { host: "127.0.0.1", port: 8080 },
@@ -149,10 +149,11 @@ async function seedNotePageBackground(uid, noteId, pageId) {
   const imagePath = `users/${uid}/notes/${noteId}/sourcePages/${pageId}/background.png`;
   try {
     const context = environment.authenticatedContext(uid);
-    await uploadBytes(ref(context.storage("gs://demo-dental-qa.firebasestorage.app"), imagePath), TEST_PNG, { contentType: "image/png" });
+    await uploadBytes(ref(context.storage("gs://demo-dental-qa.firebasestorage.app"), imagePath), image, { contentType: "image/png" });
     await updateDoc(doc(context.firestore(), "users", uid, "notes", noteId, "pages", pageId), {
       pageType: "pdf-source-page",
-      background: { type: "pdf-source-page", imagePath, sourcePageNumber: 1 }
+      background: { type: "pdf-source-page", imagePath, sourcePageNumber: 1 },
+      ...(size ? { size } : {})
     });
     return imagePath;
   } finally {
@@ -562,9 +563,9 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await expect(page.locator("#noteToolSettings"), "背景変更開始時に設定パネルを閉じる").toBeHidden();
   await expect.poll(() => dialogs.length).toBeGreaterThan(backgroundPromptCount);
 
-  await page.locator("#toggleNoteStudyBtn").click();
+  await page.locator("#noteStudyModeBtn").click();
   await expect(page.locator("#noteStudyControls")).toBeVisible();
-  await page.locator("#toggleNoteStudyBtn").click();
+  await page.locator("#noteEditModeBtn").click();
 
   await page.locator(".note-more-menu summary").click();
   await page.locator('[data-note-action="export"]').click();
@@ -761,8 +762,11 @@ test("@authenticated 固定線幅・ツール再タップ設定・長押し直�
     clientX: box.x + box.width * .45, clientY: box.y + box.height * .16
   });
   const penPath = stage.locator('path.note-element[data-element-id]').first();
+  const pageCoordinateWidth = await stage.locator("svg.note-layer").first().evaluate(node => (
+    node.viewBox.baseVal.width
+  ));
   await expect(penPath).toHaveAttribute("stroke", "#ef4444");
-  await expect(penPath).toHaveAttribute("stroke-width", "7.2");
+  expect(Number(await penPath.getAttribute("stroke-width"))).toBeCloseTo(pageCoordinateWidth * 72 / 10_000, 6);
   await expect(penPath).toHaveAttribute("stroke-opacity", "0.77");
 
   const highlighterButton = page.locator('[data-note-tool="highlighter"]');
@@ -787,7 +791,7 @@ test("@authenticated 固定線幅・ツール再タップ設定・長押し直�
   });
   const highlighterPath = stage.locator('path.note-element[data-element-id]').nth(1);
   await expect(highlighterPath).toHaveAttribute("stroke", "#6ce5ff");
-  await expect(highlighterPath).toHaveAttribute("stroke-width", "82");
+  expect(Number(await highlighterPath.getAttribute("stroke-width"))).toBeCloseTo(pageCoordinateWidth * 82 / 1_000, 6);
   await expect(highlighterPath).toHaveAttribute("stroke-opacity", "0.35");
 
   const eraserButton = page.locator('[data-note-tool="eraser-object"]');
@@ -2543,6 +2547,14 @@ test("@authenticated ユーザー削除済みノートがあってもページ�
     deletedMaterialRefs: []
   });
 
+  // The dedicated editor and the list tab each load the app-wide split state.
+  // Reload the remaining tab after closing the editor so a late, already
+  // queued settings save from the closed tab cannot make this replacement
+  // fixture look like a genuine second-device revision conflict.
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
+  await openNoteList(page);
+
   await page.locator("#pdfEditModeBtn").click();
   const materialRow = page.locator('#pdfEditTableBody tr:has-text("既定ノート更新E2E教材")');
   await materialRow.locator("[data-edit-pdf]").click();
@@ -2790,6 +2802,153 @@ test("@authenticated @ipad-v-next PDFを教材へ追加せずノート専用Stor
   expect(stored.pdfMaterials).toHaveLength(0);
   expect(blockedRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
+});
+
+test("@authenticated @ipad-page-coordinates 縦横・16:9・回転混在PDFは全レイヤーと9地点を同じページ座標へ投影する", async ({ page }) => {
+  test.setTimeout(180_000);
+  const user = await createUser();
+  await login(page, user);
+  const fixture = await createPdfFixture({ pageDefinitions: [
+    PDF_PAGE_GEOMETRY_FIXTURES.a4Portrait,
+    PDF_PAGE_GEOMETRY_FIXTURES.a4Landscape,
+    PDF_PAGE_GEOMETRY_FIXTURES.widescreen,
+    PDF_PAGE_GEOMETRY_FIXTURES.rotated90,
+    PDF_PAGE_GEOMETRY_FIXTURES.rotated270
+  ] });
+
+  await page.locator("#newNoteBtn").click();
+  const popupPromise = page.waitForEvent("popup", { timeout: 120_000 });
+  await page.locator('[data-create-note="pdf"]').click();
+  page = await popupPromise;
+  await guardProductionFirebase(page);
+  await page.waitForURL(url => url.searchParams.get("create") === "pdf", { timeout: 120_000 });
+  await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
+  await page.locator("#newNoteTitle").fill("混在PDF座標E2Eノート");
+  const chooserPromise = page.waitForEvent("filechooser");
+  await page.locator('[data-create-note="pdf"]').click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles({ name: "mixed-orientation.pdf", mimeType: "application/pdf", buffer: fixture });
+  await page.waitForURL(url => Boolean(url.searchParams.get("noteId")), { timeout: 120_000 });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 120_000 });
+
+  const noteId = new URL(page.url()).searchParams.get("noteId");
+  await expect.poll(async () => {
+    const note = (await readNotes(user.uid)).notes.find(item => item.id === noteId);
+    return note?.pages?.length || 0;
+  }, { timeout: 20_000 }).toBe(5);
+  const stored = await readNotes(user.uid);
+  const note = stored.notes.find(item => item.id === noteId);
+  const storedPages = [...note.pages].sort((a, b) => a.order - b.order);
+  expect(storedPages).toHaveLength(5);
+  expect(storedPages.map(storedPage => storedPage.background.pdfRotation))
+    .toEqual([0, 0, 0, 90, 270]);
+  await openPageSidebar(page);
+  const normalizedPoints = [0, .5, 1].flatMap(y => [0, .5, 1].map(x => ({ x, y })));
+
+  for (const [pageIndex, storedPage] of storedPages.entries()) {
+    await page.locator(`#notePageList [aria-label="${pageIndex + 1}ページを開く"]`).click();
+    await expect(page.locator("#notePageCounter")).toHaveText(`${pageIndex + 1} / ${storedPages.length}`);
+    await expect(page.locator("#notePageStage .note-background-image")).toBeVisible({ timeout: 20_000 });
+    const stage = page.locator("#notePageStage");
+    const capture = stage.locator('[data-layer="drawing-input"]');
+    const box = await stage.boundingBox();
+    expect(box).toBeTruthy();
+
+    for (const [pointIndex, point] of normalizedPoints.entries()) {
+      const insetX = Math.min(.995, Math.max(.005, point.x));
+      const insetY = Math.min(.995, Math.max(.005, point.y));
+      const pointerId = 5000 + pageIndex * 20 + pointIndex;
+      const event = {
+        pointerId, pointerType: "pen", button: 0,
+        clientX: box.x + box.width * insetX,
+        clientY: box.y + box.height * insetY,
+        width: 2, height: 2
+      };
+      await capture.dispatchEvent("pointerdown", { ...event, pressure: .5 });
+      await capture.dispatchEvent("pointerup", { ...event, pressure: 0 });
+    }
+    await expect(stage.locator("circle[data-element-id]")).toHaveCount(9);
+
+    const geometry = await stage.evaluate(node => {
+      const snapshot = element => {
+        const rect = element?.getBoundingClientRect();
+        return rect && { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+      };
+      const root = snapshot(node);
+      const layers = [
+        node.querySelector(".note-paper-layer"),
+        node.querySelector(".note-background-image"),
+        node.querySelector('[data-layer="elements"]'),
+        node.querySelector("svg.note-layer"),
+        node.querySelector('[data-layer="drawing-input"]'),
+        node.querySelector('[data-layer="masks"]')
+      ].map(snapshot).filter(Boolean);
+      const maximumLayerDeltaPx = Math.max(...layers.flatMap(rect => [
+        Math.abs(rect.left - root.left), Math.abs(rect.top - root.top),
+        Math.abs(rect.width - root.width), Math.abs(rect.height - root.height)
+      ]));
+      return {
+        root,
+        maximumLayerDeltaPx,
+        viewBox: node.querySelector("svg.note-layer")?.getAttribute("viewBox"),
+        circles: [...node.querySelectorAll("circle[data-element-id]")].map(circle => ({
+          x: Number(circle.getAttribute("cx")), y: Number(circle.getAttribute("cy"))
+        }))
+      };
+    });
+    expect(geometry.maximumLayerDeltaPx).toBeLessThanOrEqual(1);
+    expect(geometry.viewBox).toBe(`0 0 ${storedPage.size.width} ${storedPage.size.height}`);
+    geometry.circles.forEach((circle, pointIndex) => {
+      const expected = normalizedPoints[pointIndex];
+      const clientX = geometry.root.left + circle.x / storedPage.size.width * geometry.root.width;
+      const clientY = geometry.root.top + circle.y / storedPage.size.height * geometry.root.height;
+      const targetX = geometry.root.left + Math.min(.995, Math.max(.005, expected.x)) * geometry.root.width;
+      const targetY = geometry.root.top + Math.min(.995, Math.max(.005, expected.y)) * geometry.root.height;
+      expect(Math.abs(clientX - targetX), `page ${pageIndex + 1} point ${pointIndex + 1} x`).toBeLessThanOrEqual(2);
+      expect(Math.abs(clientY - targetY), `page ${pageIndex + 1} point ${pointIndex + 1} y`).toBeLessThanOrEqual(2);
+    });
+  }
+
+  const debugUrl = new URL(page.url());
+  debugUrl.searchParams.set("inputDebug", "1");
+  await page.goto(debugUrl.toString(), { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  await openPageSidebar(page);
+  await page.locator('#notePageList [aria-label="5ページを開く"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("5 / 5");
+  const diagnosticStage = page.locator("#notePageStage");
+  const diagnosticCapture = diagnosticStage.locator('[data-layer="drawing-input"]');
+  const diagnosticBox = await diagnosticStage.boundingBox();
+  expect(diagnosticBox).toBeTruthy();
+  const diagnosticEvent = {
+    pointerId: 5999, pointerType: "pen", button: 0, buttons: 1,
+    clientX: diagnosticBox.x + diagnosticBox.width * .37,
+    clientY: diagnosticBox.y + diagnosticBox.height * .61,
+    width: 2, height: 2, pressure: .5
+  };
+  await diagnosticCapture.dispatchEvent("pointerdown", diagnosticEvent);
+  await diagnosticCapture.dispatchEvent("pointerup", { ...diagnosticEvent, buttons: 0, pressure: 0 });
+  await expect(page.locator("#noteInputDebugValues")).toContainText("pen pointerdown");
+  await page.locator("#noteInputDebugPanel summary").click();
+  const diagnosticDownloadPromise = page.waitForEvent("download");
+  await page.locator("#noteInputDebugDownload").click();
+  const diagnosticDownload = await diagnosticDownloadPromise;
+  const diagnosticStream = await diagnosticDownload.createReadStream();
+  const diagnosticChunks = [];
+  for await (const chunk of diagnosticStream) diagnosticChunks.push(chunk);
+  const diagnostic = JSON.parse(Buffer.concat(diagnosticChunks).toString("utf8"));
+  expect(diagnostic.pageSpace).toMatchObject({
+    sourceWidth: storedPages[4].size.width,
+    sourceHeight: storedPages[4].size.height,
+    pdfRotation: 270,
+    rotationApplied: true
+  });
+  for (const key of ["backgroundRect", "svgRect", "inputSurfaceRect", "maskLayerRect", "pageRootRect"]) {
+    expect(diagnostic.pageSpace[key], `${key}を診断JSONへ含める`).toBeTruthy();
+  }
+  expect(diagnostic.pageSpace.maximumLayerDeltaPx).toBeLessThanOrEqual(1);
+  expect(diagnostic.drawing.events.some(event => event.distance !== null && event.distance <= .01),
+    "入力座標の再投影deltaを診断JSONへ含める").toBe(true);
 });
 
 test("@authenticated @ipad-v-next PDF作成タブが拒否されても同じタブで作成画面を継続する", async ({ page }) => {
@@ -3130,11 +3289,13 @@ test("@authenticated @ipad-transient-ui ツール別設定・画像メニュー�
   await expect(page.locator('#notePageStage path[data-element-id]')).toHaveCount(beforeStrokeCount + 31);
   await page.locator("#notePageStage").dispatchEvent("pointerdown", { pointerId: 92, pointerType: "pen", button: 0, clientX: cancelStart.x, clientY: cancelStart.y + 50, pressure: .5 });
   await page.locator("#notePageStage").dispatchEvent("pointermove", { pointerId: 92, pointerType: "pen", button: 0, clientX: cancelStart.x + 40, clientY: cancelStart.y + 80, pressure: .5 });
-  await expect(page.locator('#notePageStage [data-note-draft]')).toHaveCount(1);
+  await expect(page.locator('#notePageStage [data-note-draft]:not([data-note-draft="settled"])')).toHaveCount(1);
   await page.locator("#notePageStage").dispatchEvent("gesturestart", { clientX: cancelStart.x + 20, clientY: cancelStart.y + 65, scale: 1 });
-  await expect(page.locator('#notePageStage [data-note-draft]')).toHaveCount(0);
+  await expect(page.locator('#notePageStage [data-note-draft]:not([data-note-draft="settled"])'), "Pencil接触中のnative gestureはstroke所有権を奪わない").toHaveCount(1);
   await expect(page.locator('#notePageStage path[data-element-id]')).toHaveCount(beforeStrokeCount + 31);
   await page.locator("#notePageStage").dispatchEvent("gestureend", { clientX: cancelStart.x + 20, clientY: cancelStart.y + 65, scale: 1 });
+  await page.locator("#notePageStage").dispatchEvent("pointerup", { pointerId: 92, pointerType: "pen", button: 0, clientX: cancelStart.x + 45, clientY: cancelStart.y + 82, pressure: 0 });
+  await expect(page.locator('#notePageStage path[data-element-id]')).toHaveCount(beforeStrokeCount + 32);
   await expect(page.locator("#noteEditorView")).not.toHaveCSS("user-select", "text");
   await expect(page.locator("#noteSaveStatus")).not.toHaveAttribute("data-state", "conflict");
 
@@ -3205,7 +3366,7 @@ test("@authenticated @ipad-transient-ui ペンcapture layer上の2本指pinchは
   await capture.dispatchEvent("pointermove", {
     pointerId: 201, pointerType: "touch", button: 0, ...point(.32, .36), width: 8, height: 8, pressure: .5
   });
-  await expect(stage.locator("[data-note-draft]")).toHaveCount(1);
+  await expect(stage.locator('[data-note-draft]:not([data-note-draft="settled"])')).toHaveCount(1);
   await capture.dispatchEvent("pointerdown", {
     pointerId: 202, pointerType: "touch", button: 0, ...point(.72, .68), width: 8, height: 8, pressure: .5
   });
@@ -3262,7 +3423,7 @@ test("@authenticated @ipad-transient-ui 単独touch cancelは破棄し、pen can
   await stage.dispatchEvent("pointermove", {
     pointerId: 213, pointerType: "pen", button: 0, ...point(.38, .68), width: 2, height: 2, pressure: .5
   });
-  await expect(stage.locator("[data-note-draft]")).toHaveCount(1);
+  await expect(stage.locator('[data-note-draft]:not([data-note-draft="settled"])')).toHaveCount(1);
   await stage.dispatchEvent("pointerdown", {
     pointerId: 214, pointerType: "pen", button: 0, ...point(.2, .76), width: 2, height: 2, pressure: .5
   });
@@ -3289,6 +3450,669 @@ test("@authenticated @ipad-transient-ui 単独touch cancelは破棄し、pen can
   });
   await expect(stage.locator("path[data-element-id]"), "pointermoveなしでもpointerup終端を含む短い1画を確定する").toHaveCount(before + 5);
   await expect(page.locator("#noteSaveStatus")).toHaveAttribute("data-state", "saved", { timeout: 20_000 });
+});
+
+test("@authenticated @ipad-input-core moveなしの1点strokeはドラフトと確定表示の位置・大きさが一致する", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("単一点プレビュー一致E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
+
+  const stage = page.locator("#notePageStage");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  const point = { clientX: box.x + box.width * .42, clientY: box.y + box.height * .36 };
+
+  await capture.dispatchEvent("pointerdown", {
+    pointerId: 216, pointerType: "pen", button: 0, buttons: 1, ...point, width: 2, height: 2, pressure: .5
+  });
+  const draftDot = stage.locator('[data-note-draft]:not([data-note-draft="settled"]) circle.note-draft-dot');
+  await expect(draftDot).toHaveCount(1);
+  const draftBox = await draftDot.boundingBox();
+  expect(draftBox).toBeTruthy();
+
+  await capture.dispatchEvent("pointerup", {
+    pointerId: 216, pointerType: "pen", button: 0, buttons: 0, ...point, width: 2, height: 2, pressure: 0
+  });
+  const settledDot = stage.locator('[data-layer="elements"] circle[data-element-id]');
+  await expect(settledDot).toHaveCount(1, { timeout: 20_000 });
+  const settledBox = await settledDot.boundingBox();
+  expect(settledBox).toBeTruthy();
+  for (const key of ["x", "y", "width", "height"]) {
+    expect(Math.abs(draftBox[key] - settledBox[key]), `${key}の差を2px以内に保つ`).toBeLessThanOrEqual(2);
+  }
+});
+
+test("@authenticated @ipad-input-core stable入力面は0〜32ms間隔の1点・交差strokeと残留touch後のpenを欠落させない", async ({ page }, testInfo) => {
+  test.setTimeout(120_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("高速Pencil診断E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
+  const debugUrl = new URL(page.url());
+  debugUrl.searchParams.set("inputDebug", "1");
+  await page.goto(debugUrl.toString(), { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  await expect(page.locator("#noteInputDebugPanel")).toBeVisible();
+
+  const stage = page.locator("#notePageStage");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  await expect(capture).toHaveClass(/active/);
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  await capture.evaluate(async (node, bounds) => {
+    const fire = (type, pointerId, x, y, pressure) => node.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId, pointerType: "pen", button: 0,
+      clientX: bounds.x + bounds.width * x, clientY: bounds.y + bounds.height * y,
+      width: 2, height: 2, pressure
+    }));
+    for (const [group, interval] of [0, 4, 8, 16, 32].entries()) {
+      for (let index = 0; index < 100; index += 1) {
+        const pointerId = 400 + group * 100 + index;
+        fire("pointerdown", pointerId, .3, .3, .5);
+        fire("pointerup", pointerId, .3, .3, 0);
+        if (interval) await new Promise(resolve => setTimeout(resolve, interval));
+      }
+    }
+    for (let index = 0; index < 100; index += 1) {
+      const horizontal = index % 2 === 0;
+      fire("pointerdown", 1000 + index, horizontal ? .2 : .5, horizontal ? .5 : .2, .5);
+      fire("pointermove", 1000 + index, horizontal ? .8 : .5, horizontal ? .5 : .8, .5);
+      fire("pointerup", 1000 + index, horizontal ? .8 : .5, horizontal ? .5 : .8, 0);
+    }
+  }, box);
+
+  const rawUpdateSupported = await capture.evaluate((node, bounds) => {
+    if (!("onpointerrawupdate" in window)) return false;
+    const fire = (type, x, y, pressure) => node.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: 899, pointerType: "pen", button: 0,
+      clientX: bounds.x + bounds.width * x, clientY: bounds.y + bounds.height * y,
+      width: 2, height: 2, pressure
+    }));
+    fire("pointerdown", .2, .9, .5);
+    fire("pointerrawupdate", .7, .9, .5);
+    fire("lostpointercapture", .7, .9, 0);
+    return true;
+  }, box);
+
+  await capture.dispatchEvent("pointermove", {
+    pointerId: 1898, pointerType: "pen", button: 0, buttons: 1,
+    clientX: box.x + box.width * .16, clientY: box.y + box.height * .82,
+    width: 2, height: 2, pressure: .5
+  });
+  await capture.dispatchEvent("pointerdown", {
+    pointerId: 1898, pointerType: "pen", button: 0, buttons: 1,
+    clientX: box.x + box.width * .14, clientY: box.y + box.height * .8,
+    width: 2, height: 2, pressure: .5
+  });
+  await capture.dispatchEvent("pointermove", {
+    pointerId: 1898, pointerType: "pen", button: 0, buttons: 1,
+    clientX: box.x + box.width * .36, clientY: box.y + box.height * .86,
+    width: 2, height: 2, pressure: .5
+  });
+  await capture.dispatchEvent("pointerup", {
+    pointerId: 1898, pointerType: "pen", button: 0, buttons: 0,
+    clientX: box.x + box.width * .36, clientY: box.y + box.height * .86,
+    width: 2, height: 2, pressure: 0
+  });
+  const missingDownPointerId = 1899;
+  await capture.dispatchEvent("pointermove", {
+    pointerId: missingDownPointerId, pointerType: "pen", button: 0, buttons: 1,
+    clientX: box.x + box.width * .2, clientY: box.y + box.height * .72,
+    width: 2, height: 2, pressure: .5
+  });
+  await capture.dispatchEvent("pointerup", {
+    pointerId: missingDownPointerId, pointerType: "pen", button: 0, buttons: 0,
+    clientX: box.x + box.width * .26, clientY: box.y + box.height * .74,
+    width: 2, height: 2, pressure: 0
+  });
+  await new Promise(resolve => setTimeout(resolve, 4));
+  await capture.dispatchEvent("pointermove", {
+    pointerId: missingDownPointerId, pointerType: "pen", button: 0, buttons: 1,
+    clientX: box.x + box.width * .32, clientY: box.y + box.height * .74,
+    width: 2, height: 2, pressure: .5
+  });
+  await capture.dispatchEvent("pointerup", {
+    pointerId: missingDownPointerId, pointerType: "pen", button: 0, buttons: 0,
+    clientX: box.x + box.width * .38, clientY: box.y + box.height * .76,
+    width: 2, height: 2, pressure: 0
+  });
+  await stage.dispatchEvent("pointerdown", {
+    pointerId: 900, pointerType: "touch", button: 0,
+    clientX: box.x + box.width * .4, clientY: box.y + box.height * .4,
+    width: 16, height: 16, pressure: .5
+  });
+  await capture.dispatchEvent("pointerdown", {
+    pointerId: 901, pointerType: "pen", button: 0,
+    clientX: box.x + box.width * .55, clientY: box.y + box.height * .55,
+    width: 2, height: 2, pressure: .5
+  });
+  await capture.dispatchEvent("pointerup", {
+    pointerId: 901, pointerType: "pen", button: 0,
+    clientX: box.x + box.width * .55, clientY: box.y + box.height * .55,
+    width: 2, height: 2, pressure: 0
+  });
+  await stage.dispatchEvent("pointerup", {
+    pointerId: 900, pointerType: "touch", button: 0,
+    clientX: box.x + box.width * .4, clientY: box.y + box.height * .4,
+    width: 16, height: 16, pressure: 0
+  });
+
+  const expectedPointerdownCount = 602 + Number(rawUpdateSupported);
+  const expectedStrokeCount = expectedPointerdownCount + 2;
+  const diagnostics = page.locator("#noteInputDebugValues");
+  await expect(diagnostics).toContainText("pen pointerdown");
+  await testInfo.attach("input-diagnostics.txt", {
+    body: Buffer.from(await diagnostics.innerText(), "utf8"),
+    contentType: "text/plain"
+  });
+  await expect(diagnostics.locator("dt", { hasText: "pen pointerdown" }).locator("+ dd"))
+    .toHaveText(String(expectedPointerdownCount));
+  await expect(diagnostics.locator("dt", { hasText: "確定stroke" }).locator("+ dd"))
+    .toHaveText(String(expectedStrokeCount));
+  await expect(diagnostics.locator("dt", { hasText: "孤立session復旧" }).locator("+ dd"))
+    .toHaveText("3");
+  await expect(diagnostics.locator("dt").filter({ hasText: /^contact move復旧$/ }).locator("+ dd"))
+    .toHaveText("3");
+  for (const label of ["window capture", "document capture", "editor capture", "stage capture", "drawing surface", "capture gate通過"]) {
+    await expect(diagnostics.locator("dt", { hasText: label }).locator("+ dd"))
+      .toHaveText(String(expectedPointerdownCount));
+  }
+  await expect(stage.locator("[data-element-id]")).toHaveCount(expectedStrokeCount, { timeout: 30_000 });
+  await expect(page.locator("#noteSaveStatus")).toHaveAttribute("data-state", "saved", { timeout: 30_000 });
+  await expect(stage.locator("circle[data-element-id]"), "rawupdateは確定点にせず1点strokeを丸い点として残す")
+    .toHaveCount(501 + Number(rawUpdateSupported), { timeout: 10_000 });
+  await expect(diagnostics).toContainText("破棄stroke");
+  await expect(diagnostics).toContainText("0");
+  if (rawUpdateSupported) {
+    await expect(diagnostics.locator("dt", { hasText: "raw update" }).locator("+ dd")).toHaveText("1");
+  }
+  for (const [index, tool] of ["select", "shape", "text"].entries()) {
+    await page.locator(`[data-note-tool="${tool}"]`).click();
+    await expect(capture).not.toHaveClass(/active/);
+    const pointerId = 2200 + index;
+    await stage.dispatchEvent("pointerdown", {
+      pointerId, pointerType: "pen", button: 0,
+      clientX: box.x + box.width * (.2 + index * .1), clientY: box.y + box.height * .2,
+      width: 2, height: 2, pressure: .5
+    });
+    await stage.dispatchEvent("pointercancel", {
+      pointerId, pointerType: "pen", button: 0,
+      clientX: box.x + box.width * (.2 + index * .1), clientY: box.y + box.height * .2,
+      width: 2, height: 2, pressure: 0
+    });
+  }
+  await expect(diagnostics.locator("dt", { hasText: "capture gate除外" }).locator("+ dd")).toHaveText("3");
+  await expect(diagnostics.locator("dt", { hasText: "capture gate通過" }).locator("+ dd"))
+    .toHaveText(String(expectedPointerdownCount));
+  await expect(diagnostics.locator("dt", { hasText: "確定stroke" }).locator("+ dd"))
+    .toHaveText(String(expectedStrokeCount));
+
+  await page.locator('[data-note-tool="pen"]').click();
+  const debugPanel = page.locator("#noteInputDebugPanel");
+  const timingLabels = ["pointerdown最大", "pointermove最大", "pointerup最大"];
+  const hotPathRuns = [];
+  for (let run = 0; run < 3; run += 1) {
+    await capture.dispatchEvent("pointerdown", {
+      pointerId: 2300 + run, pointerType: "pen", button: 0, buttons: 1,
+      clientX: box.x + box.width * .42, clientY: box.y + box.height * .32,
+      width: 2, height: 2, pressure: .5
+    });
+    await capture.dispatchEvent("pointerup", {
+      pointerId: 2300 + run, pointerType: "pen", button: 0, buttons: 0,
+      clientX: box.x + box.width * .43, clientY: box.y + box.height * .33,
+      width: 2, height: 2, pressure: 0
+    });
+    await debugPanel.dispatchEvent("noteinputdebugresethotpath");
+    await capture.evaluate((node, { bounds, runIndex }) => {
+      const fire = (type, pointerId, x, y, pressure) => node.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, cancelable: true, pointerId, pointerType: "pen", button: 0,
+        buttons: type === "pointerup" ? 0 : 1,
+        clientX: bounds.x + bounds.width * x, clientY: bounds.y + bounds.height * y,
+        width: 2, height: 2, pressure
+      }));
+      for (let index = 0; index < 20; index += 1) {
+        const pointerId = 2400 + runIndex * 20 + index;
+        const y = .36 + index / 1000;
+        fire("pointerdown", pointerId, .4, y, .5);
+        fire("pointermove", pointerId, .44, y + .01, .5);
+        fire("pointerup", pointerId, .46, y + .015, 0);
+      }
+    }, { bounds: box, runIndex: run });
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const timings = {};
+    for (const label of timingLabels) {
+      timings[label] = Number((await diagnostics.locator("dt", { hasText: label }).locator("+ dd").textContent()).replace("ms", ""));
+      expect(timings[label], `${label} run ${run + 1}は1フレーム未満`).toBeLessThan(16.7);
+    }
+    hotPathRuns.push(timings);
+  }
+  const hotPathMedians = Object.fromEntries(timingLabels.map(label => [
+    label,
+    hotPathRuns.map(run => run[label]).sort((left, right) => left - right)[1]
+  ]));
+  for (const [label, value] of Object.entries(hotPathMedians)) {
+    expect(value, `${label}の3回中央値は8ms以内`).toBeLessThanOrEqual(8);
+  }
+  const hotPathMetrics = { runs: hotPathRuns, medians: hotPathMedians };
+  console.log(`INPUT_HOTPATH_METRICS ${JSON.stringify(hotPathMetrics)}`);
+  await testInfo.attach("input-hotpath-metrics.json", {
+    body: Buffer.from(JSON.stringify(hotPathMetrics, null, 2), "utf8"),
+    contentType: "application/json"
+  });
+  await expect(page.locator("#noteSaveStatus")).toHaveAttribute("data-state", "saved", { timeout: 30_000 });
+});
+
+test("@authenticated @ipad-input-core ツール切替中の同一pointerIdを三入力経路で二重処理しない", async ({ page }) => {
+  test.setTimeout(90_000);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("入力経路排他E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
+  const debugUrl = new URL(page.url());
+  debugUrl.searchParams.set("inputDebug", "1");
+  await page.goto(debugUrl.toString(), { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+
+  const stage = page.locator("#notePageStage");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  const diagnostics = page.locator("#noteInputDebugValues");
+  const metric = label => diagnostics.locator("dt", { hasText: label }).locator("+ dd");
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  const point = (x, y) => ({
+    clientX: box.x + box.width * x,
+    clientY: box.y + box.height * y,
+    width: 2,
+    height: 2
+  });
+
+  await expect(capture).toHaveClass(/active/);
+  const sharedPointerId = 2601;
+  await capture.dispatchEvent("pointerdown", {
+    pointerId: sharedPointerId, pointerType: "pen", button: 0, buttons: 1,
+    ...point(.2, .22), pressure: .5
+  });
+  await expect(metric("stage capture")).toHaveText("1");
+  await expect(metric("drawing surface")).toHaveText("1");
+  await expect(metric("capture gate通過")).toHaveText("1");
+  await expect(metric("strokeSession")).toHaveText("1");
+
+  await page.locator('[data-note-tool="select"]').click();
+  await expect(capture).not.toHaveClass(/active/);
+  await stage.dispatchEvent("pointermove", {
+    pointerId: sharedPointerId, pointerType: "pen", button: 0, buttons: 1,
+    ...point(.32, .27), pressure: .5
+  });
+  await stage.dispatchEvent("pointermove", {
+    pointerId: sharedPointerId, pointerType: "touch", button: 0, buttons: 1,
+    ...point(.36, .3), pressure: .5
+  });
+  await stage.dispatchEvent("pointerup", {
+    pointerId: sharedPointerId, pointerType: "touch", button: 0, buttons: 0,
+    ...point(.36, .3), pressure: 0
+  });
+  await expect(metric("stage capture"), "無効化後のpen moveは新しいcapture経路を作らない").toHaveText("1");
+  await expect(metric("strokeSession"), "pointerType切替後も同一pointerIdを復旧しない").toHaveText("1");
+  await expect(metric("確定stroke")).toHaveText("0");
+  await expect(metric("破棄stroke")).toHaveText("1");
+  await expect(metric("active pointer")).toHaveText("なし");
+
+  await page.locator('[data-note-tool="pen"]').click();
+  await expect(capture).toHaveClass(/active/);
+  await page.locator("#noteInputSettingsBtn").click();
+  await expect(page.locator("#noteFingerDraw")).not.toBeChecked();
+  await page.locator("#noteFingerDraw").check();
+  await expect(page.locator("#noteFingerDraw")).toBeChecked();
+  await page.locator("#noteToolSettingsDoneBtn").click();
+
+  await capture.dispatchEvent("pointerdown", {
+    pointerId: 2602, pointerType: "mouse", button: 0, buttons: 1,
+    ...point(.2, .42), pressure: .5
+  });
+  await capture.dispatchEvent("pointermove", {
+    pointerId: 2602, pointerType: "mouse", button: 0, buttons: 1,
+    ...point(.42, .46), pressure: .5
+  });
+  await capture.dispatchEvent("pointerup", {
+    pointerId: 2602, pointerType: "mouse", button: 0, buttons: 0,
+    ...point(.42, .46), pressure: 0
+  });
+  await expect(metric("strokeSession"), "drawing layer bubbleは1回だけsessionを作る").toHaveText("2");
+  await expect(metric("確定stroke")).toHaveText("1");
+
+  // Pencil終了直後の単独touchを抑止する350msのpalm guardを越えてから、
+  // capture layerを通過してstage bubbleへ届く指描画経路を検証する。
+  await page.waitForTimeout(400);
+  await capture.dispatchEvent("pointerdown", {
+    pointerId: sharedPointerId, pointerType: "touch", button: 0, buttons: 1,
+    ...point(.2, .62), pressure: .5
+  });
+  await capture.dispatchEvent("pointermove", {
+    pointerId: sharedPointerId, pointerType: "touch", button: 0, buttons: 1,
+    ...point(.23, .76), pressure: .5
+  });
+  await capture.dispatchEvent("pointerup", {
+    pointerId: sharedPointerId, pointerType: "touch", button: 0, buttons: 0,
+    ...point(.23, .76), pressure: 0
+  });
+
+  for (const label of ["window capture", "document capture", "editor capture", "stage capture", "drawing surface", "capture gate通過"]) {
+    await expect(metric(label), `${label}は最初のpen downだけを数える`).toHaveText("1");
+  }
+  await expect(metric("capture gate除外")).toHaveText("0");
+  await expect(metric("pen pointerdown"), "三経路は各1回だけbeginPointerへ到達する").toHaveText("3");
+  await expect(metric("strokeSession"), "三経路は各1回だけsessionを作る").toHaveText("3");
+  await expect(metric("確定stroke"), "mouseとtouchを各1回だけ確定する").toHaveText("2");
+  await expect(metric("破棄stroke"), "ツール切替で中断したpenだけを破棄する").toHaveText("1");
+  await expect(metric("孤立session復旧")).toHaveText("0");
+  await expect(metric("active pointer")).toHaveText("なし");
+  await expect(stage.locator("[data-element-id]"), "二重経路によるstroke増殖がない").toHaveCount(2);
+  await expect(page.locator("#noteSaveStatus")).toHaveAttribute("data-state", "saved", { timeout: 30_000 });
+});
+
+test("@authenticated @ipad-input-core 横長PDFで背景・描画・入力・カーソル・選択・crop・textを同じページ座標へ固定する", async ({ page }) => {
+  test.setTimeout(120_000);
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "横長PDF座標E2Eノート");
+  await seedNotePageBackground(user.uid, note.noteId, note.pageId, {
+    image: createRgbPng(2000, 1000),
+    size: { width: 2000, height: 1000 }
+  });
+  await login(page, user);
+  await page.goto(`/?firebaseEmulator=1&inputDebug=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, {
+    waitUntil: "domcontentloaded"
+  });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+
+  const stage = page.locator("#notePageStage");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  await expect(capture).toHaveClass(/active/);
+  await expect(stage.locator(".note-background-image")).toBeVisible();
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  expect(box.width / box.height).toBeCloseTo(2, 2);
+  const point = (x, y) => ({ clientX: box.x + box.width * x, clientY: box.y + box.height * y });
+
+  await capture.dispatchEvent("pointerdown", {
+    pointerId: 2301, pointerType: "pen", button: 0, buttons: 1, ...point(.18, .2), pressure: .5
+  });
+  await capture.dispatchEvent("pointermove", {
+    pointerId: 2301, pointerType: "pen", button: 0, buttons: 1, ...point(.76, .72), pressure: .5
+  });
+  await expect(stage.locator('[data-note-draft]:not([data-note-draft="settled"])')).toHaveCount(1);
+  const pageLayerDeltas = await stage.evaluate(root => {
+    const rootRect = root.getBoundingClientRect();
+    const delta = node => {
+      const rect = node.getBoundingClientRect();
+      return Math.max(
+        Math.abs(rect.left - rootRect.left),
+        Math.abs(rect.top - rootRect.top),
+        Math.abs(rect.width - rootRect.width),
+        Math.abs(rect.height - rootRect.height)
+      );
+    };
+    return Object.fromEntries(Object.entries({
+      paper: root.querySelector(".note-paper-layer"),
+      background: root.querySelector(".note-background-image"),
+      elements: root.querySelector('[data-layer="elements"]'),
+      masks: root.querySelector('[data-layer="masks"]'),
+      input: root.querySelector('[data-layer="drawing-input"]'),
+      draft: root.querySelector('[data-note-draft]:not([data-note-draft="settled"])')
+    }).map(([name, node]) => [name, node ? delta(node) : Number.POSITIVE_INFINITY]));
+  });
+  for (const [layer, delta] of Object.entries(pageLayerDeltas)) {
+    expect(delta, `${layer}を横長ページ矩形へ一致させる`).toBeLessThanOrEqual(1);
+  }
+  await capture.dispatchEvent("pointerup", {
+    pointerId: 2301, pointerType: "pen", button: 0, buttons: 0, ...point(.76, .72), pressure: 0
+  });
+
+  await page.locator('[data-note-tool="eraser-object"]').click();
+  await page.locator("#noteStyleBtn").click();
+  await page.locator("#noteEraserMode").selectOption("pixel");
+  await page.locator("#noteStyleBtn").click();
+  await stage.dispatchEvent("pointermove", {
+    pointerId: 2302, pointerType: "mouse", button: 0, buttons: 0, ...point(.72, .62)
+  });
+  const cursor = page.locator("#notePixelEraserCursor");
+  await expect(cursor).toBeVisible();
+  const cursorBox = await cursor.boundingBox();
+  expect(cursorBox.width).toBeCloseTo(cursorBox.height, 0);
+  expect(cursorBox.x + cursorBox.width / 2).toBeCloseTo(point(.72, .62).clientX, 0);
+  expect(cursorBox.y + cursorBox.height / 2).toBeCloseTo(point(.72, .62).clientY, 0);
+
+  await page.locator('[data-note-tool="mask"]').click();
+  await stage.dispatchEvent("pointerdown", { pointerId: 2303, pointerType: "mouse", button: 0, ...point(.2, .25) });
+  await stage.dispatchEvent("pointermove", { pointerId: 2303, pointerType: "mouse", button: 0, ...point(.55, .55) });
+  await stage.dispatchEvent("pointerup", { pointerId: 2303, pointerType: "mouse", button: 0, ...point(.55, .55) });
+  const mask = stage.locator(".note-mask");
+  const transformOverlay = stage.locator(".note-transform-overlay");
+  await expect(transformOverlay).toBeVisible();
+  const maskBox = await mask.boundingBox();
+  const transformBox = await transformOverlay.boundingBox();
+  expect(transformBox.x).toBeCloseTo(maskBox.x, 0);
+  expect(transformBox.y).toBeCloseTo(maskBox.y, 0);
+  expect(transformBox.width).toBeCloseTo(maskBox.width, 0);
+  expect(transformBox.height).toBeCloseTo(maskBox.height, 0);
+  for (const [handle, expectedX, expectedY] of [
+    ["resize-nw", transformBox.x, transformBox.y],
+    ["resize-se", transformBox.x + transformBox.width, transformBox.y + transformBox.height]
+  ]) {
+    const handleBox = await stage.locator(`[data-transform-handle="${handle}"]`).boundingBox();
+    expect(Math.abs(handleBox.x + handleBox.width / 2 - expectedX)).toBeLessThanOrEqual(2);
+    expect(Math.abs(handleBox.y + handleBox.height / 2 - expectedY)).toBeLessThanOrEqual(2);
+  }
+
+  await page.locator('[data-note-tool="text"]').click();
+  await stage.dispatchEvent("pointerdown", { pointerId: 2304, pointerType: "mouse", button: 0, ...point(.15, .62) });
+  await stage.dispatchEvent("pointermove", { pointerId: 2304, pointerType: "mouse", button: 0, ...point(.62, .86) });
+  await stage.dispatchEvent("pointerup", { pointerId: 2304, pointerType: "mouse", button: 0, ...point(.62, .86) });
+  const textEditor = stage.locator('[data-note-text-editor="true"]');
+  await expect(textEditor).toBeFocused();
+  const textBox = await textEditor.boundingBox();
+  expect(textBox.x).toBeCloseTo(point(.15, .62).clientX, 0);
+  expect(textBox.y).toBeCloseTo(point(.15, .62).clientY, 0);
+  expect(textBox.width).toBeCloseTo(box.width * .47, 0);
+  expect(textBox.height).toBeCloseTo(box.height * .24, 0);
+  await textEditor.press("Escape");
+  await expect(textEditor).toHaveCount(0);
+
+  await page.locator("#noteImageFileInput").setInputFiles({
+    name: "landscape-object.png", mimeType: "image/png", buffer: TEST_PNG
+  });
+  const image = stage.locator(".note-image-element");
+  await expect(image).toBeVisible({ timeout: 20_000 });
+  await page.locator('[data-note-tool="select"]').click();
+  await expect(image).toHaveClass(/note-selected/);
+  await page.locator('#noteSelectionActions [data-selection-action="crop"]').click();
+  const cropOverlay = stage.locator(".note-crop-overlay");
+  await expect(cropOverlay).toBeVisible();
+  const imageBox = await image.boundingBox();
+  const cropBox = await cropOverlay.boundingBox();
+  expect(cropBox.x).toBeCloseTo(imageBox.x, 0);
+  expect(cropBox.y).toBeCloseTo(imageBox.y, 0);
+  expect(cropBox.width).toBeCloseTo(imageBox.width, 0);
+  expect(cropBox.height).toBeCloseTo(imageBox.height, 0);
+  for (const [handle, expectedX, expectedY] of [
+    ["crop-nw", cropBox.x, cropBox.y],
+    ["crop-se", cropBox.x + cropBox.width, cropBox.y + cropBox.height]
+  ]) {
+    const handleBox = await stage.locator(`[data-transform-handle="${handle}"]`).boundingBox();
+    expect(Math.abs(handleBox.x + handleBox.width / 2 - expectedX)).toBeLessThanOrEqual(2);
+    expect(Math.abs(handleBox.y + handleBox.height / 2 - expectedY)).toBeLessThanOrEqual(2);
+  }
+});
+
+test("@authenticated @ipad-input-core 明示的なツール・zoom・閲覧・ページ変更は描画途中のdotを残さない", async ({ page }) => {
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("Pencil中断境界E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click());
+
+  const stage = page.locator("#notePageStage");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  const viewport = page.locator("#noteViewport");
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  const beginDot = pointerId => capture.dispatchEvent("pointerdown", {
+    pointerId, pointerType: "pen", button: 0,
+    clientX: box.x + box.width * .4, clientY: box.y + box.height * .4,
+    width: 2, height: 2, pressure: .5
+  });
+  const expectNoStroke = () => expect(stage.locator("[data-element-id]"), "明示中断したdotを正本へ残さない").toHaveCount(0);
+
+  await beginDot(2101);
+  await page.locator('[data-note-tool="highlighter"]').click();
+  await expectNoStroke();
+  await page.locator('[data-note-tool="pen"]').click();
+
+  await beginDot(2102);
+  await viewport.dispatchEvent("pagezoomstart");
+  await expectNoStroke();
+
+  await beginDot(2103);
+  await page.locator("#noteMarkupDoneBtn").click();
+  await expectNoStroke();
+  await page.locator("#noteMarkupDoneBtn").click();
+
+  await openPageSidebar(page);
+  await page.locator('[data-page-action="add-ruled"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("2 / 2");
+  await page.locator('#notePageList [aria-label="1ページを開く"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
+  await beginDot(2104);
+  await page.locator('#notePageList [aria-label="2ページを開く"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("2 / 2");
+  await page.locator('#notePageList [aria-label="1ページを開く"]').click();
+  await expectNoStroke();
+
+  const endDot = pointerId => capture.dispatchEvent("pointerup", {
+    pointerId, pointerType: "pen", button: 0,
+    clientX: box.x + box.width * .4, clientY: box.y + box.height * .4,
+    width: 2, height: 2, pressure: 0
+  });
+  await beginDot(2110);
+  await endDot(2110);
+  await expect(stage.locator("[data-element-id]")).toHaveCount(1);
+
+  await beginDot(2111);
+  await endDot(2110); // 旧pointerIdの遅延終了通知
+  const viewportBox = await viewport.boundingBox();
+  const touchEvent = (pointerId, x, y, pressure = .5) => ({
+    pointerId, pointerType: "touch", button: 0,
+    clientX: viewportBox.x + viewportBox.width * x,
+    clientY: viewportBox.y + viewportBox.height * y,
+    width: 12, height: 12, pressure
+  });
+  await viewport.dispatchEvent("pointerdown", touchEvent(2112, .35, .45));
+  await viewport.dispatchEvent("pointerdown", touchEvent(2113, .65, .55));
+  await viewport.dispatchEvent("pointermove", touchEvent(2113, .75, .6));
+  await viewport.dispatchEvent("pointerup", touchEvent(2113, .75, .6, 0));
+  await viewport.dispatchEvent("pointerup", touchEvent(2112, .35, .45, 0));
+  await endDot(2111);
+  await expect(stage.locator("[data-element-id]"), "旧pointer終了と後続touchで新strokeを破棄しない").toHaveCount(2);
+
+  await page.locator("#noteMarkupDoneBtn").click();
+  await expect(page.locator(".note-toolbar")).toBeHidden();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  await expect(page.locator("#notePageStage [data-element-id]"), "完了直前のidle strokeを再読込後も保持する").toHaveCount(2);
+
+  const toolbar = page.locator(".note-toolbar");
+  await expect(toolbar).toBeVisible();
+  await page.locator("#noteMarkupDoneBtn").click();
+  await expect(toolbar).toBeHidden();
+  await page.locator("#noteStudyModeBtn").click();
+  await expect(page.locator("#noteStudyControls")).toBeVisible();
+  await expect(toolbar).toBeHidden();
+  await page.locator("#noteEditModeBtn").click();
+  await expect(page.locator("#noteStudyControls")).toBeHidden();
+  await expect(toolbar, "閲覧状態のまま暗記から編集へ戻ってもパレットを出さない").toBeHidden();
+  await page.locator("#noteMarkupDoneBtn").click();
+  await expect(toolbar).toBeVisible();
+  await page.locator("#noteStudyModeBtn").click();
+  await expect(toolbar).toBeHidden();
+  await expect(page.locator("#noteStudyControls")).toBeVisible();
+});
+
+test("@authenticated @ipad-input-core マークアップ完了はクラウド保存失敗でも端末内下書きを保持して再試行できる", async ({ page }) => {
+  test.setTimeout(90_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator("#newNoteTitle").fill("マークアップ保存失敗E2Eノート");
+  page = await openEditorPopup(page, () => page.locator('[data-create-note="blank"]').click(), { blockedRequests });
+
+  let failedRevisionUploads = 0;
+  await page.route("**/v0/b/demo-dental-qa.firebasestorage.app/o**", async route => {
+    const request = route.request();
+    const objectName = new URL(request.url()).searchParams.get("name") || "";
+    if (["POST", "PUT"].includes(request.method()) && objectName.includes("/revisions/")) {
+      failedRevisionUploads += 1;
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: 403, message: "forced markup revision failure" } })
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  const stage = page.locator("#notePageStage");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  const box = await stage.boundingBox();
+  expect(box).toBeTruthy();
+  const point = (x, y) => ({ clientX: box.x + box.width * x, clientY: box.y + box.height * y });
+  await capture.dispatchEvent("pointerdown", {
+    pointerId: 2201, pointerType: "pen", button: 0, ...point(.22, .3), width: 2, height: 2, pressure: .5
+  });
+  await capture.dispatchEvent("pointermove", {
+    pointerId: 2201, pointerType: "pen", button: 0, ...point(.62, .48), width: 2, height: 2, pressure: .5
+  });
+  await capture.dispatchEvent("pointerup", {
+    pointerId: 2201, pointerType: "pen", button: 0, ...point(.62, .48), width: 2, height: 2, pressure: 0
+  });
+  await expect(stage.locator("[data-element-id]")).toHaveCount(1);
+
+  await page.locator("#noteMarkupDoneBtn").click();
+  await expect(page.locator(".note-toolbar"), "クラウド失敗でもローカル保存完了後はパレットを閉じる").toBeHidden();
+  await expect(page.locator("#noteSaveStatus")).toHaveAttribute("data-state", "recoverable-error", { timeout: 20_000 });
+  expect(failedRevisionUploads).toBeGreaterThan(0);
+  await expect.poll(() => localNoteStoreCounts(page)).toMatchObject({ pageDrafts: 1, pendingSaves: 1 });
+  const failedCloudState = await readNotes(user.uid);
+  const note = failedCloudState.notes.find(item => item.title === "マークアップ保存失敗E2Eノート");
+  expect(note?.pages[0]?.contentRevision).toBe(0);
+
+  await page.locator("#noteSaveStatus").click();
+  await expect(page.locator("#noteSaveStatusDetail")).toContainText("端末内");
+  await expect(page.locator("#noteRetrySaveBtn")).toBeVisible();
+  await page.unroute("**/v0/b/demo-dental-qa.firebasestorage.app/o**");
+  await page.locator("#noteRetrySaveBtn").click();
+  await expect(page.locator("#noteSaveStatus")).toHaveAttribute("data-state", "saved", { timeout: 20_000 });
+  await expect.poll(() => localNoteStoreCounts(page)).toEqual({
+    pendingAssets: 0,
+    pageDrafts: 0,
+    pendingSaves: 0,
+    conflicts: 0
+  });
+  await expect.poll(async () => {
+    const stored = await readNotes(user.uid);
+    return stored.notes.find(item => item.id === note.id)?.pages[0]?.contentRevision || 0;
+  }, { timeout: 20_000 }).toBeGreaterThan(0);
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
+  await expect(page.locator("#notePageStage [data-element-id]"), "再試行後はクラウドから筆跡を復元できる").toHaveCount(1);
+  expect(blockedRequests).toEqual([]);
 });
 
 test("@authenticated @ipad-transient-ui ページスワイプはローカル保存後に遷移し、ズーム・ピンチ・描画中は発火しない", async ({ page }) => {
@@ -3318,10 +4142,11 @@ test("@authenticated @ipad-transient-ui ページスワイプはローカル保�
   expect(viewportBox).toBeTruthy();
   const stagePoint = (x, y) => ({ clientX: stageBox.x + stageBox.width * x, clientY: stageBox.y + stageBox.height * y });
   const viewportPoint = (x, y) => ({ clientX: viewportBox.x + viewportBox.width * x, clientY: viewportBox.y + viewportBox.height * y });
-  const swipe = async (pointerId, from, to) => {
-    await viewport.dispatchEvent("pointerdown", { pointerId, pointerType: "touch", button: 0, ...from, width: 8, height: 8, pressure: .5 });
-    await viewport.dispatchEvent("pointermove", { pointerId, pointerType: "touch", button: 0, ...to, width: 8, height: 8, pressure: .5 });
-    await viewport.dispatchEvent("pointerup", { pointerId, pointerType: "touch", button: 0, ...to, width: 8, height: 8, pressure: 0 });
+  const swipe = async (pointerId, from, to, { expectFollow = true } = {}) => {
+    await viewport.dispatchEvent("pointerdown", { pointerId, pointerType: "touch", button: 0, ...from, width: 40, height: 40, pressure: .5 });
+    await viewport.dispatchEvent("pointermove", { pointerId, pointerType: "touch", button: 0, ...to, width: 40, height: 40, pressure: .5 });
+    if (expectFollow) await expect(stage, "ページはpointerup前から指へ追従する").toHaveCSS("translate", /-?[1-9]/);
+    await viewport.dispatchEvent("pointerup", { pointerId, pointerType: "touch", button: 0, ...to, width: 40, height: 40, pressure: 0 });
   };
 
   const before = await stage.locator("path[data-element-id]").count();
@@ -3336,12 +4161,27 @@ test("@authenticated @ipad-transient-ui ページスワイプはローカル保�
   await expect(page.locator("#notePageCounter")).toHaveText("1 / 2", { timeout: 20_000 });
   await expect(stage.locator("path[data-element-id]"), "スワイプ往復後も直前の筆跡を保持する").toHaveCount(before + 1);
 
+  await page.locator("#noteInputSettingsBtn").click();
+  await page.locator("#noteFingerDraw").check();
+  await expect(page.locator("#notePencilMode")).not.toBeChecked();
+  await page.locator("#noteToolSettingsDoneBtn").click();
+  const fingerSwipe = async (pointerId, from, to, expectedPage) => {
+    await stage.dispatchEvent("pointerdown", { pointerId, pointerType: "touch", button: 0, ...from, width: 8, height: 8, pressure: .5 });
+    await stage.dispatchEvent("pointermove", { pointerId, pointerType: "touch", button: 0, ...to, width: 8, height: 8, pressure: .5 });
+    await expect(stage.locator("[data-note-draft]"), "横方向ロック後は指描画draftをページ送りへ引き継ぐ").toHaveCount(0);
+    await expect(page.locator("#noteAdjacentPagePreview")).toBeVisible();
+    await stage.dispatchEvent("pointerup", { pointerId, pointerType: "touch", button: 0, ...to, width: 8, height: 8, pressure: 0 });
+    await expect(page.locator("#notePageCounter")).toHaveText(expectedPage, { timeout: 20_000 });
+  };
+  await fingerSwipe(309, stagePoint(.78, .5), stagePoint(.18, .52), "2 / 2");
+  await fingerSwipe(310, stagePoint(.18, .5), stagePoint(.78, .52), "1 / 2");
+
   await viewport.dispatchEvent("wheel", {
     ctrlKey: true, deltaY: -220, ...viewportPoint(.5, .5)
   });
   await expect.poll(() => stage.evaluate(node => Number(getComputedStyle(node).getPropertyValue("--page-zoom")))).toBeGreaterThan(1);
   await viewport.evaluate(node => { node.scrollLeft = Math.max(20, (node.scrollWidth - node.clientWidth) / 2); });
-  await swipe(304, viewportPoint(.78, .42), viewportPoint(.12, .44));
+  await swipe(304, viewportPoint(.78, .42), viewportPoint(.12, .44), { expectFollow: false });
   await expect(page.locator("#notePageCounter"), "拡大中かつ横スクロール端でない場合はページを送らない").toHaveText("1 / 2");
 
   await page.locator("#noteMoreMenu summary").click();
@@ -3355,12 +4195,12 @@ test("@authenticated @ipad-transient-ui ページスワイプはローカル保�
 
   await stage.dispatchEvent("pointerdown", { pointerId: 307, pointerType: "pen", button: 0, ...stagePoint(.55, .55), pressure: .5 });
   await stage.dispatchEvent("pointermove", { pointerId: 307, pointerType: "pen", button: 0, ...stagePoint(.68, .62), pressure: .5 });
-  await swipe(308, viewportPoint(.78, .58), viewportPoint(.12, .6));
+  await swipe(308, viewportPoint(.78, .58), viewportPoint(.12, .6), { expectFollow: false });
   await expect(page.locator("#notePageCounter"), "Pencil描画中のtouchではページを送らない").toHaveText("1 / 2");
   await stage.dispatchEvent("pointerup", { pointerId: 307, pointerType: "pen", button: 0, ...stagePoint(.68, .62), pressure: 0 });
 });
 
-test("@authenticated @ipad-writing-mask 交差する複数画・日本語IME・保存チップ・編集画面内マスクを統合する", async ({ page }) => {
+test("@authenticated @ipad-writing-mask 交差する複数画・日本語IME・保存チップ・編集画面内マスクを統合する", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
   const blockedRequests = await guardProductionFirebase(page);
   const pageErrors = [];
@@ -3552,10 +4392,22 @@ test("@authenticated @ipad-writing-mask 交差する複数画・日本語IME・�
   await expect(stage.locator('path[data-element-id]')).toHaveCount(pathCountBeforeMaskStroke + 1);
   await expect(stage.locator(".note-mask")).toHaveCount(2);
 
-  await page.locator("#toggleNoteStudyBtn").click();
+  await page.locator("#noteStudyModeBtn").click();
   await expect(stage).toHaveClass(/study-mode/);
-  await expect(page.locator("#toggleNoteStudyBtn")).toHaveAttribute("aria-label", "編集モードへ戻る");
-  await expect(page.locator("#toggleNoteStudyBtn .note-mode-icon-edit")).toBeVisible();
+  await expect(page.locator("#noteStudyModeBtn")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("#noteEditModeBtn")).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator("#noteStudyControls")).toHaveCSS("flex-wrap", "nowrap");
+  const studyControlsBox = await page.locator("#noteStudyControls").boundingBox();
+  expect(studyControlsBox.x).toBeGreaterThanOrEqual(0);
+  expect(studyControlsBox.x + studyControlsBox.width).toBeLessThanOrEqual((await page.viewportSize()).width);
+  for (const button of await page.locator("#noteStudyControls button").all()) {
+    const buttonBox = await button.boundingBox();
+    expect(buttonBox.width).toBeGreaterThanOrEqual(44);
+    expect(buttonBox.height).toBeGreaterThanOrEqual(44);
+  }
+  await testInfo.attach(`study-mode-${testInfo.project.name}.png`, {
+    body: await page.locator("#noteEditorView").screenshot(), contentType: "image/png"
+  });
   await expect(stage.locator(".note-mask.editing-hidden")).toHaveCount(0);
   await expect(stage.locator(".note-mask").first()).toHaveCSS("opacity", "1");
   await page.locator('[data-study-action="hide-all"]').click();
@@ -3564,9 +4416,12 @@ test("@authenticated @ipad-writing-mask 交差する複数画・日本語IME・�
   await expect(stage.locator(".note-mask.revealed").first()).toHaveCSS("opacity", "1");
   await expect(stage.locator(".note-mask.revealed").first()).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
   await expect(stage.locator(".note-mask.revealed").first()).toHaveCSS("pointer-events", "auto");
-  await page.locator("#toggleNoteStudyBtn").click();
-  await expect(page.locator("#toggleNoteStudyBtn")).toHaveAttribute("aria-label", "暗記モード");
-  await expect(page.locator("#toggleNoteStudyBtn .note-mode-icon-brain")).toBeVisible();
+  await page.locator("#noteEditModeBtn").click();
+  await expect(page.locator("#noteEditModeBtn")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("#noteStudyModeBtn")).toHaveAttribute("aria-pressed", "false");
+  await testInfo.attach(`edit-mode-${testInfo.project.name}.png`, {
+    body: await page.locator("#noteEditorView").screenshot(), contentType: "image/png"
+  });
 
   await page.locator("#noteMoreMenu summary").click();
   await page.locator('[data-note-action="export"]').click();
@@ -3588,7 +4443,6 @@ test("@authenticated @ipad-writing-mask 交差する複数画・日本語IME・�
   await expect(stage.locator(".note-mask")).toHaveCount(2);
 
   await expect(saveChip).toHaveAttribute("data-state", "saved", { timeout: 30_000 });
-  await page.setViewportSize({ width: 768, height: 1024 });
   await page.evaluate(() => {
     const status = document.querySelector("#noteSaveStatus");
     status.dataset.state = "offline";
@@ -3596,15 +4450,20 @@ test("@authenticated @ipad-writing-mask 交差する複数画・日本語IME・�
     document.querySelector("#noteSaveStatusButtonText").textContent = "オフライン";
   });
   await expect(page.locator("#localEnvironmentToggle")).toBeVisible();
-  const headerFits = await page.locator("#noteEditorView > .note-editor-header").evaluate(header => {
-    const bounds = header.getBoundingClientRect();
-    const childrenFit = [...header.children].every(child => {
-      const rect = child.getBoundingClientRect();
-      return rect.left >= bounds.left - 1 && rect.right <= bounds.right + 1;
+  for (const width of [744, 760, 768, 1024]) {
+    await page.setViewportSize({ width, height: 1024 });
+    const headerFits = await page.locator("#noteEditorView > .note-editor-header").evaluate(header => {
+      const bounds = header.getBoundingClientRect();
+      const childrenFit = [...header.children]
+        .filter(child => getComputedStyle(child).display !== "none")
+        .every(child => {
+          const rect = child.getBoundingClientRect();
+          return rect.left >= bounds.left - 1 && rect.right <= bounds.right + 1;
+        });
+      return header.scrollWidth <= header.clientWidth + 1 && childrenFit;
     });
-    return header.scrollWidth <= header.clientWidth + 1 && childrenFit;
-  });
-  expect(headerFits, "768px幅でLOCAL表示と最長保存状態名をheader内へ収める").toBe(true);
+    expect(headerFits, `${width}px幅でLOCAL表示と最長保存状態名をheader内へ収める`).toBe(true);
+  }
   expect(blockedRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
 });

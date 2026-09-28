@@ -1,4 +1,5 @@
 import { randomId } from "./id.js";
+import { LEGACY_NOTE_PAGE_SIZE, notePageMetrics } from "./note-page-metrics.js";
 
 export const clamp = (value, min = 0, max = 1) => Math.min(max, Math.max(min, Number(value) || 0));
 
@@ -9,6 +10,16 @@ export function clientPointToNormalized(clientX, clientY, pageRect) {
   return {
     x: clamp((clientX - pageRect.left) / pageRect.width),
     y: clamp((clientY - pageRect.top) / pageRect.height)
+  };
+}
+
+export function normalizedPointToClient(point, pageRect) {
+  if (!pageRect || pageRect.width <= 0 || pageRect.height <= 0) {
+    throw new Error("ページ表示領域を取得できません。");
+  }
+  return {
+    x: pageRect.left + Number(point?.x || 0) * pageRect.width,
+    y: pageRect.top + Number(point?.y || 0) * pageRect.height
   };
 }
 
@@ -111,20 +122,38 @@ export function translateElement(element, dx, dy, pageSize) {
   return element;
 }
 
-export function distanceToSegment(point, start, end) {
+function scaledDistanceToSegment(point, start, end, yScale = 1) {
   const dx = end.x - start.x;
-  const dy = end.y - start.y;
+  const dy = (end.y - start.y) * yScale;
   const lengthSquared = dx * dx + dy * dy;
-  if (!lengthSquared) return Math.hypot(point.x - start.x, point.y - start.y);
-  const t = clamp(((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared);
-  return Math.hypot(point.x - (start.x + t * dx), point.y - (start.y + t * dy));
+  if (!lengthSquared) return Math.hypot(point.x - start.x, (point.y - start.y) * yScale);
+  const pointDx = point.x - start.x;
+  const pointDy = (point.y - start.y) * yScale;
+  const t = clamp((pointDx * dx + pointDy * dy) / lengthSquared);
+  return Math.hypot(pointDx - t * dx, pointDy - t * dy);
 }
 
-function pointTouchesEraser(point, eraserPoints, radius) {
+export function distanceToSegment(point, start, end, pageSize) {
+  const metrics = notePageMetrics(pageSize);
+  return scaledDistanceToSegment(point, start, end, pageSize ? metrics.height / metrics.width : 1);
+}
+
+export function pageWidthRadiusToNormalizedAxes(radius, pageSize) {
+  const normalizedRadius = Math.max(0, Number(radius) || 0);
+  const metrics = notePageMetrics(pageSize);
+  return {
+    x: normalizedRadius,
+    y: normalizedRadius * metrics.width / metrics.height
+  };
+}
+
+function pointTouchesEraser(point, eraserPoints, radius, yScale) {
   if (!eraserPoints.length) return false;
-  if (eraserPoints.length === 1) return Math.hypot(point.x - eraserPoints[0].x, point.y - eraserPoints[0].y) <= radius;
+  if (eraserPoints.length === 1) {
+    return scaledDistanceToSegment(point, eraserPoints[0], eraserPoints[0], yScale) <= radius;
+  }
   for (let index = 1; index < eraserPoints.length; index += 1) {
-    if (distanceToSegment(point, eraserPoints[index - 1], eraserPoints[index]) <= radius) return true;
+    if (scaledDistanceToSegment(point, eraserPoints[index - 1], eraserPoints[index], yScale) <= radius) return true;
   }
   return false;
 }
@@ -143,7 +172,7 @@ function interpolateStrokePoint(start, end, ratio) {
   return point;
 }
 
-function densifyStrokePoints(points, radius) {
+function densifyStrokePoints(points, radius, yScale) {
   if (points.length < 2) return points;
   const dense = [points[0]];
   const maximumStep = Math.max(0.0005, radius / 2);
@@ -152,7 +181,7 @@ function densifyStrokePoints(points, radius) {
     const end = points[index];
     const steps = Math.min(
       1024,
-      Math.max(1, Math.ceil(Math.hypot(end.x - start.x, end.y - start.y) / maximumStep))
+      Math.max(1, Math.ceil(Math.hypot(end.x - start.x, (end.y - start.y) * yScale) / maximumStep))
     );
     for (let step = 1; step <= steps; step += 1) {
       dense.push(step === steps ? end : interpolateStrokePoint(start, end, step / steps));
@@ -161,14 +190,16 @@ function densifyStrokePoints(points, radius) {
   return dense;
 }
 
-export function splitStrokeByEraser(stroke, eraserPoints, radius, createId = randomId) {
+export function splitStrokeByEraser(stroke, eraserPoints, radius, createId = randomId, pageSize) {
   const sourcePoints = Array.isArray(stroke?.points) ? stroke.points : [];
   const normalizedRadius = Math.max(0.0001, Number(radius) || 0.0001);
-  const points = densifyStrokePoints(sourcePoints, normalizedRadius);
+  const metrics = notePageMetrics(pageSize);
+  const yScale = pageSize ? metrics.height / metrics.width : 1;
+  const points = densifyStrokePoints(sourcePoints, normalizedRadius, yScale);
   const groups = [];
   let current = [];
   points.forEach(point => {
-    if (pointTouchesEraser(point, eraserPoints, normalizedRadius)) {
+    if (pointTouchesEraser(point, eraserPoints, normalizedRadius, yScale)) {
       if (current.length > 1) groups.push(current);
       current = [];
       return;
@@ -188,15 +219,11 @@ export function rotatePoint(point, center, angleDegrees) {
   return { x: center.x + dx * cos - dy * sin, y: center.y + dx * sin + dy * cos };
 }
 
-const DEFAULT_PAGE_SIZE = Object.freeze({ width: 1000, height: 1414 });
+const DEFAULT_PAGE_SIZE = LEGACY_NOTE_PAGE_SIZE;
 
 function pageSizeOrDefault(pageSize) {
-  const width = Number(pageSize?.width);
-  const height = Number(pageSize?.height);
-  return {
-    width: width > 0 ? width : DEFAULT_PAGE_SIZE.width,
-    height: height > 0 ? height : DEFAULT_PAGE_SIZE.height
-  };
+  const { width, height } = notePageMetrics(pageSize);
+  return { width, height };
 }
 
 function rotateNormalizedPoint(point, center, angleDegrees, pageSize) {

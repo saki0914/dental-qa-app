@@ -113,7 +113,7 @@ export function createNoteEditorDiagnosticSnapshot(value = {}) {
     "localDraftRevision", "saveState", "lockOwner", "lockAgeMs",
     "pendingSaves", "pendingAssets", "conflicts", "lastSaveSucceededAt",
     "lastError", "emulator", "urlParameters", "userAgent", "viewport",
-    "zoom", "pageRect", "startupState", "drawing"
+    "zoom", "pageRect", "pageSpace", "startupState", "drawing"
   ];
   return allowed.reduce((result, key) => {
     if (value[key] !== undefined) result[key] = structuredClone(value[key]);
@@ -129,7 +129,8 @@ const SAFE_DIAGNOSTIC_URL_PARAMETERS = new Set([
   "creationSessionId",
   "noteId",
   "editorTabId",
-  "study"
+  "study",
+  "inputDebug"
 ]);
 
 export function sanitizeDiagnosticUrlParameters(entries = []) {

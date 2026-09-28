@@ -48,3 +48,18 @@ test("自動高さはページ下端を越えず、既存の過大な高さもcl
   }, { pageHeight: 1000, measureText: value => value.length * 10 });
   assert.ok(Math.abs(element.bounds.height - .06) < 1e-9);
 });
+
+test("横長ページの保存済みテキストは実ページ幅で折り返し高さを算出する", () => {
+  const original = {
+    id: "landscape-text", type: "text", text: "123456",
+    bounds: { x: .1, y: .1, width: .1, height: .01 },
+    style: { fontSizeRatio: .02, lineHeight: 1 }
+  };
+  const narrow = ensureTextElementHeight(original, {
+    pageWidth: 1000, pageHeight: 1000, measureText: value => value.length * 30
+  });
+  const wide = ensureTextElementHeight(original, {
+    pageWidth: 2000, pageHeight: 1000, measureText: value => value.length * 30
+  });
+  assert.ok(narrow.bounds.height > wide.bounds.height);
+});

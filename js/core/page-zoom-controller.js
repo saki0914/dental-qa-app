@@ -129,6 +129,7 @@ export function createPageZoomController({
   }
   function gestureStart(event) {
     event.preventDefault();
+    if (!shouldTrackTouch(event)) return;
     // Safari can emit GestureEvents after the two PointerEvents have already
     // claimed this contact sequence. The first source keeps ownership until
     // that sequence ends so the same physical pinch is never applied twice.

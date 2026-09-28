@@ -76,15 +76,22 @@ test("compact設定パネルは全dock共通でviewport高の52%以下に収め�
   assert.equal(transientPanelMaxHeight(300), 220);
 });
 
-test("pointercancelは安全な手書きだけを確定し、ズーム開始では破棄する", () => {
+test("安全なcancelはPencil dotを救済し、明示操作による中断は破棄する", () => {
   const points = [{ x: 0.1, y: 0.1 }, { x: 0.12, y: 0.14 }, { x: 0.2, y: 0.2 }];
   assert.equal(cancelledStrokeCanBeCommitted({ type: "pen", pointerType: "pen", points, reason: "pointercancel" }), true);
   assert.equal(cancelledStrokeCanBeCommitted({ type: "highlighter", pointerType: "pen", points, reason: "lostpointercapture" }), true);
   assert.equal(cancelledStrokeCanBeCommitted({ type: "pen", pointerType: "pen", points, reason: "interrupted-pen" }), true);
   assert.equal(cancelledStrokeCanBeCommitted({ type: "pen", pointerType: "touch", points, reason: "pointercancel" }), false);
   assert.equal(cancelledStrokeCanBeCommitted({ type: "pen", pointerType: "mouse", points, reason: "pointercancel" }), false);
-  assert.equal(cancelledStrokeCanBeCommitted({ type: "pen", pointerType: "pen", points, reason: "pagezoomstart" }), false);
+  for (const reason of ["pagezoomstart", "tool-change", "page-change", "close", "explicit-discard"]) {
+    assert.equal(cancelledStrokeCanBeCommitted({
+      type: "pen", pointerType: "pen", points: [points[0]], reason
+    }), false, `${reason}は偶発的な1点strokeを残さない`);
+  }
   assert.equal(cancelledStrokeCanBeCommitted({ type: "shape", pointerType: "pen", points, reason: "pointercancel" }), false);
   assert.equal(cancelledStrokeCanBeCommitted({ type: "pen", pointerType: "pen", points: [], reason: "interrupted-pen" }), false);
-  assert.equal(cancelledStrokeCanBeCommitted({ type: "pen", pointerType: "pen", points: [points[0]], reason: "pointercancel" }), false);
+  assert.equal(cancelledStrokeCanBeCommitted({ type: "pen", pointerType: "pen", points: [points[0]], reason: "pointercancel" }), true);
+  assert.equal(cancelledStrokeCanBeCommitted({
+    type: "pen", pointerType: "pen", points: [points[0], { ...points[0], x: points[0].x + .00001 }], reason: "pointercancel"
+  }), true);
 });

@@ -66,6 +66,20 @@ test("native gesturestartもpagezoomstartとして編集側へ通知する", () 
   controller.destroy();
 });
 
+test("Pencil入力中として拒否されたnative gestureはzoom所有権を取得しない", () => {
+  const { viewport, content } = zoomFixture();
+  let zoomStarts = 0;
+  viewport.addEventListener("pagezoomstart", () => { zoomStarts += 1; });
+  const controller = createPageZoomController({ viewport, content, shouldTrackTouch: () => false });
+  const gesture = new Event("gesturestart", { bubbles: true, cancelable: true });
+  Object.assign(gesture, { clientX: 300, clientY: 240, scale: 1 });
+  viewport.dispatchEvent(gesture);
+  assert.equal(gesture.defaultPrevented, true);
+  assert.equal(zoomStarts, 0);
+  assert.equal(controller.isPinchGestureActive, false);
+  controller.destroy();
+});
+
 test("2本指ピンチ状態を編集側へ公開し、掌候補は追跡しない", () => {
   const { viewport, content, styles } = zoomFixture();
   let zoomStarts = 0;

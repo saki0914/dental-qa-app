@@ -15,16 +15,6 @@ function loadImage(blob) {
   });
 }
 
-function canvasPath(context, points, width, height) {
-  if (!points?.length) return;
-  context.beginPath();
-  context.moveTo(points[0].x * width, points[0].y * height);
-  for (let index = 1; index < points.length; index += 1) {
-    const point = points[index];
-    context.lineTo(point.x * width, point.y * height);
-  }
-}
-
 function drawPaper(context, page, width, height) {
   const background = page.background || {};
   context.fillStyle = background.paperColor || "#ffffff";
@@ -209,9 +199,9 @@ export async function renderNotePageToCanvas({
       context.save();
       context.globalAlpha = Number(element.style?.opacity ?? 0.3);
       context.strokeStyle = element.style?.color || "#fff176";
-      context.lineWidth = Number(element.style?.widthRatio || 0.025) * canvas.width;
       context.lineCap = "round"; context.lineJoin = "round";
-      canvasPath(context, element.points, canvas.width, canvas.height); context.stroke(); context.restore();
+      drawStrokeSegments(context, element.points, Number(element.style?.widthRatio || 0.025), canvas.width, canvas.height);
+      context.restore();
     } else if (element.type === "stroke") {
       context.save();
       context.globalAlpha = Number(element.style?.opacity ?? 1);

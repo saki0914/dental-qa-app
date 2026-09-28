@@ -11,6 +11,13 @@ export const PDF_RENDER_JPEG_QUALITY = 0.92;
 
 let cachedPdfJsLib = null;
 
+export function normalizePdfRotation(value) {
+  const rotation = Number(value);
+  if (!Number.isFinite(rotation)) return 0;
+  const normalized = ((rotation % 360) + 360) % 360;
+  return [0, 90, 180, 270].includes(normalized) ? normalized : 0;
+}
+
 export async function getPdfJsLibForConvert() {
   if (cachedPdfJsLib) return cachedPdfJsLib;
   cachedPdfJsLib = await import("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs");
@@ -45,6 +52,7 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
       onProgress?.(pageNumber, pdfDoc.numPages, "converting");
       const page = await pdfDoc.getPage(pageNumber);
       const baseViewport = page.getViewport({ scale: 1 });
+      const pdfRotation = normalizePdfRotation(baseViewport.rotation ?? page.rotate);
       const scale = Math.min(
         PDF_RENDER_MAX_SCALE,
         Math.max(PDF_RENDER_MIN_SCALE, PDF_RENDER_TARGET_WIDTH / baseViewport.width)
@@ -79,6 +87,7 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
           totalPages: pdfDoc.numPages,
           width: canvas.width,
           height: canvas.height,
+          pdfRotation,
           file
         };
         if (options.onPage) await options.onPage(pageInfo);

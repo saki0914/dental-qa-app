@@ -44,12 +44,12 @@ export function layoutTextBox(text, {
   };
 }
 
-export function ensureTextElementHeight(element, { pageHeight = 1414, measureText }) {
+export function ensureTextElementHeight(element, { pageWidth = 1000, pageHeight = 1414, measureText }) {
   if (!element?.bounds || element.type !== "text") return element;
   const style = element.style || {};
   const fontSize = Math.max(8, Number(style.fontSizeRatio || .025) * pageHeight);
   const layout = layoutTextBox(element.text, {
-    maxWidth: Math.max(1, Number(element.bounds.width || 0) * 1000),
+    maxWidth: Math.max(1, Number(element.bounds.width || 0) * pageWidth),
     lineHeight: fontSize * Number(style.lineHeight || 1.25),
     measureText
   });

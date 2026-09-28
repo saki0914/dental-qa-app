@@ -26,6 +26,14 @@ const SETTINGS_BY_TOOL = Object.freeze({
   text: "text-settings"
 });
 
+const EXPLICIT_STROKE_DISCARD_REASONS = new Set([
+  "explicit-discard",
+  "pagezoomstart",
+  "tool-change",
+  "page-change",
+  "close"
+]);
+
 export function createClosedTransientUi() {
   return { type: "closed", ownerTool: null, targetElementIds: [], anchor: null };
 }
@@ -86,12 +94,12 @@ export function cancelledStrokeCanBeCommitted({
   pointerType,
   reason = "pointercancel",
   points = [],
-  minPoints = 2,
-  minLength = 0.001
+  minPoints = 1,
+  minLength = 0
 } = {}) {
   if (!["pen", "highlighter"].includes(type)) return false;
   if (pointerType !== "pen") return false;
-  if (["pagezoomstart", "tool-change", "page-change", "close"].includes(reason)) return false;
+  if (EXPLICIT_STROKE_DISCARD_REASONS.has(reason)) return false;
   if (!Array.isArray(points) || points.length < minPoints) return false;
   let length = 0;
   for (let index = 1; index < points.length; index += 1) {
@@ -100,5 +108,5 @@ export function cancelledStrokeCanBeCommitted({
       Number(points[index].y || 0) - Number(points[index - 1].y || 0)
     );
   }
-  return length >= minLength;
+  return length >= Math.max(0, Number(minLength) || 0);
 }

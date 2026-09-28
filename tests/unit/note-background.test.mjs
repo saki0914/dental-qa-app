@@ -29,4 +29,8 @@ test("ページ・寸法・背景ソースの変更を背景シグネチャへ�
     ...page,
     background: { ...page.background, materialPage: 3 }
   }));
+  assert.notEqual(signature, createNoteBackgroundSignature({
+    ...page,
+    background: { ...page.background, pdfRotation: 90 }
+  }));
 });

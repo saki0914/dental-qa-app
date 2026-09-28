@@ -8,6 +8,8 @@ import {
   normalizeLineElement,
   normalizeNoteLineElements,
   normalizedBoundsFromPoints,
+  normalizedPointToClient,
+  pageWidthRadiusToNormalizedAxes,
   resetImageCrop,
   resizeElements,
   splitStrokeByEraser,
@@ -57,6 +59,27 @@ test("ズーム・画面向き・サイドバー・パレット位置でペー�
   }
 });
 
+test("縦・横・16:9・回転済み表示の9地点は同じ矩形変換で2px以内へ再投影される", () => {
+  const displayedRects = [
+    { left: 124.734375, top: 92, width: 650.515625, height: 920.421875 },
+    { left: 124.734375, top: 92, width: 650.515625, height: 365.765625 },
+    { left: 72, top: 110, width: 720, height: 405 },
+    // PDF rotation is already reflected in the final displayed rectangle.
+    { left: 104, top: 88, width: 690, height: 488 },
+    { left: 104, top: 88, width: 488, height: 690 }
+  ];
+  const points = [0, .5, 1].flatMap(y => [0, .5, 1].map(x => ({ x, y })));
+  for (const rect of displayedRects) {
+    for (const expected of points) {
+      const client = normalizedPointToClient(expected, rect);
+      const normalized = clientPointToNormalized(client.x, client.y, rect);
+      const reprojected = normalizedPointToClient(normalized, rect);
+      assert.ok(Math.abs(reprojected.x - client.x) <= 2);
+      assert.ok(Math.abs(reprojected.y - client.y) <= 2);
+    }
+  }
+});
+
 test("ドラッグ方向に依存せず正規化矩形を作る", () => {
   assert.deepEqual(normalizedBoundsFromPoints({ x: .8, y: .7 }, { x: .2, y: .3 }), { x: .2, y: .3, width: .6000000000000001, height: .39999999999999997 });
 });
@@ -90,14 +113,32 @@ test("ピクセル消しゴムは疎な線分の中央を横切っても保存�
   assert.deepEqual(parts.map(part => part.style), [stroke.style, stroke.style]);
 });
 
+test("横長ページのイレーサー半径はページ幅基準の真円として判定とcursor軸を一致させる", () => {
+  const pageSize = { width: 2000, height: 1000 };
+  const axes = pageWidthRadiusToNormalizedAxes(.05, pageSize);
+  assert.deepEqual(axes, { x: .05, y: .1 });
+
+  let sequence = 0;
+  const parts = splitStrokeByEraser({
+    id: "vertical", type: "stroke",
+    points: [{ x: .5, y: .1 }, { x: .5, y: .9 }]
+  }, [{ x: .5, y: .5 }], .05, () => `part-${++sequence}`, pageSize);
+  assert.equal(parts.length, 2);
+  assert.ok(parts[0].points.at(-1).y < .4);
+  assert.ok(parts[1].points[0].y > .6);
+});
+
 test("移動後もオブジェクトをページ内へ収める", () => {
   const moved = translateElement({ bounds: { x: .8, y: .8, width: .2, height: .2 } }, .5, .5);
   assert.equal(moved.bounds.x, .8);
   assert.equal(moved.bounds.y, .8);
 });
 
-test("lineとarrowはstart/endを正本にし旧bounds/rotationでも同じ向きを再構成する", () => {
-  const pageSize = { width: 1240, height: 1754 };
+test("lineとarrowは縦型・横型ともstart/endを正本にし旧bounds/rotationでも同じ向きを再構成する", () => {
+  const pageSizes = [
+    { width: 1240, height: 1754 },
+    { width: 2000, height: 1000 }
+  ];
   const cases = [
     [{ x: .1, y: .2 }, { x: .8, y: .9 }],
     [{ x: .8, y: .9 }, { x: .1, y: .2 }],
@@ -108,14 +149,16 @@ test("lineとarrowはstart/endを正本にし旧bounds/rotationでも同じ向�
     [{ x: .9, y: .2 }, { x: .1, y: .8 }],
     [{ x: .4, y: .4 }, { x: .4, y: .4 }]
   ];
-  for (const [start, end] of cases) {
-    const normalized = normalizeLineElement({ id: "line", type: "shape", shapeType: "arrow", start, end }, pageSize);
-    assert.deepEqual(normalized.start, start);
-    assert.deepEqual(normalized.end, end);
-    assert.equal("points" in normalized, false);
-    const legacy = lineEndpoints({ bounds: normalized.bounds, rotation: normalized.rotation }, pageSize);
-    assert.ok(Math.hypot(legacy[0].x - start.x, legacy[0].y - start.y) < 1e-9);
-    assert.ok(Math.hypot(legacy[1].x - end.x, legacy[1].y - end.y) < 1e-9);
+  for (const pageSize of pageSizes) {
+    for (const [start, end] of cases) {
+      const normalized = normalizeLineElement({ id: "line", type: "shape", shapeType: "arrow", start, end }, pageSize);
+      assert.deepEqual(normalized.start, start);
+      assert.deepEqual(normalized.end, end);
+      assert.equal("points" in normalized, false);
+      const legacy = lineEndpoints({ bounds: normalized.bounds, rotation: normalized.rotation }, pageSize);
+      assert.ok(Math.hypot(legacy[0].x - start.x, legacy[0].y - start.y) < 1e-9);
+      assert.ok(Math.hypot(legacy[1].x - end.x, legacy[1].y - end.y) < 1e-9);
+    }
   }
 });
 

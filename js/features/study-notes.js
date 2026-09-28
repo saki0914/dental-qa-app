@@ -18,6 +18,8 @@ import {
   normalizeLineElement,
   normalizeNoteLineElements,
   normalizedBoundsFromPoints,
+  normalizedPointToClient,
+  pageWidthRadiusToNormalizedAxes,
   resetImageCrop,
   resizeBoundsFromHandle,
   resizeElements,
@@ -31,7 +33,16 @@ import { chooseClipboardImage, imageFileFromPasteEvent, isTextEditingTarget, rea
 import { createNoteBackgroundSignature } from "../core/note-background.js";
 import { resolveNoteConflicts } from "../core/note-conflict-resolution.js";
 import { createNoteHistory } from "../core/note-history.js";
-import { appendPointerSamples, copyStrokePointsForCommit, createStrokeSession, flushStrokePoints } from "../core/note-stroke-session.js";
+import {
+  appendPointerSamples,
+  copyStrokePointsForCommit,
+  createStrokeRecoveryCooldown,
+  createStrokeSession,
+  delayedPointerdownJoinsRecoveredSession,
+  flushStrokePoints,
+  recoverableStrokeMove,
+  strokeSessionOwnsPointer
+} from "../core/note-stroke-session.js";
 import { createNoteEditorLease, getOrCreateNoteClientInstanceId } from "../core/note-editor-lock.js";
 import {
   createNoteEditorDiagnosticSnapshot,
@@ -42,9 +53,14 @@ import {
   saveStatePresentation,
   shouldRecoverLocalNoteState
 } from "../core/note-editor-state.js";
-import { createNoteInputGuard } from "../core/note-input-guard.js";
+import {
+  createNoteInputGuard,
+  isDrawingInputCaptureEnabled,
+  registerInputDebugPointerdownCapture
+} from "../core/note-input-guard.js";
 import { createNoteLocalStore, noteLocalKey } from "../core/note-local-store.js";
 import { getMaterialPageMasks, maskVisibilityKey } from "../core/note-mask-adapter.js";
+import { notePageMetrics } from "../core/note-page-metrics.js";
 import {
   getMaterialDefaultNoteId,
   isMaterialArchiving
@@ -58,7 +74,7 @@ import {
 } from "../core/note-session-loading.js";
 import { strokeSvgNodes } from "../core/note-stroke.js";
 import { ensureTextElementHeight, layoutTextBox } from "../core/note-text-layout.js";
-import { resolvePageSwipe } from "../core/note-page-swipe.js";
+import { pageSwipeVisualOffset, resolvePageSwipe, resolvePageSwipeIntent } from "../core/note-page-swipe.js";
 import { createNoteThumbnailSignature } from "../core/note-thumbnail.js";
 import {
   cancelledStrokeCanBeCommitted,
@@ -100,6 +116,25 @@ const TOOL_LABELS = {
   "eraser-object": "消しゴム", "eraser-pixel": "ピクセル消しゴム", shape: "図形",
   text: "テキスト", image: "画像", mask: "暗記マスク", study: "暗記モード"
 };
+const PENDING_STROKE_IDLE_MS = 220;
+const TOUCH_PREEMPT_POLICY = Object.freeze({
+  pan: "preserve-viewport",
+  lasso: "rollback",
+  select: "rollback",
+  "move-elements": "rollback",
+  "move-mask": "rollback",
+  "resize-selection": "rollback",
+  "rotate-selection": "rollback",
+  "line-endpoint": "rollback",
+  "crop-resize": "rollback",
+  "eraser-object": "rollback",
+  "eraser-pixel": "rollback",
+  text: "rollback",
+  shape: "rollback",
+  mask: "rollback",
+  pen: "rollback",
+  highlighter: "rollback"
+});
 
 const clone = value => structuredClone(value);
 const stableLegacyMutationId = value => {
@@ -178,7 +213,8 @@ export function createStudyNotes(dependencies) {
     createProgressBar: byId("noteCreateProgressBar"), cancelCreateProgress: byId("cancelNoteProgressBtn"),
     closeNote: byId("closeNoteBtn"), title: byId("noteTitleInput"), pageCounter: byId("notePageCounter"), pagesButton: byId("notePagesBtn"),
     editorHeader: byId("noteEditorView")?.querySelector(".note-editor-header"), localSlot: byId("noteEditorLocalSlot"),
-    undo: byId("noteUndoBtn"), redo: byId("noteRedoBtn"), studyToggle: byId("toggleNoteStudyBtn"),
+    undo: byId("noteUndoBtn"), redo: byId("noteRedoBtn"), modeSwitcher: byId("noteModeSwitcher"),
+    editMode: byId("noteEditModeBtn"), studyModeButton: byId("noteStudyModeBtn"),
     saveStatus: byId("noteSaveStatus"), pageSidebar: byId("notePageSidebar"), pageList: byId("notePageList"),
     saveStatusIcon: byId("noteSaveStatusIcon"), saveStatusButtonText: byId("noteSaveStatusButtonText"), saveStatusLive: byId("noteSaveStatusLive"),
     saveStatusText: byId("noteSaveStatusText"), saveStatusDetail: byId("noteSaveStatusDetail"),
@@ -197,6 +233,8 @@ export function createStudyNotes(dependencies) {
     conflictBanner: byId("notePageConflictBanner"),
     viewport: byId("noteViewport"), stage: byId("notePageStage"),
     drawingInput: byId("notePageStage")?.querySelector('[data-layer="drawing-input"]'), studyControls: byId("noteStudyControls"),
+    adjacentPagePreview: byId("noteAdjacentPagePreview"), inputDebugPanel: byId("noteInputDebugPanel"),
+    inputDebugValues: byId("noteInputDebugValues"), inputDebugDownload: byId("noteInputDebugDownload"),
     eraserCursor: byId("notePixelEraserCursor"), maskSelectMode: byId("noteMaskSelectModeBtn"),
     maskCounts: byId("noteMaskCounts"), selectionActions: byId("noteSelectionActions"), selectionActionsTitle: byId("noteSelectionActionsTitle"),
     toolbar: byId("noteEditorView")?.querySelector(".note-toolbar"), settings: byId("noteToolSettings"),
@@ -256,7 +294,9 @@ export function createStudyNotes(dependencies) {
   let selectedIds = [];
   let activeGesture = null;
   let pendingStrokeWork = null;
-  let pendingStrokeTimer = 0;
+  let pendingStrokeIdleHandle = 0;
+  let pendingStrokeIdleKind = "";
+  let pendingStrokeIdleSince = 0;
   let pendingThumbnailTimer = 0;
   let swipeGesture = null;
   let pageSwitching = false;
@@ -306,6 +346,19 @@ export function createStudyNotes(dependencies) {
   let lastSaveSucceededAt = "";
   let currentSaveState = "saved";
   const drawingDiagnostics = {
+    windowCapturePointerdown: 0,
+    documentCapturePointerdown: 0,
+    editorCapturePointerdown: 0,
+    stageCapturePointerdown: 0,
+    drawingSurfacePointerdown: 0,
+    captureGateAccepted: 0,
+    captureGateRejected: 0,
+    orphanedSessionsRecovered: 0,
+    contactMoveSessionsRecovered: 0,
+    contactMoveRecoveriesBlocked: 0,
+    isolatedPointerupSessionsRecovered: 0,
+    duplicateInputEvents: 0,
+    listenerGeneration: 0,
     pointerdown: 0,
     pointerup: 0,
     pointercancel: 0,
@@ -315,14 +368,35 @@ export function createStudyNotes(dependencies) {
     strokesDiscarded: 0,
     discardedReasons: {},
     coalescedPoints: 0,
+    rawupdateEvents: 0,
     eventIntervals: [],
     straightenTimerFires: 0,
-    longestMainThreadGapMs: 0
+    longestMainThreadGapMs: 0,
+    longTaskCount: 0,
+    lastLongTaskMs: 0,
+    lastDiscardReason: "",
+    lastStrokeGapMs: null,
+    maxPointerdownMs: 0,
+    maxPointermoveMs: 0,
+    maxPointerupMs: 0,
+    events: []
   };
+  const inputDebugEnabled = dedicatedEditor && routeParams.get("firebaseEmulator") === "1" && routeParams.get("inputDebug") === "1";
+  let lastPenEndedAt = null;
+  let diagnosticsFrame = 0;
+  let diagnosticsCaptureFrame = 0;
+  let diagnosticsEventSequence = 0;
+  const pendingInputDiagnostics = [];
+  let longTaskObserver = null;
   let markupMode = true;
   let localRecoverySuppressed = false;
   let textEditorSession = null;
   let editorNoticeTimer = null;
+  let drawingInputListenerController = null;
+  let drawingInputListenerGeneration = 0;
+  let pageLayerGeometryValid = true;
+  let pageLayerGeometryIssue = "";
+  const strokeRecoveryCooldown = createStrokeRecoveryCooldown();
 
   function captureUserSession() {
     const uid = getCurrentUser()?.uid;
@@ -420,6 +494,164 @@ export function createStudyNotes(dependencies) {
     return url;
   }
 
+  function rectSnapshot(node) {
+    const rect = node?.getBoundingClientRect?.();
+    return rect ? {
+      left: Number(rect.left), top: Number(rect.top),
+      width: Number(rect.width), height: Number(rect.height),
+      right: Number(rect.right), bottom: Number(rect.bottom)
+    } : null;
+  }
+
+  function rectDelta(reference, candidate) {
+    if (!reference || !candidate) return null;
+    return Math.max(
+      Math.abs(reference.left - candidate.left),
+      Math.abs(reference.top - candidate.top),
+      Math.abs(reference.width - candidate.width),
+      Math.abs(reference.height - candidate.height)
+    );
+  }
+
+  function positionedLayerSnapshot(node, expectedParent) {
+    if (!node?.isConnected || !expectedParent?.isConnected) return null;
+    const style = globalThis.getComputedStyle?.(node);
+    if (!style || style.display === "none") return null;
+    const numeric = value => Number.parseFloat(value) || 0;
+    const expected = {
+      left: numeric(style.left) + numeric(style.marginLeft),
+      top: numeric(style.top) + numeric(style.marginTop),
+      width: numeric(style.width),
+      height: numeric(style.height)
+    };
+    const layout = {
+      left: Number(node.offsetLeft || 0),
+      top: Number(node.offsetTop || 0),
+      width: Number(node.offsetWidth || 0),
+      height: Number(node.offsetHeight || 0)
+    };
+    const maximumLayoutDeltaPx = Math.max(
+      Math.abs(expected.left - layout.left),
+      Math.abs(expected.top - layout.top),
+      Math.abs(expected.width - layout.width),
+      Math.abs(expected.height - layout.height)
+    );
+    const offsetParentMatches = node.offsetParent === expectedParent;
+    return {
+      rect: rectSnapshot(node),
+      expected,
+      layout,
+      offsetParentMatches,
+      maximumLayoutDeltaPx,
+      valid: offsetParentMatches && maximumLayoutDeltaPx <= 1
+    };
+  }
+
+  function pageLayerDiagnostics() {
+    const page = pages[currentPageIndex] || null;
+    const sourceWidth = Number(page?.size?.width || A4_SIZE.width);
+    const sourceHeight = Number(page?.size?.height || A4_SIZE.height);
+    const pageRootRect = rectSnapshot(ui.stage);
+    const backgroundImage = ui.stage?.querySelector?.(".note-background-image");
+    const paper = ui.stage?.querySelector?.(".note-paper-layer");
+    const background = backgroundImage || paper;
+    const svg = ui.stage?.querySelector?.("svg.note-layer");
+    const masks = ui.stage?.querySelector?.('[data-layer="masks"]');
+    const elements = ui.stage?.querySelector?.('[data-layer="elements"]');
+    const draft = ui.stage?.querySelector?.("[data-note-draft]");
+    const transformOverlay = ui.stage?.querySelector?.(".note-transform-overlay");
+    const cropOverlay = ui.stage?.querySelector?.(".note-crop-overlay");
+    const textEditor = ui.stage?.querySelector?.('[data-note-text-editor="true"]');
+    const transformHandles = transformOverlay ? [...transformOverlay.querySelectorAll(".note-transform-handle")] : [];
+    const cropHandles = cropOverlay ? [...cropOverlay.querySelectorAll(".note-transform-handle")] : [];
+    const layerRects = {
+      backgroundRect: rectSnapshot(background),
+      paperRect: rectSnapshot(paper),
+      elementsRect: rectSnapshot(elements),
+      svgRect: rectSnapshot(svg),
+      inputSurfaceRect: rectSnapshot(ui.drawingInput),
+      maskLayerRect: rectSnapshot(masks),
+      draftRect: rectSnapshot(draft),
+      eraserCursorRect: rectSnapshot(ui.eraserCursor),
+      transformOverlayRect: rectSnapshot(transformOverlay),
+      cropOverlayRect: rectSnapshot(cropOverlay),
+      textEditorRect: rectSnapshot(textEditor)
+    };
+    const compared = [
+      layerRects.backgroundRect,
+      layerRects.elementsRect,
+      layerRects.svgRect,
+      layerRects.inputSurfaceRect,
+      layerRects.maskLayerRect,
+      layerRects.draftRect
+    ].filter(Boolean);
+    const maximumLayerDeltaPx = compared.reduce(
+      (maximum, candidate) => Math.max(maximum, rectDelta(pageRootRect, candidate) || 0),
+      0
+    );
+    const positionedLayers = {
+      eraserCursor: positionedLayerSnapshot(ui.eraserCursor, ui.stage),
+      transformOverlay: positionedLayerSnapshot(transformOverlay, ui.stage),
+      transformHandles: transformHandles.map(node => positionedLayerSnapshot(node, transformOverlay)).filter(Boolean),
+      cropOverlay: positionedLayerSnapshot(cropOverlay, ui.stage),
+      cropHandles: cropHandles.map(node => positionedLayerSnapshot(node, cropOverlay)).filter(Boolean),
+      textEditor: positionedLayerSnapshot(textEditor, ui.stage)
+    };
+    const positionedValues = [
+      positionedLayers.eraserCursor,
+      positionedLayers.transformOverlay,
+      ...positionedLayers.transformHandles,
+      positionedLayers.cropOverlay,
+      ...positionedLayers.cropHandles,
+      positionedLayers.textEditor
+    ].filter(Boolean);
+    const positionedLayerMaximumDeltaPx = positionedValues.reduce(
+      (maximum, candidate) => Math.max(maximum, Number(candidate.maximumLayoutDeltaPx || 0)),
+      0
+    );
+    const positionedLayersValid = positionedValues.every(candidate => candidate.valid);
+    const viewport = globalThis.visualViewport;
+    return {
+      sourceWidth,
+      sourceHeight,
+      aspectRatio: sourceWidth > 0 && sourceHeight > 0 ? sourceWidth / sourceHeight : null,
+      orientation: sourceWidth >= sourceHeight ? "landscape" : "portrait",
+      pdfRotation: Number(page?.background?.pdfRotation || 0),
+      rotationApplied: Number(page?.background?.pdfRotation || 0) !== 0,
+      backgroundNaturalWidth: Number(backgroundImage?.naturalWidth || 0),
+      backgroundNaturalHeight: Number(backgroundImage?.naturalHeight || 0),
+      pageRootRect,
+      ...layerRects,
+      positionedLayers,
+      maximumLayerDeltaPx,
+      positionedLayerMaximumDeltaPx,
+      valid: maximumLayerDeltaPx <= 1 && positionedLayersValid,
+      cssTransform: globalThis.getComputedStyle?.(ui.stage)?.transform || "none",
+      svgViewBox: svg?.getAttribute?.("viewBox") || "",
+      visualViewport: viewport ? {
+        scale: Number(viewport.scale || 1),
+        offsetLeft: Number(viewport.offsetLeft || 0),
+        offsetTop: Number(viewport.offsetTop || 0),
+        width: Number(viewport.width || 0),
+        height: Number(viewport.height || 0)
+      } : null
+    };
+  }
+
+  function validatePageLayerGeometry() {
+    const diagnostic = pageLayerDiagnostics();
+    pageLayerGeometryValid = diagnostic.valid;
+    pageLayerGeometryIssue = diagnostic.valid
+      ? ""
+      : `ページレイヤーの表示矩形が ${Math.max(
+        diagnostic.maximumLayerDeltaPx,
+        diagnostic.positionedLayerMaximumDeltaPx
+      ).toFixed(2)}px ずれています。`;
+    syncDrawingInputLayer();
+    if (!diagnostic.valid) showEditorNotice(pageLayerGeometryIssue);
+    return diagnostic;
+  }
+
   async function editorDiagnostics() {
     const uid = getCurrentUser()?.uid || "";
     const page = pages[currentPageIndex] || null;
@@ -434,6 +666,7 @@ export function createStudyNotes(dependencies) {
     ]) : [null, [], [], []];
     const lease = editorLease?.read?.() || null;
     const rect = ui.stage?.getBoundingClientRect?.();
+    const pageSpace = pageLayerDiagnostics();
     const identityValue = editorLease?.getIdentity?.() || {};
     return createNoteEditorDiagnosticSnapshot({
       capturedAt: new Date().toISOString(),
@@ -463,15 +696,144 @@ export function createStudyNotes(dependencies) {
       viewport: { width: globalThis.innerWidth || 0, height: globalThis.innerHeight || 0 },
       zoom: zoomController?.zoom || 1,
       pageRect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
+      pageSpace,
       startupState,
       drawing: {
         ...drawingDiagnostics,
         eventIntervals: undefined,
+        activePointerId: activeGesture?.pointerId ?? null,
+        activeStrokeSessionId: activeGesture?.strokeSessionId || "",
+        saving: currentSaveState === "saving",
+        rendering: Boolean(renderToken && ui.stage?.querySelector?.("[data-note-draft]")),
         averageEventIntervalMs: drawingDiagnostics.eventIntervals.length
           ? drawingDiagnostics.eventIntervals.reduce((sum, value) => sum + value, 0) / drawingDiagnostics.eventIntervals.length
           : 0
       }
     });
+  }
+
+  function scheduleInputDebugRender() {
+    if (!inputDebugEnabled || !ui.inputDebugValues || diagnosticsFrame) return;
+    diagnosticsFrame = requestAnimationFrame(() => {
+      diagnosticsFrame = 0;
+      const values = [
+        ["window capture", drawingDiagnostics.windowCapturePointerdown],
+        ["document capture", drawingDiagnostics.documentCapturePointerdown],
+        ["editor capture", drawingDiagnostics.editorCapturePointerdown],
+        ["stage capture", drawingDiagnostics.stageCapturePointerdown],
+        ["drawing surface", drawingDiagnostics.drawingSurfacePointerdown],
+        ["capture gate通過", drawingDiagnostics.captureGateAccepted],
+        ["capture gate除外", drawingDiagnostics.captureGateRejected],
+        ["孤立session復旧", drawingDiagnostics.orphanedSessionsRecovered],
+        ["contact move復旧", drawingDiagnostics.contactMoveSessionsRecovered],
+        ["contact move復旧拒否", drawingDiagnostics.contactMoveRecoveriesBlocked],
+        ["pen pointerdown", drawingDiagnostics.pointerdown],
+        ["pen pointerup", drawingDiagnostics.pointerup],
+        ["pointercancel", drawingDiagnostics.pointercancel],
+        ["lostpointercapture", drawingDiagnostics.lostpointercapture],
+        ["strokeSession", drawingDiagnostics.sessionsCreated],
+        ["確定stroke", drawingDiagnostics.strokesCommitted],
+        ["破棄stroke", drawingDiagnostics.strokesDiscarded],
+        ["最後の破棄理由", drawingDiagnostics.lastDiscardReason || "なし"],
+        ["active pointer", activeGesture?.pointerId ?? "なし"],
+        ["active session", activeGesture?.strokeSessionId || "なし"],
+        ["前strokeとの間隔", drawingDiagnostics.lastStrokeGapMs == null ? "-" : `${drawingDiagnostics.lastStrokeGapMs.toFixed(1)}ms`],
+        ["直近long task", drawingDiagnostics.lastLongTaskMs ? `${drawingDiagnostics.lastLongTaskMs.toFixed(1)}ms` : "なし"],
+        ["pointerdown最大", `${drawingDiagnostics.maxPointerdownMs.toFixed(2)}ms`],
+        ["pointermove最大", `${drawingDiagnostics.maxPointermoveMs.toFixed(2)}ms`],
+        ["pointerup最大", `${drawingDiagnostics.maxPointerupMs.toFixed(2)}ms`],
+        ["最大event間隔", `${drawingDiagnostics.longestMainThreadGapMs.toFixed(1)}ms`],
+        ["保存処理", currentSaveState === "saving" ? "実行中" : "待機"],
+        ["raw update", drawingDiagnostics.rawupdateEvents]
+      ];
+      ui.inputDebugValues.replaceChildren(...values.flatMap(([label, value]) => {
+        const term = document.createElement("dt"); term.textContent = label;
+        const detail = document.createElement("dd"); detail.textContent = String(value);
+        return [term, detail];
+      }));
+    });
+  }
+
+  function summarizeInputDiagnosticNode(node) {
+    if (!node || node === globalThis || node === document) {
+      return node === globalThis ? "window" : node === document ? "document" : "";
+    }
+    const tag = String(node.tagName || "").toLowerCase();
+    const classes = [...(node.classList || [])].slice(0, 4).join(".");
+    const data = ["layer", "noteTool", "transformHandle", "cropAction"]
+      .filter(key => node.dataset?.[key])
+      .map(key => `${key}=${String(node.dataset[key]).slice(0, 40)}`)
+      .join(",");
+    return `${tag}${classes ? `.${classes}` : ""}${data ? `[${data}]` : ""}`;
+  }
+
+  function scheduleInputDiagnosticCapture() {
+    if (!inputDebugEnabled || diagnosticsCaptureFrame || !pendingInputDiagnostics.length) return;
+    diagnosticsCaptureFrame = requestAnimationFrame(() => {
+      diagnosticsCaptureFrame = 0;
+      const entries = pendingInputDiagnostics.splice(0);
+      for (const entry of entries) {
+        const { eventTargetNode, sampleBoundary, ...diagnosticEntry } = entry;
+        diagnosticEntry.eventTarget = summarizeInputDiagnosticNode(eventTargetNode);
+        diagnosticEntry.elementsFromPoint = sampleBoundary && diagnosticEntry.clientPoint
+          ? document.elementsFromPoint?.(diagnosticEntry.clientPoint.x, diagnosticEntry.clientPoint.y)
+            .slice(0, 8).map(summarizeInputDiagnosticNode).filter(Boolean) || []
+          : [];
+        drawingDiagnostics.events.push(diagnosticEntry);
+      }
+      if (drawingDiagnostics.events.length > 500) drawingDiagnostics.events.splice(0, drawingDiagnostics.events.length - 500);
+    });
+  }
+
+  function recordInputDiagnostic(eventType, event, gesture = activeGesture, {
+    outcome = "received",
+    reason = "",
+    durationMs = 0
+  } = {}) {
+    if (inputDebugEnabled) {
+      const pageRect = gesture?.pageRect;
+      const clientX = Number(event?.clientX);
+      const clientY = Number(event?.clientY);
+      const hasCoordinates = Number.isFinite(clientX) && Number.isFinite(clientY);
+      const normalizedPoint = hasCoordinates && pageRect?.width > 0 && pageRect?.height > 0
+        ? clientPointToNormalized(clientX, clientY, pageRect)
+        : null;
+      const reprojectedClientPoint = normalizedPoint ? normalizedPointToClient(normalizedPoint, pageRect) : null;
+      const deltaX = reprojectedClientPoint ? reprojectedClientPoint.x - clientX : null;
+      const deltaY = reprojectedClientPoint ? reprojectedClientPoint.y - clientY : null;
+      diagnosticsEventSequence += 1;
+      const diagnosticEntry = {
+        capturedAt: new Date().toISOString(),
+        eventType,
+        pointerId: event?.pointerId ?? gesture?.pointerId ?? null,
+        strokeSessionId: gesture?.strokeSessionId || "",
+        eventTimeStamp: Number(event?.timeStamp || 0),
+        pointCount: Number(gesture?.points?.length || 0) + Number(gesture?.pendingPoints?.length || 0),
+        outcome,
+        reason,
+        durationMs: Number(durationMs || 0),
+        pointerCaptured: Boolean(gesture?.captureTarget?.hasPointerCapture?.(gesture?.pointerId)),
+        clientPoint: hasCoordinates ? { x: clientX, y: clientY } : null,
+        normalizedPoint,
+        reprojectedClientPoint,
+        deltaX,
+        deltaY,
+        distance: deltaX == null ? null : Math.hypot(deltaX, deltaY),
+        activeTool: currentTool,
+        inputSurfaceActive: ui.drawingInput?.classList.contains("active") === true,
+        transientUi: transientUi.type,
+        pageRect: pageRect ? {
+          left: Number(pageRect.left), top: Number(pageRect.top),
+          width: Number(pageRect.width), height: Number(pageRect.height)
+        } : null,
+        eventTargetNode: event?.target || null,
+        sampleBoundary: outcome !== "received" || diagnosticsEventSequence <= 10 || diagnosticsEventSequence % 50 === 0
+      };
+      pendingInputDiagnostics.push(diagnosticEntry);
+      if (pendingInputDiagnostics.length > 500) pendingInputDiagnostics.splice(0, pendingInputDiagnostics.length - 500);
+      scheduleInputDiagnosticCapture();
+    }
+    scheduleInputDebugRender();
   }
 
   async function copyDiagnostics() {
@@ -781,6 +1143,16 @@ export function createStudyNotes(dependencies) {
     applyToolSettingsToUi();
   }
 
+  function persistToolSettingsWhenIdle(patch = {}) {
+    toolSettings = normalizeNoteToolSettings({ ...toolSettings, ...patch });
+    const save = () => {
+      toolSettings = toolSettingsStore?.save(toolSettings) || toolSettings;
+      applyToolSettingsToUi();
+    };
+    if (typeof globalThis.requestIdleCallback === "function") globalThis.requestIdleCallback(save, { timeout: 800 });
+    else setTimeout(save, 0);
+  }
+
   function setEditorReadOnly(value, message = "") {
     readOnlyEditor = value === true;
     ui.editorView.classList.toggle("is-readonly", readOnlyEditor);
@@ -1026,7 +1398,9 @@ export function createStudyNotes(dependencies) {
 
   function scheduleLocalSave(saveIdentity, content) {
     const key = localSaveKey(saveIdentity);
-    const task = saveCoordinator.schedule(saveIdentity, content);
+    const page = pages.find(item => item.pageId === saveIdentity.pageId);
+    const normalizedContent = normalizeNoteLineElements(content, page?.size);
+    const task = saveCoordinator.schedule(saveIdentity, normalizedContent);
     pendingLocalSavePromises.set(key, task);
     const clear = () => {
       if (pendingLocalSavePromises.get(key) === task) pendingLocalSavePromises.delete(key);
@@ -1118,6 +1492,20 @@ export function createStudyNotes(dependencies) {
 
   async function flushAllWithDecision(actionLabel = "操作") {
     while (true) {
+      if (pendingStrokeWork) {
+        try {
+          await flushPendingStrokeWork({ render: false, throwOnError: true });
+        } catch (error) {
+          console.error(error);
+          const choice = prompt(
+            `${actionLabel}の前に手書き下書きを端末内へ保存できませんでした。\n` +
+            "retry（再試行）/ cancel（操作をキャンセル）",
+            "retry"
+          )?.trim().toLowerCase();
+          if (choice === "retry") continue;
+          return false;
+        }
+      }
       const results = await saveCoordinator.flushAll();
       if (!results.some(result => result instanceof Error)) return true;
       const choice = prompt(
@@ -1550,7 +1938,7 @@ export function createStudyNotes(dependencies) {
         ui.createProgressLabel.textContent = `PDFを読み込んでいます ${current} / ${total}ページ（${percent}%）`;
       }, {
         signal: createController.signal,
-        onPage: async ({ file: pageFile, pageNumber, width, height }) => {
+        onPage: async ({ file: pageFile, pageNumber, width, height, pdfRotation }) => {
           assertUserSession(session);
           const pageId = randomId();
           const imagePath = await noteStore.uploadSourcePage(noteId, pageId, pageFile, session.uid);
@@ -1558,7 +1946,7 @@ export function createStudyNotes(dependencies) {
           uploaded.push(imagePath);
           notePages.push({
             pageId, order: pageNumber, pageType: "pdf-source-page", size: { width, height },
-            background: { type: "pdf-source-page", imagePath, sourcePageNumber: pageNumber }
+            background: { type: "pdf-source-page", imagePath, sourcePageNumber: pageNumber, pdfRotation }
           });
         }
       });
@@ -2148,32 +2536,34 @@ export function createStudyNotes(dependencies) {
     return node;
   }
 
-  function pathData(points) {
-    return (points || []).map((point, index) => `${index ? "L" : "M"} ${point.x * 1000} ${point.y * 1414}`).join(" ");
+  function pathData(points, metrics = notePageMetrics(pages[currentPageIndex]?.size)) {
+    return (points || []).map((point, index) => `${index ? "L" : "M"} ${metrics.x(point.x)} ${metrics.y(point.y)}`).join(" ");
   }
 
-  function shapeNode(element, arrowMarkerId = "", pageSize = A4_SIZE) {
+  function shapeNode(element, arrowMarkerId = "", pageSize = A4_SIZE, metrics = notePageMetrics(pageSize)) {
     const style = element.style || {};
     const attrs = {
       fill: Number(style.fillOpacity || 0) > 0 ? style.fillColor || "#111111" : "none",
       "fill-opacity": style.fillOpacity || 0,
       stroke: style.strokeColor || "#111111",
       "stroke-opacity": style.strokeOpacity ?? 1,
-      "stroke-width": Math.max(1, Number(style.strokeWidthRatio || 0.002) * 1000),
-      "stroke-dasharray": style.lineStyle === "dashed" ? "14 9" : style.lineStyle === "dotted" ? "2 8" : ""
+      "stroke-width": Math.max(1, metrics.widthRatio(style.strokeWidthRatio || 0.002)),
+      "stroke-dasharray": style.lineStyle === "dashed"
+        ? `${metrics.widthRatio(.014)} ${metrics.widthRatio(.009)}`
+        : style.lineStyle === "dotted" ? `${metrics.widthRatio(.002)} ${metrics.widthRatio(.008)}` : ""
     };
     if (["line", "arrow"].includes(element.shapeType)) {
       const [start, end] = lineEndpoints(element, pageSize);
       const group = createSvgElement("g", { class: "note-element", "data-element-id": element.id });
       group.append(createSvgElement("line", {
-        x1: start.x * 1000, y1: start.y * 1414,
-        x2: end.x * 1000, y2: end.y * 1414,
-        stroke: "transparent", "stroke-width": 28,
+        x1: metrics.x(start.x), y1: metrics.y(start.y),
+        x2: metrics.x(end.x), y2: metrics.y(end.y),
+        stroke: "transparent", "stroke-width": metrics.widthRatio(.028),
         "pointer-events": "stroke", class: "note-element-hit"
       }));
       const shape = createSvgElement("line", {
-        x1: start.x * 1000, y1: start.y * 1414,
-        x2: end.x * 1000, y2: end.y * 1414,
+        x1: metrics.x(start.x), y1: metrics.y(start.y),
+        x2: metrics.x(end.x), y2: metrics.y(end.y),
         ...attrs, fill: "none"
       });
       if (element.shapeType === "arrow" && arrowMarkerId) shape.setAttribute("marker-end", `url(#${arrowMarkerId})`);
@@ -2181,12 +2571,12 @@ export function createStudyNotes(dependencies) {
       return group;
     }
     const group = createSvgElement("g", {
-      transform: `translate(${element.bounds.x * 1000} ${element.bounds.y * 1414}) rotate(${element.rotation || 0} ${element.bounds.width * 500} ${element.bounds.height * 707})`,
+      transform: `translate(${metrics.x(element.bounds.x)} ${metrics.y(element.bounds.y)}) rotate(${element.rotation || 0} ${metrics.widthRatio(element.bounds.width) / 2} ${metrics.heightRatio(element.bounds.height) / 2})`,
       class: "note-element",
       "data-element-id": element.id
     });
-    const w = element.bounds.width * 1000;
-    const h = element.bounds.height * 1414;
+    const w = metrics.widthRatio(element.bounds.width);
+    const h = metrics.heightRatio(element.bounds.height);
     group.append(createSvgElement("rect", {
       x: 0, y: 0, width: w, height: h,
       fill: "transparent", stroke: "none",
@@ -2207,26 +2597,26 @@ export function createStudyNotes(dependencies) {
     return group;
   }
 
-  function textNode(element) {
+  function textNode(element, metrics = notePageMetrics(pages[currentPageIndex]?.size)) {
     const style = element.style || {};
-    const fontSize = Number(style.fontSizeRatio || .025) * 1414;
+    const fontSize = metrics.heightRatio(style.fontSizeRatio || .025);
     const family = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
     const measurement = document.createElement("canvas").getContext("2d");
     measurement.font = `${style.fontStyle || "normal"} ${style.fontWeight || "normal"} ${fontSize}px ${family}`;
     const align = style.textAlign || "left";
     const anchorX = align === "center"
-      ? (element.bounds.x + element.bounds.width / 2) * 1000
-      : align === "right" ? (element.bounds.x + element.bounds.width) * 1000 : element.bounds.x * 1000;
+      ? metrics.x(element.bounds.x + element.bounds.width / 2)
+      : align === "right" ? metrics.x(element.bounds.x + element.bounds.width) : metrics.x(element.bounds.x);
     const lineHeight = fontSize * Number(style.lineHeight || 1.25);
     const layout = layoutTextBox(element.text, {
-      maxWidth: element.bounds.width * 1000,
+      maxWidth: metrics.widthRatio(element.bounds.width),
       lineHeight,
       measureText: value => measurement.measureText(value).width
     });
-    const effectiveHeight = Math.max(element.bounds.height, layout.requiredHeight / 1414);
+    const effectiveHeight = Math.max(element.bounds.height, layout.requiredHeight / metrics.height);
     const node = createSvgElement("text", {
       x: anchorX,
-      y: element.bounds.y * 1414,
+      y: metrics.y(element.bounds.y),
       fill: style.color || "#111111",
       opacity: style.opacity ?? 1,
       "font-size": fontSize,
@@ -2236,7 +2626,7 @@ export function createStudyNotes(dependencies) {
       "text-anchor": align === "center" ? "middle" : align === "right" ? "end" : "start",
       class: "note-element",
       "data-element-id": element.id,
-      transform: `rotate(${element.rotation || 0} ${(element.bounds.x + element.bounds.width / 2) * 1000} ${(element.bounds.y + effectiveHeight / 2) * 1414})`
+      transform: `rotate(${element.rotation || 0} ${metrics.x(element.bounds.x + element.bounds.width / 2)} ${metrics.y(element.bounds.y + effectiveHeight / 2)})`
     });
     layout.lines.forEach((line, index) => {
       const span = createSvgElement("tspan", { x: anchorX, dy: index ? lineHeight : fontSize });
@@ -2247,13 +2637,15 @@ export function createStudyNotes(dependencies) {
 
   function normalizeTextElementHeight(element) {
     if (element?.type !== "text") return element;
+    const metrics = notePageMetrics(pages[currentPageIndex]?.size);
     const style = element.style || {};
-    const fontSize = Math.max(8, Number(style.fontSizeRatio || .025) * 1414);
+    const fontSize = Math.max(8, metrics.heightRatio(style.fontSizeRatio || .025));
     const family = style.fontFamily === "system-serif" ? "serif" : style.fontFamily === "monospace" ? "monospace" : "sans-serif";
     const measurement = document.createElement("canvas").getContext("2d");
     measurement.font = `${style.fontStyle || "normal"} ${style.fontWeight || "normal"} ${fontSize}px ${family}`;
     return ensureTextElementHeight(element, {
-      pageHeight: 1414,
+      pageWidth: metrics.width,
+      pageHeight: metrics.height,
       measureText: value => measurement.measureText(value).width
     });
   }
@@ -2416,10 +2808,20 @@ export function createStudyNotes(dependencies) {
     });
   }
 
+  function drawingInputCaptureEnabled() {
+    return pageLayerGeometryValid && isDrawingInputCaptureEnabled({
+      hasContent: Boolean(currentContent),
+      studyMode,
+      markupMode,
+      readOnlyEditor,
+      tool: currentTool
+    });
+  }
+
   function syncDrawingInputLayer() {
     const layer = ui.drawingInput;
     if (!layer) return;
-    const enabled = Boolean(currentContent) && !studyMode && markupMode && !readOnlyEditor && ["pen", "highlighter"].includes(currentTool);
+    const enabled = drawingInputCaptureEnabled();
     layer.classList.toggle("active", enabled);
     ui.stage.classList.toggle("is-drawing-input", enabled);
     ui.editorView.classList.toggle("drawing-input-active", enabled);
@@ -2428,6 +2830,98 @@ export function createStudyNotes(dependencies) {
   function bindDrawingInputLayer() {
     const layer = ui.drawingInput;
     if (!layer) throw new Error("描画入力レイヤーを初期化できませんでした。");
+    drawingInputListenerController?.abort();
+    drawingInputListenerController = new AbortController();
+    const { signal } = drawingInputListenerController;
+    drawingInputListenerGeneration += 1;
+    drawingDiagnostics.listenerGeneration = drawingInputListenerGeneration;
+    registerInputDebugPointerdownCapture({
+      enabled: inputDebugEnabled,
+      targets: [globalThis],
+      signal,
+      listener: event => {
+        if (event.pointerType !== "pen") return;
+        drawingDiagnostics.windowCapturePointerdown += 1;
+        scheduleInputDebugRender();
+      }
+    });
+    registerInputDebugPointerdownCapture({
+      enabled: inputDebugEnabled,
+      targets: [document],
+      signal,
+      listener: event => {
+        if (event.pointerType !== "pen") return;
+        drawingDiagnostics.documentCapturePointerdown += 1;
+        scheduleInputDebugRender();
+      }
+    });
+    registerInputDebugPointerdownCapture({
+      enabled: inputDebugEnabled,
+      targets: [ui.editorView],
+      signal,
+      listener: event => {
+        if (event.pointerType !== "pen") return;
+        drawingDiagnostics.editorCapturePointerdown += 1;
+        scheduleInputDebugRender();
+      }
+    });
+    const capturePenPointer = (handler, { raw = false } = {}) => event => {
+      if (event.pointerType !== "pen") return;
+      if (event.type === "pointerdown") {
+        drawingDiagnostics.stageCapturePointerdown += 1;
+        if (event.target === layer || layer.contains(event.target)) {
+          drawingDiagnostics.drawingSurfacePointerdown += 1;
+        }
+        if (!drawingInputCaptureEnabled()) {
+          drawingDiagnostics.captureGateRejected += 1;
+          scheduleInputDebugRender();
+          return;
+        }
+        drawingDiagnostics.captureGateAccepted += 1;
+        strokeRecoveryCooldown.notePointerdown(event.pointerId);
+      } else {
+        const ownsCapturedDrawing = activeGesture?.pointerId === event.pointerId &&
+          activeGesture.pointerType === "pen" && ["pen", "highlighter"].includes(activeGesture.type);
+        if (!ownsCapturedDrawing) {
+          const canRecoverMissingDown = !activeGesture && drawingInputCaptureEnabled() && recoverableStrokeMove(event);
+          if (!canRecoverMissingDown) return;
+          if (strokeRecoveryCooldown.blocks(event)) {
+            event.stopImmediatePropagation();
+            drawingDiagnostics.contactMoveRecoveriesBlocked += 1;
+            recordInputDiagnostic("session-recovery-blocked", event, null, {
+              outcome: "blocked",
+              reason: "pointer-end-cooldown"
+            });
+            return;
+          }
+          event.stopImmediatePropagation();
+          beginPointer(event, { recoveredFromMissingPointerdown: true });
+          if (!strokeSessionOwnsPointer(activeGesture, event)) return;
+          drawingDiagnostics.orphanedSessionsRecovered += 1;
+          drawingDiagnostics.contactMoveSessionsRecovered += 1;
+          recordInputDiagnostic("session-recovered", event, activeGesture, {
+            outcome: "recovered",
+            reason: event.type
+          });
+        }
+      }
+      event.stopImmediatePropagation();
+      if (raw) drawingDiagnostics.rawupdateEvents += 1;
+      handler(event);
+    };
+    ui.stage.addEventListener("pointerdown", capturePenPointer(beginPointer), { capture: true, signal });
+    ui.stage.addEventListener("pointermove", capturePenPointer(movePointer), { capture: true, signal });
+    if ("onpointerrawupdate" in globalThis) {
+      ui.stage.addEventListener("pointerrawupdate", capturePenPointer(event => movePointer(event, { raw: true }), { raw: true }), { capture: true, signal });
+    }
+    ui.stage.addEventListener("pointerup", capturePenPointer(endPointer), { capture: true, signal });
+    ui.stage.addEventListener("pointercancel", capturePenPointer(endPointer), { capture: true, signal });
+    ui.stage.addEventListener("lostpointercapture", event => {
+      if (event.pointerType !== "pen" || activeGesture?.pointerId !== event.pointerId) return;
+      event.stopImmediatePropagation();
+      drawingDiagnostics.lostpointercapture += 1;
+      finishPointerGesture("lostpointercapture", event);
+    }, { capture: true, signal });
     const forwardDrawingPointer = handler => event => {
       // Touch stays on the viewport/stage path so single-finger pan and
       // two-finger pinch keep working. Pencil and mouse use one stable layer.
@@ -2435,16 +2929,23 @@ export function createStudyNotes(dependencies) {
       event.stopPropagation();
       handler(event);
     };
-    layer.addEventListener("pointerdown", forwardDrawingPointer(beginPointer));
-    layer.addEventListener("pointermove", forwardDrawingPointer(movePointer));
-    layer.addEventListener("pointerup", forwardDrawingPointer(endPointer));
-    layer.addEventListener("pointercancel", forwardDrawingPointer(endPointer));
+    layer.addEventListener("pointerdown", forwardDrawingPointer(beginPointer), { signal });
+    layer.addEventListener("pointermove", forwardDrawingPointer(movePointer), { signal });
+    if ("onpointerrawupdate" in globalThis) {
+      layer.addEventListener("pointerrawupdate", forwardDrawingPointer(event => {
+        drawingDiagnostics.rawupdateEvents += 1;
+        movePointer(event, { raw: true });
+      }), { signal });
+    }
+    layer.addEventListener("pointerup", forwardDrawingPointer(endPointer), { signal });
+    layer.addEventListener("pointercancel", forwardDrawingPointer(endPointer), { signal });
     layer.addEventListener("lostpointercapture", event => {
       if (event.pointerType === "touch") return;
       event.stopPropagation();
+      if (activeGesture?.pointerId !== event.pointerId) return;
       drawingDiagnostics.lostpointercapture += 1;
-      if (activeGesture?.pointerId === event.pointerId) finishPointerGesture("lostpointercapture", event);
-    });
+      finishPointerGesture("lostpointercapture", event);
+    }, { signal });
     syncDrawingInputLayer();
   }
 
@@ -2452,6 +2953,10 @@ export function createStudyNotes(dependencies) {
     if (!currentContent || !pages[currentPageIndex]) return;
     const token = ++renderToken;
     const page = pages[currentPageIndex];
+    const metrics = notePageMetrics(page.size);
+    // Apply the next page geometry before background I/O yields. Pointer input
+    // must never observe the previous page's aspect ratio during a page switch.
+    ui.stage.style.aspectRatio = `${page.size?.width || A4_SIZE.width} / ${page.size?.height || A4_SIZE.height}`;
     const backgroundSignature = createNoteBackgroundSignature(page, currentNote?.id);
     const keepBackground = renderedBackgroundSignature === backgroundSignature &&
       Boolean(ui.stage.querySelector(".note-paper-layer"));
@@ -2487,7 +2992,6 @@ export function createStudyNotes(dependencies) {
       }
     }
     if (token !== renderToken) return;
-    ui.stage.style.aspectRatio = `${page.size?.width || A4_SIZE.width} / ${page.size?.height || A4_SIZE.height}`;
     ui.stage.classList.toggle("study-mode", studyMode);
 
     const elementLayer = document.createElement("div");
@@ -2514,12 +3018,14 @@ export function createStudyNotes(dependencies) {
         continue;
       }
 
-      const svg = createSvgElement("svg", { viewBox: "0 0 1000 1414", preserveAspectRatio: "none", class: "note-layer note-svg-layer note-element-layer" });
+      const svg = createSvgElement("svg", { viewBox: metrics.viewBox, preserveAspectRatio: "none", class: "note-layer note-svg-layer note-element-layer" });
       svg.style.zIndex = layerZIndex;
       if (["highlighter", "stroke"].includes(element.type)) {
         if (element.type === "stroke" && element.pressureEnabled === true) {
           strokeSvgNodes(createSvgElement, element.points, Number(element.style?.widthRatio || .0025), {
             pressureEnabled: true,
+            scaleX: metrics.width,
+            scaleY: metrics.height,
             attributes: {
               fill: "none", stroke: element.style?.color || "#111111",
               "stroke-opacity": element.style?.opacity ?? 1,
@@ -2527,10 +3033,22 @@ export function createStudyNotes(dependencies) {
               "data-element-id": element.id
             }
           }).forEach(node => svg.append(node));
+        } else if (element.points?.length === 1) {
+          strokeSvgNodes(createSvgElement, element.points, Number(element.style?.widthRatio || .0025), {
+            pressureEnabled: false,
+            scaleX: metrics.width,
+            scaleY: metrics.height,
+            attributes: {
+              fill: "none", stroke: element.style?.color || "#111111",
+              "stroke-opacity": element.style?.opacity ?? (element.type === "highlighter" ? .3 : 1),
+              class: `note-element ${selectedIds.includes(element.id) ? "note-selected" : ""}`,
+              "data-element-id": element.id
+            }
+          }).forEach(node => svg.append(node));
         } else {
           svg.append(createSvgElement("path", {
-            d: pathData(element.points), fill: "none", stroke: element.style?.color || "#111111",
-            "stroke-width": Math.max(1, Number(element.style?.widthRatio || .0025) * 1000),
+            d: pathData(element.points, metrics), fill: "none", stroke: element.style?.color || "#111111",
+            "stroke-width": Math.max(1, metrics.widthRatio(element.style?.widthRatio || .0025)),
             "stroke-opacity": element.style?.opacity ?? (element.type === "highlighter" ? .3 : 1),
             "stroke-linecap": "round", "stroke-linejoin": "round",
             class: `note-element ${selectedIds.includes(element.id) ? "note-selected" : ""}`,
@@ -2544,9 +3062,9 @@ export function createStudyNotes(dependencies) {
           const marker = createSvgElement("marker", { id: markerId, markerWidth: 10, markerHeight: 10, refX: 8, refY: 3, orient: "auto", markerUnits: "strokeWidth" });
           marker.append(createSvgElement("path", { d: "M0,0 L0,6 L9,3 z", fill: "context-stroke" })); defs.append(marker); svg.append(defs);
         }
-        const node = shapeNode(element, markerId, page.size); if (selectedIds.includes(element.id)) node.classList.add("note-selected"); svg.append(node);
+        const node = shapeNode(element, markerId, page.size, metrics); if (selectedIds.includes(element.id)) node.classList.add("note-selected"); svg.append(node);
       } else if (element.type === "text") {
-        const node = textNode(element); if (selectedIds.includes(element.id)) node.classList.add("note-selected"); svg.append(node);
+        const node = textNode(element, metrics); if (selectedIds.includes(element.id)) node.classList.add("note-selected"); svg.append(node);
       } else {
         continue;
       }
@@ -2591,6 +3109,9 @@ export function createStudyNotes(dependencies) {
       viewport: ui.viewport,
       content: ui.stage,
       shouldTrackTouch: event => !inputGuard.isPenActive() && !inputGuard.isPalmCandidate(event)
+    });
+    requestAnimationFrame(() => {
+      if (token === renderToken) validatePageLayerGeometry();
     });
   }
 
@@ -2735,11 +3256,58 @@ export function createStudyNotes(dependencies) {
     };
   }
 
+  function cancelPendingStrokeSchedule() {
+    if (!pendingStrokeIdleHandle) return;
+    if (pendingStrokeIdleKind === "idle") globalThis.cancelIdleCallback?.(pendingStrokeIdleHandle);
+    else clearTimeout(pendingStrokeIdleHandle);
+    pendingStrokeIdleHandle = 0;
+    pendingStrokeIdleKind = "";
+  }
+
+  function schedulePendingStrokeFlush() {
+    cancelPendingStrokeSchedule();
+    const armTimeout = delay => {
+      pendingStrokeIdleKind = "timeout";
+      pendingStrokeIdleHandle = setTimeout(run, Math.max(16, delay));
+    };
+    const armIdleCallback = () => {
+      pendingStrokeIdleKind = "idle";
+      pendingStrokeIdleHandle = globalThis.requestIdleCallback(run, { timeout: 500 });
+    };
+    const run = () => {
+      const firedKind = pendingStrokeIdleKind;
+      pendingStrokeIdleHandle = 0;
+      pendingStrokeIdleKind = "";
+      if (!pendingStrokeWork) return;
+      if (activeGesture) {
+        pendingStrokeIdleSince = 0;
+        armTimeout(60);
+        return;
+      }
+      const now = performance.now();
+      if (!pendingStrokeIdleSince) pendingStrokeIdleSince = now;
+      const quietRemaining = PENDING_STROKE_IDLE_MS - (now - pendingStrokeIdleSince);
+      if (quietRemaining > 0) {
+        armTimeout(quietRemaining);
+        return;
+      }
+      if (typeof globalThis.requestIdleCallback === "function" && firedKind !== "idle") {
+        armIdleCallback();
+        return;
+      }
+      void flushPendingStrokeWork();
+    };
+    const quietRemaining = pendingStrokeIdleSince
+      ? PENDING_STROKE_IDLE_MS - (performance.now() - pendingStrokeIdleSince)
+      : PENDING_STROKE_IDLE_MS;
+    armTimeout(quietRemaining);
+  }
+
   async function flushPendingStrokeWork({ render = true, throwOnError = false } = {}) {
-    clearTimeout(pendingStrokeTimer);
-    pendingStrokeTimer = 0;
+    cancelPendingStrokeSchedule();
     const work = pendingStrokeWork;
     pendingStrokeWork = null;
+    pendingStrokeIdleSince = 0;
     if (!work) return;
     for (const entry of work.historyEntries || []) {
       history.pushImmutable(
@@ -2749,11 +3317,16 @@ export function createStudyNotes(dependencies) {
       );
     }
     ui.undo.disabled = !history.canUndo();
+    // Enqueue the immutable content snapshot before yielding to rendering.
+    // Multiple idle flushes may overlap while Pencil input continues; if an
+    // older flush awaited render first it could otherwise enqueue after a
+    // newer page snapshot and overwrite it on reload.
+    const saveTask = scheduleLocalSave(work.identity, work.content);
     if (render && currentNote?.id === work.identity.noteId && pages[currentPageIndex]?.pageId === work.identity.pageId) {
       await renderPage();
     }
     try {
-      await scheduleLocalSave(work.identity, work.content);
+      await saveTask;
     } catch (error) {
       if (throwOnError) {
         if (!pendingStrokeWork) pendingStrokeWork = work;
@@ -2775,8 +3348,8 @@ export function createStudyNotes(dependencies) {
     if (!pendingStrokeWork) pendingStrokeWork = { identity: identity(), content: after, historyEntries: [] };
     pendingStrokeWork.content = after;
     pendingStrokeWork.historyEntries.push({ before, after, label });
-    clearTimeout(pendingStrokeTimer);
-    pendingStrokeTimer = setTimeout(() => { void flushPendingStrokeWork(); }, 140);
+    pendingStrokeIdleSince = performance.now();
+    schedulePendingStrokeFlush();
     ui.undo.disabled = false;
   }
 
@@ -2785,15 +3358,22 @@ export function createStudyNotes(dependencies) {
     gesture.previewFrame = requestAnimationFrame(() => {
       gesture.previewFrame = 0;
       flushStrokePoints(gesture);
-      if (activeGesture === gesture || gesture.isFinalizing) drawDraftPath(gesture.points, gesture.type, gesture);
+      if (activeGesture !== gesture && !gesture.isFinalizing) return;
+      const previewPoints = gesture.rawPreviewPoint
+        ? gesture.straightened
+          ? straightenedPoints(gesture.freehandPoints || gesture.points, gesture.rawPreviewPoint)
+          : [...gesture.points, gesture.rawPreviewPoint]
+        : gesture.points;
+      drawDraftPath(previewPoints, gesture.type, gesture);
     });
   }
 
   function flushGestureSamples(gesture, event, { ensureRenderable = false } = {}) {
     if (!gesture || !["pen", "highlighter", "eraser-pixel"].includes(gesture.type)) return;
-    if (event && event.pointerId === gesture.pointerId) {
+    if (event && event.pointerId === gesture.pointerId && ["pointermove", "pointerup", "pointercancel"].includes(event.type)) {
       appendPointerSamples(gesture, event, sample => gesturePoint(sample, gesture.pageRect));
     }
+    gesture.rawPreviewPoint = null;
     if (gesture.previewFrame) cancelAnimationFrame(gesture.previewFrame);
     gesture.previewFrame = 0;
     flushStrokePoints(gesture, { ensureRenderable });
@@ -2808,6 +3388,7 @@ export function createStudyNotes(dependencies) {
     gesture?.previewNode?.remove?.();
     gesture.previewNode = null;
     gesture.previewPath = null;
+    gesture.rawPreviewPoint = null;
   }
 
   function hidePixelEraserCursor() {
@@ -2823,13 +3404,17 @@ export function createStudyNotes(dependencies) {
     }
     const point = gesturePoint(event, activeGesture?.pageRect);
     const pageRect = activeGesture?.pageRect || ui.stage.getBoundingClientRect();
-    const diameter = Math.max(8, Number(toolSettings.eraserSize) / 1000 * 5 * pageRect.width);
+    const pageSize = pages[currentPageIndex]?.size;
+    const radius = Number(toolSettings.eraserSize) / 1000 * 2.5;
+    const axes = pageWidthRadiusToNormalizedAxes(radius, pageSize);
+    const cursorWidth = Math.max(8, axes.x * 2 * pageRect.width);
+    const cursorHeight = Math.max(8, axes.y * 2 * pageRect.height);
     if (eraserCursorFrame) cancelAnimationFrame(eraserCursorFrame);
     eraserCursorFrame = requestAnimationFrame(() => {
       eraserCursorFrame = 0;
       const zoom = Math.max(.001, zoomController?.zoom || 1);
-      ui.eraserCursor.style.width = `${diameter / zoom}px`;
-      ui.eraserCursor.style.height = `${diameter / zoom}px`;
+      ui.eraserCursor.style.width = `${cursorWidth / zoom}px`;
+      ui.eraserCursor.style.height = `${cursorHeight / zoom}px`;
       ui.eraserCursor.style.left = `${point.x * 100}%`;
       ui.eraserCursor.style.top = `${point.y * 100}%`;
       ui.eraserCursor.classList.remove("hidden");
@@ -2848,19 +3433,20 @@ export function createStudyNotes(dependencies) {
       .sort((a, b) => Number(b.element.zIndex || 0) - Number(a.element.zIndex || 0) || b.index - a.index)
       .find(({ element }) => {
         const tolerance = Math.max(.006, Number(element.style?.widthRatio || 0) * 1.5);
+        const toleranceAxes = pageWidthRadiusToNormalizedAxes(tolerance, pageSize);
         if (["stroke", "highlighter"].includes(element.type)) {
           const points = element.points || [];
           return points.length === 1
-            ? Math.hypot(points[0].x - point.x, points[0].y - point.y) <= tolerance
-            : points.slice(1).some((end, index) => distanceToSegment(point, points[index], end) <= tolerance);
+            ? distanceToSegment(point, points[0], points[0], pageSize) <= tolerance
+            : points.slice(1).some((end, index) => distanceToSegment(point, points[index], end, pageSize) <= tolerance);
         }
         if (element.type === "shape" && ["line", "arrow"].includes(element.shapeType)) {
           const [start, end] = lineEndpoints(element, pageSize);
-          return distanceToSegment(point, start, end) <= tolerance;
+          return distanceToSegment(point, start, end, pageSize) <= tolerance;
         }
         const bounds = elementBounds(element, pageSize);
-        return point.x >= bounds.x - tolerance && point.x <= bounds.x + bounds.width + tolerance &&
-          point.y >= bounds.y - tolerance && point.y <= bounds.y + bounds.height + tolerance;
+        return point.x >= bounds.x - toleranceAxes.x && point.x <= bounds.x + bounds.width + toleranceAxes.x &&
+          point.y >= bounds.y - toleranceAxes.y && point.y <= bounds.y + bounds.height + toleranceAxes.y;
       })?.element?.id || "";
   }
 
@@ -2912,26 +3498,28 @@ export function createStudyNotes(dependencies) {
     currentContent.noteMasks = currentContent.noteMasks.map(mask => replacements.get(mask.id) || mask);
   }
 
-  function objectEraserHit(element, point, radius) {
+  function objectEraserHit(element, point, radius, pageSize) {
     if (["stroke", "highlighter"].includes(element.type)) {
       const points = element.points || [];
-      if (points.length === 1) return Math.hypot(points[0].x - point.x, points[0].y - point.y) <= radius;
-      return points.slice(1).some((end, index) => distanceToSegment(point, points[index], end) <= radius);
+      if (points.length === 1) return distanceToSegment(point, points[0], points[0], pageSize) <= radius;
+      return points.slice(1).some((end, index) => distanceToSegment(point, points[index], end, pageSize) <= radius);
     }
     if (element.type === "shape" && ["line", "arrow"].includes(element.shapeType)) {
-      const [start, end] = lineEndpoints(element, pages[currentPageIndex]?.size);
-      return distanceToSegment(point, start, end) <= radius;
+      const [start, end] = lineEndpoints(element, pageSize);
+      return distanceToSegment(point, start, end, pageSize) <= radius;
     }
     if (!["shape", "text"].includes(element.type) || !element.bounds) return false;
     const bounds = element.bounds;
-    return point.x >= bounds.x - radius && point.x <= bounds.x + bounds.width + radius &&
-      point.y >= bounds.y - radius && point.y <= bounds.y + bounds.height + radius;
+    const axes = pageWidthRadiusToNormalizedAxes(radius, pageSize);
+    return point.x >= bounds.x - axes.x && point.x <= bounds.x + bounds.width + axes.x &&
+      point.y >= bounds.y - axes.y && point.y <= bounds.y + bounds.height + axes.y;
   }
 
   function eraseObjectsAt(point, gesture) {
     const radius = Number(toolSettings.eraserSize) / 1000 * 2.5;
+    const pageSize = pages[currentPageIndex]?.size;
     const beforeCount = currentContent.elements.length;
-    currentContent.elements = currentContent.elements.filter(element => !objectEraserHit(element, point, radius));
+    currentContent.elements = currentContent.elements.filter(element => !objectEraserHit(element, point, radius, pageSize));
     if (currentContent.elements.length !== beforeCount) {
       gesture.changed = true;
       renderPage();
@@ -2987,10 +3575,30 @@ export function createStudyNotes(dependencies) {
     const gesture = activeGesture;
     if (!gesture || !["pen", "highlighter"].includes(gesture.type)) return false;
     if (event.pointerType !== gesture.pointerType) return false;
-    return finishPointerGesture("interrupted-drawing", event, { interrupted: true });
+    const recovered = finishPointerGesture("interrupted-drawing", event, { interrupted: true });
+    if (recovered) drawingDiagnostics.orphanedSessionsRecovered += 1;
+    return recovered;
   }
 
-  function beginPointer(event) {
+  function preemptTouchGestureForPen() {
+    const gesture = activeGesture;
+    if (!gesture || gesture.pointerType !== "touch") return false;
+    if (swipeGesture?.pointerId === gesture.pointerId) swipeGesture.blocked = true;
+    clearSwipeVisual({ immediate: true });
+    const policy = TOUCH_PREEMPT_POLICY[gesture.type] || "rollback";
+    if (policy !== "preserve-viewport") {
+      if (gesture.type === "eraser-pixel") hidePixelEraserCursor();
+      return finishPointerGesture("pen-preempt");
+    }
+    clearStraightenTimer(gesture);
+    activeGesture = null;
+    releaseActivePointer(gesture.pointerId, gesture.captureTarget);
+    removeGesturePreview(gesture);
+    return true;
+  }
+
+  function beginPointer(event, { recoveredFromMissingPointerdown = false } = {}) {
+    const startedProcessingAt = performance.now();
     if (isTextEditingTarget(event.target)) return;
     const requestedHandle = targetTransformHandle(event);
     const cropControl = requestedHandle.startsWith("crop-") || event.target?.closest?.("[data-crop-action]");
@@ -2998,19 +3606,28 @@ export function createStudyNotes(dependencies) {
       event.preventDefault();
       return;
     }
-    if (!cropControl) closeTransientUi();
+    if (!cropControl && transientUi.type !== "closed") closeTransientUi();
     globalThis.getSelection?.()?.removeAllRanges?.();
     if (toolSettings.toolbarAutoHide && ["pen", "highlighter"].includes(currentTool)) {
       ui.toolbar.classList.add("collapsed");
     }
     if (!currentContent || event.button > 0) return;
-    if (["pen", "highlighter"].includes(currentTool)) {
-      clearTimeout(pendingStrokeTimer);
-      pendingStrokeTimer = 0;
+    if (delayedPointerdownJoinsRecoveredSession(activeGesture, event)) {
+      drawingDiagnostics.pointerdown += 1;
+      recordInputDiagnostic("pointerdown", event, activeGesture, {
+        outcome: "joined",
+        reason: activeGesture.recoveredFromEvent
+      });
+      event.preventDefault();
+      return;
     }
+    if (pendingStrokeWork) pendingStrokeIdleSince = 0;
     if (event.target?.closest?.("[data-crop-action]")) return;
     if (!studyMode && !isEditableNow()) { explainBlockedEdit(); return; }
     const touchCount = event.pointerType === "touch" ? activeTouchPointerIds.size : 0;
+    if (event.pointerType === "pen" && activeGesture?.pointerType === "touch") {
+      preemptTouchGestureForPen();
+    }
     if (activeGesture) {
       // A second touch belongs to the viewport pinch controller. It must bubble
       // through the Pencil capture layer without settling the first touch here.
@@ -3030,7 +3647,7 @@ export function createStudyNotes(dependencies) {
       hasSeenPen = true;
       if (["pen", "highlighter"].includes(currentTool)) ui.editorView.classList.add("pen-contact-active");
       if (!toolSettings.pencilMode || toolSettings.fingerDraw) {
-        persistToolSettings({ pencilMode: true, fingerDraw: false });
+        persistToolSettingsWhenIdle({ pencilMode: true, fingerDraw: false });
       }
     }
     const pageRect = ui.stage.getBoundingClientRect();
@@ -3131,7 +3748,9 @@ export function createStudyNotes(dependencies) {
         return;
       }
     } else if (["pen", "highlighter"].includes(currentTool)) {
-      drawingDiagnostics.pointerdown += 1;
+      if (!recoveredFromMissingPointerdown) drawingDiagnostics.pointerdown += 1;
+      const now = Number(event.timeStamp || performance.now());
+      if (lastPenEndedAt != null) drawingDiagnostics.lastStrokeGapMs = Math.max(0, now - lastPenEndedAt);
       activeGesture = {
         ...createStrokeSession({
           id: randomId(),
@@ -3139,16 +3758,25 @@ export function createStudyNotes(dependencies) {
           pointerType: event.pointerType,
           tool: currentTool,
           firstPoint: { ...point, pressure: Number(event.pressure || .5) },
-          startedAt: Number(event.timeStamp || performance.now())
+          startedAt: Number(event.timeStamp || performance.now()),
+          recoveredFromEvent: recoveredFromMissingPointerdown ? event.type : ""
         }),
         type: currentTool,
         start: point,
         end: point,
         before: currentContent,
-        pageRect
+        pageRect,
+        pageMetrics: notePageMetrics(pages[currentPageIndex]?.size)
       };
       drawingDiagnostics.sessionsCreated += 1;
-      drawDraftPath(activeGesture.points, activeGesture.type, activeGesture);
+      // Keep the synchronous pointerdown path below one frame budget. The
+      // first point is already in the session; materialize only its draft DOM
+      // on the next animation frame (pointerup flushes it synchronously when
+      // the stroke is shorter than one frame).
+      scheduleStrokePreview(activeGesture);
+      const durationMs = performance.now() - startedProcessingAt;
+      drawingDiagnostics.maxPointerdownMs = Math.max(drawingDiagnostics.maxPointerdownMs, durationMs);
+      recordInputDiagnostic(recoveredFromMissingPointerdown ? "session-recovered" : "pointerdown", event, activeGesture, { durationMs });
     } else {
       activeGesture = { type: currentTool === "select" ? "lasso" : currentTool, pointerId: event.pointerId, pointerType: event.pointerType, start: point, points: [{ ...point, pressure: Number(event.pressure || .5) }], end: point, additive: event.shiftKey, before: clone(currentContent) };
       activeGesture.pageRect = pageRect;
@@ -3161,15 +3789,44 @@ export function createStudyNotes(dependencies) {
     event.preventDefault();
   }
 
-  function movePointer(event) {
+  function movePointer(event, { raw = false } = {}) {
+    const startedProcessingAt = performance.now();
     if (!activeGesture || activeGesture.pointerId !== event.pointerId) return;
+    if (
+      event.pointerType === "touch" &&
+      ["pen", "highlighter"].includes(activeGesture.type) &&
+      swipeGesture?.pointerId === event.pointerId
+    ) {
+      if (swipeGesture.directionLock === "pending") {
+        event.preventDefault();
+        return;
+      }
+      if (swipeGesture.directionLock === "swipe") {
+        const gesture = activeGesture;
+        clearStraightenTimer(gesture);
+        activeGesture = null;
+        releaseActivePointer(gesture.pointerId, gesture.captureTarget);
+        removeGesturePreview(gesture);
+        currentContent = gesture.before;
+        drawingDiagnostics.strokesDiscarded += 1;
+        drawingDiagnostics.discardedReasons["page-swipe"] = Number(drawingDiagnostics.discardedReasons["page-swipe"] || 0) + 1;
+        drawingDiagnostics.lastDiscardReason = "page-swipe";
+        recordInputDiagnostic(event.type, event, gesture, { outcome: "page-swipe", reason: "horizontal-direction-lock" });
+        event.preventDefault();
+        return;
+      }
+    }
     if (activeGesture.type === "pan") {
+      if (event.pointerType === "touch" && swipeGesture?.pointerId === event.pointerId && swipeGesture.directionLock === "swipe") {
+        event.preventDefault();
+        return;
+      }
       ui.viewport.scrollLeft = activeGesture.scrollLeft - (event.clientX - activeGesture.clientX);
       ui.viewport.scrollTop = activeGesture.scrollTop - (event.clientY - activeGesture.clientY);
       return;
     }
     const point = gesturePoint(event, activeGesture.pageRect);
-    activeGesture.end = point;
+    if (!raw) activeGesture.end = point;
     if (activeGesture.type === "resize-selection") {
       const targetBounds = resizeBoundsFromHandle(activeGesture.bounds, activeGesture.handle, point);
       if (activeGesture.target === "masks") resizeSelectedMasks(activeGesture.original, activeGesture.bounds, targetBounds);
@@ -3206,6 +3863,16 @@ export function createStudyNotes(dependencies) {
       cropSession.draft = { crop: clone(image.crop), bounds: clone(image.bounds) };
       renderPage();
     } else if (["pen", "highlighter"].includes(activeGesture.type)) {
+      if (raw) {
+        activeGesture.rawPreviewPoint = { ...point, pressure: Number(event.pressure || .5) };
+        scheduleStrokePreview(activeGesture);
+        const durationMs = performance.now() - startedProcessingAt;
+        drawingDiagnostics.maxPointermoveMs = Math.max(drawingDiagnostics.maxPointermoveMs, durationMs);
+        recordInputDiagnostic("pointerrawupdate", event, activeGesture, { durationMs });
+        event.preventDefault();
+        return;
+      }
+      activeGesture.rawPreviewPoint = null;
       if (activeGesture.straightened) {
         activeGesture.points = straightenedPoints(activeGesture.freehandPoints, point);
         drawDraftPath(activeGesture.points, activeGesture.type, activeGesture);
@@ -3220,6 +3887,9 @@ export function createStudyNotes(dependencies) {
         }
         armStraightenTimer(activeGesture, event);
         scheduleStrokePreview(activeGesture);
+        const durationMs = performance.now() - startedProcessingAt;
+        drawingDiagnostics.maxPointermoveMs = Math.max(drawingDiagnostics.maxPointermoveMs, durationMs);
+        recordInputDiagnostic(raw ? "pointerrawupdate" : "pointermove", event, activeGesture, { durationMs });
       }
     } else if (activeGesture.type === "eraser-pixel") {
       const coalesced = event.getCoalescedEvents?.();
@@ -3254,7 +3924,7 @@ export function createStudyNotes(dependencies) {
   }
 
   function commitDrawGesture(gesture) {
-    if (gesture?.committed || !["pen", "highlighter"].includes(gesture?.type) || !Array.isArray(gesture.points) || gesture.points.length <= 1) return false;
+    if (gesture?.committed || !["pen", "highlighter"].includes(gesture?.type) || !Array.isArray(gesture.points) || gesture.points.length < 1) return false;
     gesture.committed = true;
     const isHighlighter = gesture.type === "highlighter";
     const element = {
@@ -3269,6 +3939,10 @@ export function createStudyNotes(dependencies) {
       zIndex: elementZIndex(currentContent.elements), createdAt: new Date().toISOString()
     };
     currentContent = { ...currentContent, elements: [...currentContent.elements, element] };
+    // Promote the already visible draft before any idle render. This avoids a
+    // blank frame and makes an interrupted previous stroke immediately final.
+    gesture.previewPath?.setAttribute("data-element-id", element.id);
+    gesture.previewPath?.classList.add("note-element");
     gesture.previewNode?.setAttribute("data-note-draft", "settled");
     queueStrokeWork(gesture.before, currentContent, isHighlighter ? "ハイライト追加" : "ペン追加");
     drawingDiagnostics.strokesCommitted += 1;
@@ -3276,13 +3950,15 @@ export function createStudyNotes(dependencies) {
   }
 
   function finishPointerGesture(reason = "pointercancel", event = null, { interrupted = false } = {}) {
+    const startedProcessingAt = performance.now();
     const gesture = activeGesture;
     if (!gesture || gesture.settling) return false;
     if (!interrupted && event?.pointerId !== undefined && gesture.pointerId !== event.pointerId) return false;
     gesture.settling = true;
     gesture.isFinalizing = true;
     if (gesture.pointerType === "pen") {
-      inputGuard.notePointerEnd({ pointerType: "pen" });
+      inputGuard.notePointerEnd({ pointerType: "pen", pointerId: gesture.pointerId });
+      strokeRecoveryCooldown.notePointerEnd(gesture.pointerId, event?.timeStamp);
     }
     ui.editorView.classList.remove("pen-contact-active");
     clearStraightenTimer(gesture);
@@ -3297,9 +3973,10 @@ export function createStudyNotes(dependencies) {
       drawDraftPath(gesture.points, gesture.type, gesture);
     } else if (drawingGesture) {
       flushGestureSamples(gesture, event, { ensureRenderable: true });
+      if (!gesture.previewPath) drawDraftPath(gesture.points, gesture.type, gesture);
     }
     const shouldCommitDrawing = drawingGesture && (reason === "pointerup" || interrupted
-      ? Array.isArray(gesture.points) && gesture.points.length > 1
+      ? Array.isArray(gesture.points) && gesture.points.length > 0
       : cancelledStrokeCanBeCommitted({
         type: gesture.type,
         pointerType: gesture.pointerType || event?.pointerType,
@@ -3307,10 +3984,16 @@ export function createStudyNotes(dependencies) {
         points: gesture.points
       }));
 
+    // Release the hot-path owner before history, local draft or rendering work.
+    // A following Pencil down must never wait for settlement bookkeeping.
+    if (activeGesture === gesture) activeGesture = null;
+    releaseActivePointer(gesture.pointerId, gesture.captureTarget);
+    if (gesture.pointerType === "pen") lastPenEndedAt = Number(event?.timeStamp || performance.now());
+
     let committed = false;
     if (shouldCommitDrawing) {
-      // A stroke has one settlement path: stop its timer, apply any eligible
-      // straightening, commit once, and only then clear the active owner.
+      // A stroke has one settlement path. The active owner was already
+      // released above so this immutable model append cannot reject a new down.
       applyPendingStraightening(gesture);
       committed = commitDrawGesture(gesture);
     } else if (gesture.type === "text") {
@@ -3323,22 +4006,24 @@ export function createStudyNotes(dependencies) {
       if (gesture.before) currentContent = clone(gesture.before);
     }
 
-    if (activeGesture === gesture) activeGesture = null;
-    releaseActivePointer(gesture.pointerId, gesture.captureTarget);
     if (!committed) {
       removeGesturePreview(gesture);
       if (drawingGesture) {
         drawingDiagnostics.strokesDiscarded += 1;
         drawingDiagnostics.discardedReasons[reason] = Number(drawingDiagnostics.discardedReasons[reason] || 0) + 1;
+        drawingDiagnostics.lastDiscardReason = reason;
       }
     }
     if (!committed && gesture.type !== "text" && currentContent) renderPage();
+    const durationMs = performance.now() - startedProcessingAt;
+    drawingDiagnostics.maxPointerupMs = Math.max(drawingDiagnostics.maxPointerupMs, durationMs);
+    recordInputDiagnostic(reason, event, gesture, { outcome: committed ? "committed" : "discarded", reason, durationMs });
     return true;
   }
 
   function endPointer(event) {
-    inputGuard.notePointerEnd(event);
     const ownsActiveGesture = activeGesture?.pointerId === event.pointerId;
+    if (ownsActiveGesture) inputGuard.notePointerEnd(event);
     if (event.pointerType === "pen" && ownsActiveGesture) ui.editorView.classList.remove("pen-contact-active");
     if (!ownsActiveGesture) return;
     if (["pen", "highlighter"].includes(activeGesture.type)) {
@@ -3378,7 +4063,7 @@ export function createStudyNotes(dependencies) {
     if (gesture.type === "eraser-pixel") {
       currentContent.elements = currentContent.elements.flatMap(element => {
         if (!["stroke", "highlighter"].includes(element.type)) return [element];
-        return splitStrokeByEraser(element, gesture.points, gesture.radius);
+        return splitStrokeByEraser(element, gesture.points, gesture.radius, randomId, pages[currentPageIndex]?.size);
       });
       commitChange(gesture.before, "ピクセル消去");
     } else if (gesture.type === "text") {
@@ -3423,19 +4108,39 @@ export function createStudyNotes(dependencies) {
   function drawDraftPath(points, type, gesture = activeGesture) {
     if (!gesture) return;
     const isHighlighter = type === "highlighter";
+    const metrics = gesture.pageMetrics || notePageMetrics(pages[currentPageIndex]?.size);
+    const color = isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor;
+    const widthRatio = Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10000 * (isHighlighter ? 10 : 1);
+    const opacity = Number(isHighlighter ? toolSettings.highlighterOpacity : toolSettings.penOpacity) / 100;
     if (!gesture.previewNode?.isConnected) {
-      const svg = createSvgElement("svg", { viewBox: "0 0 1000 1414", preserveAspectRatio: "none", class: "note-layer", "data-note-draft": gesture.strokeSessionId || "active" });
+      const svg = createSvgElement("svg", { viewBox: metrics.viewBox, preserveAspectRatio: "none", class: "note-layer", "data-note-draft": gesture.strokeSessionId || "active" });
       svg.style.zIndex = "30";
-      gesture.previewPath = createSvgElement("path", {
-        class: "note-draft-path", stroke: isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor,
-        "stroke-width": Math.max(1, Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10 * (isHighlighter ? 10 : 1)),
-        "stroke-opacity": Number(isHighlighter ? toolSettings.highlighterOpacity : toolSettings.penOpacity) / 100
-      });
-      svg.append(gesture.previewPath);
       ui.stage.append(svg);
       gesture.previewNode = svg;
+      gesture.previewPath = null;
     }
-    gesture.previewPath.setAttribute("d", pathData(points));
+    if (points?.length === 1) {
+      const [draftDot] = strokeSvgNodes(createSvgElement, points, widthRatio, {
+        scaleX: metrics.width,
+        scaleY: metrics.height,
+        attributes: { class: "note-draft-dot", stroke: color, "stroke-opacity": opacity, "pointer-events": "none" }
+      });
+      if (gesture.previewPath) gesture.previewPath.replaceWith(draftDot);
+      else gesture.previewNode.append(draftDot);
+      gesture.previewPath = draftDot;
+      return;
+    }
+    if (gesture.previewPath?.localName !== "path") {
+      const path = createSvgElement("path", {
+        class: "note-draft-path", stroke: color,
+        "stroke-width": Math.max(1, metrics.widthRatio(widthRatio)),
+        "stroke-opacity": opacity
+      });
+      if (gesture.previewPath) gesture.previewPath.replaceWith(path);
+      else gesture.previewNode.append(path);
+      gesture.previewPath = path;
+    }
+    gesture.previewPath.setAttribute("d", pathData(points, metrics));
   }
 
   function drawSelectionRect(start, end) {
@@ -3446,9 +4151,13 @@ export function createStudyNotes(dependencies) {
 
   function drawLasso(points) {
     ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
-    const svg = createSvgElement("svg", { viewBox: "0 0 1000 1414", preserveAspectRatio: "none", class: "note-layer", "data-note-draft": "true" });
+    const metrics = notePageMetrics(pages[currentPageIndex]?.size);
+    const svg = createSvgElement("svg", { viewBox: metrics.viewBox, preserveAspectRatio: "none", class: "note-layer", "data-note-draft": "true" });
     svg.style.zIndex = "30";
-    svg.append(createSvgElement("path", { d: `${pathData(points)} Z`, class: "note-lasso-path" }));
+    const path = createSvgElement("path", { d: `${pathData(points, metrics)} Z`, class: "note-lasso-path" });
+    path.style.strokeWidth = String(metrics.widthRatio(.002));
+    path.style.strokeDasharray = `${metrics.widthRatio(.007)} ${metrics.widthRatio(.005)}`;
+    svg.append(path);
     ui.stage.append(svg);
   }
 
@@ -3790,6 +4499,10 @@ export function createStudyNotes(dependencies) {
     if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
     const session = captureUserSession();
     assertUserSession(session);
+    // Page creation changes currentPageIndex without going through switchPage.
+    // Settle the current page's Pencil queue first so a later stroke on the
+    // new page cannot replace this page's pending immutable snapshot.
+    await flushPendingStrokeWork({ render: false, throwOnError: true });
     if (!await flushWithDecision(pages[currentPageIndex], "ページ追加")) return;
     assertUserSession(session);
     if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
@@ -4047,17 +4760,17 @@ export function createStudyNotes(dependencies) {
     studyMode = active === true;
     if (studyMode) { currentTool = "study"; selectedIds = []; }
     else setTool("pen");
-    const modeLabel = studyMode ? "編集モードへ戻る" : "暗記モード";
-    ui.studyToggle.setAttribute("aria-label", modeLabel);
-    ui.studyToggle.title = modeLabel;
-    ui.studyToggle.querySelector(".note-mode-icon-brain")?.classList.toggle("hidden", studyMode);
-    ui.studyToggle.querySelector(".note-mode-icon-edit")?.classList.toggle("hidden", !studyMode);
-    const accessibleLabel = ui.studyToggle.querySelector(".sr-only");
-    if (accessibleLabel) accessibleLabel.textContent = modeLabel;
-    ui.studyToggle.classList.toggle("active", studyMode);
-    ui.studyControls.classList.toggle("hidden", !studyMode);
-    ui.toolbar.classList.toggle("hidden", studyMode);
+    ui.editMode.classList.toggle("active", !studyMode);
+    ui.editMode.setAttribute("aria-pressed", String(!studyMode));
+    ui.studyModeButton.classList.toggle("active", studyMode);
+    ui.studyModeButton.setAttribute("aria-pressed", String(studyMode));
+    syncModeToolbars();
     renderPage();
+  }
+
+  function syncModeToolbars() {
+    ui.studyControls.classList.toggle("hidden", !studyMode);
+    ui.toolbar.classList.toggle("hidden", studyMode || !markupMode);
   }
 
   async function renameNote(note = currentNote) {
@@ -4195,7 +4908,8 @@ export function createStudyNotes(dependencies) {
           copyPages[index].background = {
             type: "pdf-source-page",
             imagePath,
-            sourcePageNumber: Number(sourcePage.background?.sourcePageNumber || sourcePage.background?.materialPage || index + 1)
+            sourcePageNumber: Number(sourcePage.background?.sourcePageNumber || sourcePage.background?.materialPage || index + 1),
+            pdfRotation: Number(sourcePage.background?.pdfRotation || 0)
           };
           await noteStore.updatePage(copyId, copyPages[index].pageId, {
             pageType: copyPages[index].pageType,
@@ -4536,7 +5250,7 @@ export function createStudyNotes(dependencies) {
     if (active !== true && textEditorSession && !textEditorSession.finish()) return;
     markupMode = active === true;
     ui.editorView.classList.toggle("markup-inactive", !markupMode);
-    ui.toolbar.classList.toggle("hidden", !markupMode);
+    syncModeToolbars();
     ui.markupDone.setAttribute("aria-label", markupMode ? "マークアップを完了" : "マークアップを開始");
     ui.markupDone.title = markupMode ? "マークアップを完了" : "マークアップを開始";
     ui.markupDone.textContent = markupMode ? "✓" : "✎";
@@ -4556,11 +5270,15 @@ export function createStudyNotes(dependencies) {
       setMarkupMode(true);
       return;
     }
+    if (currentNote && !readOnlyEditor) {
+      await flushPendingStrokeWork({ render: false, throwOnError: true });
+      const results = await saveCoordinator.flushAll();
+      const failure = results.find(result => result instanceof Error);
+      if (failure) setSaveState("recoverable-error", { error: failure });
+    }
+    // The toolbar disappearing is the visible acknowledgement that the latest
+    // Pencil queue reached IndexedDB/save coordination and is safe to reload.
     setMarkupMode(false);
-    if (!currentNote || readOnlyEditor) return;
-    const results = await saveCoordinator.flushAll();
-    const failure = results.find(result => result instanceof Error);
-    if (failure) setSaveState("recoverable-error", { error: failure });
   }
 
   async function restoreDedicatedLocalDraft() {
@@ -4791,7 +5509,122 @@ export function createStudyNotes(dependencies) {
     ui.toolbarDrag.addEventListener("pointercancel", finish);
   }
 
+  function clearSwipeVisual({ immediate = false } = {}) {
+    const stage = ui.stage;
+    const preview = ui.adjacentPagePreview;
+    if (!stage || !preview) return;
+    if (immediate) {
+      stage.classList.remove("note-swipe-tracking", "note-swipe-settling");
+      preview.classList.remove("note-swipe-tracking", "note-swipe-settling");
+      stage.style.translate = "";
+      preview.style.translate = "";
+      preview.classList.add("hidden");
+      preview.replaceChildren();
+      return;
+    }
+    stage.classList.remove("note-swipe-tracking");
+    preview.classList.remove("note-swipe-tracking");
+    stage.classList.add("note-swipe-settling");
+    preview.classList.add("note-swipe-settling");
+    stage.style.translate = "0px 0px";
+    preview.style.translate = "0px 0px";
+    setTimeout(() => clearSwipeVisual({ immediate: true }), 220);
+  }
+
+  function prepareAdjacentPagePreview(index, direction) {
+    const preview = ui.adjacentPagePreview;
+    const page = pages[index];
+    if (!preview) return false;
+    if (!page) {
+      preview.classList.add("hidden");
+      preview.replaceChildren();
+      return false;
+    }
+    const stageRect = ui.stage.getBoundingClientRect();
+    const viewportRect = ui.viewport.getBoundingClientRect();
+    const gap = 18;
+    preview.style.inlineSize = `${stageRect.width}px`;
+    preview.style.blockSize = `${stageRect.height}px`;
+    preview.style.insetBlockStart = `${stageRect.top - viewportRect.top + ui.viewport.scrollTop}px`;
+    preview.style.insetInlineStart = `${stageRect.left - viewportRect.left + ui.viewport.scrollLeft + (direction === "next" ? stageRect.width + gap : -stageRect.width - gap)}px`;
+    preview.style.aspectRatio = `${page.size?.width || A4_SIZE.width} / ${page.size?.height || A4_SIZE.height}`;
+    const source = ui.pageList.querySelector(`[data-page-id="${CSS.escape(page.pageId)}"] img`);
+    if (source) {
+      const image = source.cloneNode();
+      image.removeAttribute("data-thumbnail-url");
+      preview.replaceChildren(image);
+    } else {
+      const label = document.createElement("span");
+      label.className = "note-adjacent-page-label";
+      label.textContent = `${index + 1}ページ`;
+      preview.replaceChildren(label);
+    }
+    preview.classList.remove("hidden");
+    return true;
+  }
+
+  function updateSwipeVisual(swipe) {
+    if (!swipe || swipe.directionLock !== "swipe") return;
+    const deltaX = swipe.endX - swipe.startX;
+    const direction = deltaX < 0 ? "next" : "previous";
+    const adjacentIndex = direction === "next" ? currentPageIndex + 1 : currentPageIndex - 1;
+    const hasAdjacentPage = adjacentIndex >= 0 && adjacentIndex < pages.length;
+    if (swipe.previewIndex !== adjacentIndex) {
+      swipe.previewIndex = adjacentIndex;
+      swipe.hasAdjacentPage = prepareAdjacentPagePreview(adjacentIndex, direction);
+    }
+    const offset = pageSwipeVisualOffset(deltaX, { hasAdjacentPage });
+    ui.stage.classList.add("note-swipe-tracking");
+    ui.adjacentPagePreview?.classList.add("note-swipe-tracking");
+    ui.stage.style.translate = `${offset}px 0px`;
+    if (ui.adjacentPagePreview) ui.adjacentPagePreview.style.translate = `${offset}px 0px`;
+  }
+
+  function settleSwipeVisual(direction, nextIndex) {
+    if (!direction || nextIndex < 0 || nextIndex >= pages.length) {
+      clearSwipeVisual();
+      return;
+    }
+    const travel = (direction === "next" ? -1 : 1) * (ui.viewport.clientWidth + 18);
+    ui.stage.classList.remove("note-swipe-tracking");
+    ui.stage.classList.add("note-swipe-settling");
+    ui.adjacentPagePreview?.classList.remove("note-swipe-tracking");
+    ui.adjacentPagePreview?.classList.add("note-swipe-settling");
+    ui.stage.style.translate = `${travel}px 0px`;
+    if (ui.adjacentPagePreview) ui.adjacentPagePreview.style.translate = `${travel}px 0px`;
+    setTimeout(() => {
+      clearSwipeVisual({ immediate: true });
+      void switchPage(nextIndex, { localOnly: true, direction }).catch(reportError);
+    }, 210);
+  }
+
   function bindEvents() {
+    ui.inputDebugPanel?.classList.toggle("hidden", !inputDebugEnabled);
+    ui.inputDebugDownload?.addEventListener("click", () => downloadDiagnostics().catch(reportError));
+    if (inputDebugEnabled) {
+      ui.inputDebugPanel?.addEventListener("noteinputdebugresethotpath", () => {
+        drawingDiagnostics.maxPointerdownMs = 0;
+        drawingDiagnostics.maxPointermoveMs = 0;
+        drawingDiagnostics.maxPointerupMs = 0;
+        scheduleInputDebugRender();
+      });
+    }
+    if (inputDebugEnabled && typeof PerformanceObserver === "function") {
+      try {
+        longTaskObserver = new PerformanceObserver(list => {
+          for (const entry of list.getEntries()) {
+            drawingDiagnostics.longTaskCount += 1;
+            drawingDiagnostics.lastLongTaskMs = Number(entry.duration || 0);
+            drawingDiagnostics.longestMainThreadGapMs = Math.max(drawingDiagnostics.longestMainThreadGapMs, Number(entry.duration || 0));
+          }
+          scheduleInputDebugRender();
+        });
+        longTaskObserver.observe({ type: "longtask", buffered: true });
+      } catch (error) {
+        console.debug("Long Task診断はこのブラウザで利用できません。", error);
+      }
+      scheduleInputDebugRender();
+    }
     bindDrawingInputLayer();
     ui.noteModeBtn.addEventListener("click", () => { activateSection("note"); show(currentNote ? "editor" : "list"); void refreshNotes(); });
     ui.newNoteBtn.addEventListener("click", () => { show("create"); ui.materialPicker.classList.add("hidden"); });
@@ -4902,7 +5735,8 @@ export function createStudyNotes(dependencies) {
         .catch(reportError)
         .finally(() => { ui.retrySave.disabled = false; });
     });
-    ui.studyToggle.addEventListener("click", () => setStudyMode(!studyMode));
+    ui.editMode.addEventListener("click", () => setStudyMode(false));
+    ui.studyModeButton.addEventListener("click", () => setStudyMode(true));
     ui.toolbar.querySelectorAll("[data-note-tool]").forEach(button => {
       let longPress = null;
       let longPressed = false;
@@ -5011,8 +5845,14 @@ export function createStudyNotes(dependencies) {
     ui.lineStyle.addEventListener("change", () => persistToolSettings({ shapeLineStyle: ui.lineStyle.value }));
     ui.fillColor.addEventListener("input", () => persistToolSettings({ shapeFillColor: ui.fillColor.value }));
     ui.fillOpacity.addEventListener("input", () => persistToolSettings({ shapeFillOpacity: Number(ui.fillOpacity.value) }));
-    ui.pencilMode.addEventListener("change", () => persistToolSettings({ pencilMode: ui.pencilMode.checked }));
-    ui.fingerDraw.addEventListener("change", () => persistToolSettings({ fingerDraw: ui.fingerDraw.checked }));
+    ui.pencilMode.addEventListener("change", () => persistToolSettings({
+      pencilMode: ui.pencilMode.checked,
+      ...(ui.pencilMode.checked ? { fingerDraw: false } : {})
+    }));
+    ui.fingerDraw.addEventListener("change", () => persistToolSettings({
+      fingerDraw: ui.fingerDraw.checked,
+      ...(ui.fingerDraw.checked ? { pencilMode: false } : {})
+    }));
     ui.straightenEnabled.addEventListener("change", () => persistToolSettings({ straightenEnabled: ui.straightenEnabled.checked }));
     ui.toolbarAutoHide.addEventListener("change", () => persistToolSettings({ toolbarAutoHide: ui.toolbarAutoHide.checked }));
     ui.toolbarDock.addEventListener("change", () => persistToolSettings({ toolbarDock: ui.toolbarDock.value }));
@@ -5100,7 +5940,8 @@ export function createStudyNotes(dependencies) {
       if (currentContent) renderPage();
     };
     ui.editorView.addEventListener("gesturestart", event => {
-      dismissTransientForViewportChange();
+      if (activeGesture?.pointerType === "pen" || inputGuard.isPenActive()) closeTransientUi();
+      else dismissTransientForViewportChange();
       event.preventDefault();
     }, { passive: false });
     ["gesturechange", "gestureend"].forEach(type => {
@@ -5118,7 +5959,10 @@ export function createStudyNotes(dependencies) {
     globalThis.visualViewport?.addEventListener?.("scroll", repositionTransientForViewportChange);
     bindToolbarDrag();
     ui.viewport.addEventListener("pointerdown", event => {
-      if (event.pointerType !== "touch" || inputGuard.isPalmCandidate(event)) return;
+      if (event.pointerType !== "touch") return;
+      // Broad contacts never draw, but a deliberate horizontal gesture may
+      // still navigate when Pencil is not active.
+      if (inputGuard.isPalmCandidate(event) && inputGuard.isPenActive()) return;
       activeTouchPointerIds.add(event.pointerId);
       if (swipeGesture) swipeGesture.blocked = true;
       if (
@@ -5137,6 +5981,8 @@ export function createStudyNotes(dependencies) {
         endY: event.clientY,
         startedAt: Number(event.timeStamp || performance.now()),
         startedAtEdge: event.clientX - rect.left <= 36 || rect.right - event.clientX <= 36,
+        directionLock: "pending",
+        previewIndex: null,
         blocked: false
       };
     }, { capture: true });
@@ -5147,6 +5993,25 @@ export function createStudyNotes(dependencies) {
       }
       swipeGesture.endX = event.clientX;
       swipeGesture.endY = event.clientY;
+      if (swipeGesture.directionLock === "pending") {
+        let intent = resolvePageSwipeIntent({
+          ...swipeGesture,
+          fingerDraw: toolSettings.fingerDraw && currentTool !== "pan" && !studyMode
+        });
+        if (intent === "swipe" && (zoomController?.zoom || 1) > 1.05) {
+          const deltaX = swipeGesture.endX - swipeGesture.startX;
+          const atLeftEdge = ui.viewport.scrollLeft <= 2;
+          const atRightEdge = ui.viewport.scrollLeft + ui.viewport.clientWidth >= ui.viewport.scrollWidth - 2;
+          if ((deltaX < 0 && !atRightEdge) || (deltaX > 0 && !atLeftEdge)) intent = "content";
+        }
+        swipeGesture.directionLock = intent;
+      }
+      if (swipeGesture.blocked) {
+        clearSwipeVisual();
+      } else if (swipeGesture.directionLock === "swipe") {
+        updateSwipeVisual(swipeGesture);
+        event.preventDefault();
+      }
     }, { capture: true });
     const finishTrackedTouch = event => {
       if (event.pointerType !== "touch") return;
@@ -5160,6 +6025,7 @@ export function createStudyNotes(dependencies) {
           zoom: zoomController?.zoom || 1,
           atLeftEdge: ui.viewport.scrollLeft <= 2,
           atRightEdge: ui.viewport.scrollLeft + ui.viewport.clientWidth >= ui.viewport.scrollWidth - 2,
+          viewportWidth: ui.viewport.clientWidth,
           fingerDraw: toolSettings.fingerDraw && currentTool !== "pan" && !studyMode,
           blocked: swipe.blocked || activeTouchPointerIds.size > 1 ||
             Boolean(zoomController?.isPinchGestureActive || zoomController?.isPinching) ||
@@ -5167,8 +6033,8 @@ export function createStudyNotes(dependencies) {
         });
         if (direction) {
           const nextIndex = direction === "next" ? currentPageIndex + 1 : currentPageIndex - 1;
-          queueMicrotask(() => void switchPage(nextIndex, { localOnly: true, direction }).catch(reportError));
-        }
+          settleSwipeVisual(direction, nextIndex);
+        } else clearSwipeVisual();
       }
       swipeGesture = null;
       activeTouchPointerIds.delete(event.pointerId);
@@ -5202,8 +6068,9 @@ export function createStudyNotes(dependencies) {
       dismissTransientForViewportChange();
     });
     ui.stage.addEventListener("lostpointercapture", event => {
+      if (activeGesture?.pointerId !== event.pointerId) return;
       drawingDiagnostics.lostpointercapture += 1;
-      if (activeGesture?.pointerId === event.pointerId) finishPointerGesture("lostpointercapture", event);
+      finishPointerGesture("lostpointercapture", event);
     });
     ui.stage.addEventListener("dblclick", event => {
       const id = targetElementId(event); const element = currentContent?.elements.find(item => item.id === id);
@@ -5227,6 +6094,7 @@ export function createStudyNotes(dependencies) {
       const action = button.dataset.studyAction;
       if (action === "previous") switchPage(Math.max(0, currentPageIndex - 1)).catch(reportError);
       if (action === "next") switchPage(Math.min(pages.length - 1, currentPageIndex + 1)).catch(reportError);
+      if (action === "edit") setStudyMode(false);
       if (action === "hide-all") { revealedMaskIds.clear(); renderPage(); }
       if (action === "show-all") {
         const page = pages[currentPageIndex];
@@ -5312,13 +6180,16 @@ export function createStudyNotes(dependencies) {
     ui.cancelPdf.addEventListener("click", () => exportController?.abort());
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "hidden" || !currentNote || readOnlyEditor) return;
+      if (activeGesture && ["pen", "highlighter"].includes(activeGesture.type)) finishPointerGesture("visibilitychange");
       textEditorSession?.finish({ force: true });
-      void saveCoordinator.flushAll();
+      void flushPendingStrokeWork({ render: false }).then(() => saveCoordinator.flushAll()).catch(reportError);
     });
     window.addEventListener("pagehide", () => {
       if (currentNote && !readOnlyEditor) {
+        if (activeGesture && ["pen", "highlighter"].includes(activeGesture.type)) finishPointerGesture("pagehide");
         textEditorSession?.finish({ force: true });
-        void saveCoordinator.flushAll();
+        void flushPendingStrokeWork({ render: false }).then(() => saveCoordinator.flushAll())
+          .catch(error => console.warn("ページ終了時のノート下書き確定に失敗しました。", error));
       }
       editorLease?.release();
     });
@@ -5361,7 +6232,11 @@ export function createStudyNotes(dependencies) {
     // The list tab may be replaying an already durable IndexedDB draft in the
     // background. Logging out must not wait indefinitely for that network
     // retry; only an active writer tab has editable in-memory state to flush.
-    flush: () => currentNote && !readOnlyEditor ? saveCoordinator.flushAll() : Promise.resolve([]),
+    flush: async () => {
+      if (!currentNote || readOnlyEditor) return [];
+      await flushPendingStrokeWork({ render: false });
+      return saveCoordinator.flushAll();
+    },
     openMaterialNote,
     confirmMaterialReplacement,
     finalizeMaterialReplacement,

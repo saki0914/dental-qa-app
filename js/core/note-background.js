@@ -8,6 +8,7 @@ const BACKGROUND_FIELDS = [
   "ruleWidthRatio",
   "imagePath",
   "sourcePageNumber",
+  "pdfRotation",
   "materialId",
   "materialPage"
 ];
