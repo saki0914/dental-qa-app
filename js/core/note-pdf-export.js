@@ -46,9 +46,22 @@ export function sanitizePdfFilename(value, fallback = "学習ノート.pdf") {
   return `${stem}.pdf`;
 }
 
+let pdfLibLoadPromise = null;
+
 async function getPdfLib() {
   if (globalThis.PDFLib?.PDFDocument) return globalThis.PDFLib;
-  throw new Error("PDF出力ライブラリを読み込めませんでした。ページを再読み込みしてください。");
+  if (!pdfLibLoadPromise) {
+    pdfLibLoadPromise = import("../../vendor/pdf-lib/pdf-lib.min.js")
+      .then(() => globalThis.PDFLib)
+      .catch(error => {
+        pdfLibLoadPromise = null;
+        throw error;
+      });
+  }
+  const pdfLib = await pdfLibLoadPromise;
+  if (pdfLib?.PDFDocument) return pdfLib;
+  pdfLibLoadPromise = null;
+  throw new Error("PDF出力ライブラリを読み込めませんでした。ネットワーク接続を確認して再試行してください。");
 }
 
 export function getPdfPageLayout(width, height, pageNumbers = false) {
@@ -97,10 +110,10 @@ export async function exportNotePdf({
   signal
 }) {
   const preset = PDF_EXPORT_PRESETS[quality] || PDF_EXPORT_PRESETS.standard;
-  const { PDFDocument } = await getPdfLib();
+  const { PDFDocument, StandardFonts } = await getPdfLib();
   const pdf = await PDFDocument.create();
-  const footerFont = pageNumbers && globalThis.PDFLib.StandardFonts
-    ? await pdf.embedFont(globalThis.PDFLib.StandardFonts.Helvetica)
+  const footerFont = pageNumbers && StandardFonts
+    ? await pdf.embedFont(StandardFonts.Helvetica)
     : null;
   for (let outputIndex = 0; outputIndex < pageIndexes.length; outputIndex += 1) {
     if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");

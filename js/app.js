@@ -10,6 +10,7 @@ import {
   isNoteEditorReady as isNoteEditorSessionReady,
   selectNoteFeatureUser
 } from "./core/note-editor-state.js";
+import { createNoteStartupMetrics } from "./core/note-startup-metrics.js";
 import {
   escapeDisplayText,
   escapeHtml,
@@ -33,8 +34,6 @@ import {
   normalizeStudyCondition,
   normalizeStudyConditionGroups
 } from "./core/study-filters.js";
-import { createImageMemory } from "./features/image-memory.js";
-import { createQuestionManager } from "./features/question-manager.js";
 import { createStudyNotes } from "./features/study-notes.js";
 import {
   CloudSaveConflictError,
@@ -44,7 +43,34 @@ import {
   writeSplitDocuments
 } from "./services/cloud-store.js";
 
-const noteEditorRoute = new URLSearchParams(globalThis.location?.search || "").get("noteEditor") === "1";
+const startupRouteParams = new URLSearchParams(globalThis.location?.search || "");
+const noteEditorRoute = startupRouteParams.get("noteEditor") === "1";
+let createImageMemoryFactory = null;
+let createQuestionManagerFactory = null;
+if (!noteEditorRoute) {
+  const [imageMemoryModule, questionManagerModule] = await Promise.all([
+    import("./features/image-memory.js"),
+    import("./features/question-manager.js")
+  ]);
+  createImageMemoryFactory = imageMemoryModule.createImageMemory;
+  createQuestionManagerFactory = questionManagerModule.createQuestionManager;
+}
+const navigationEntry = globalThis.performance?.getEntriesByType?.("navigation")?.[0];
+const noteEditorStartupMetrics = createNoteStartupMetrics({
+  enabled: noteEditorRoute,
+  launchAtEpochMs: Number(startupRouteParams.get("noteStartupAt") || 0),
+  navigationType: navigationEntry?.type || "navigate",
+  publish: snapshot => { globalThis.__noteEditorStartupMetrics = snapshot; }
+});
+noteEditorStartupMetrics.mark("app-module-evaluated", {
+  transferSize: Number(navigationEntry?.transferSize || 0),
+  decodedBodySize: Number(navigationEntry?.decodedBodySize || 0)
+});
+if (noteEditorRoute && startupRouteParams.has("noteStartupAt")) {
+  const cleanStartupUrl = new URL(globalThis.location.href);
+  cleanStartupUrl.searchParams.delete("noteStartupAt");
+  globalThis.history?.replaceState?.(null, "", cleanStartupUrl);
+}
 
 window.addEventListener("error", event => {
   console.error(event.error || event.message);
@@ -295,7 +321,15 @@ const saveCoordinator = createSaveCoordinator({
   }
 });
 
-const questionManager = createQuestionManager({
+const noopQuestionManager = {
+  apply: () => {},
+  bindEvents: () => {},
+  render: () => {},
+  renderFilter: () => {},
+  resetBulkImport: () => {},
+  serialize: () => ({})
+};
+const questionManager = createQuestionManagerFactory ? createQuestionManagerFactory({
   el,
   getCurrentUser: () => isInteractionReady() ? currentUser : null,
   getStorage: () => storage,
@@ -310,7 +344,7 @@ const questionManager = createQuestionManager({
   renderStudy,
   requestAutoSave: options => autoSaveToCloud(options),
   requestSave: options => saveToCloud(options)
-});
+}) : noopQuestionManager;
 
 let studyNotes = null;
 
@@ -325,21 +359,57 @@ function setCombinedImageNoteMode(mode) {
   });
 }
 
-const imageMemory = createImageMemory({
-  el,
-  getCurrentUser: () => isInteractionReady() ? currentUser : null,
-  getStorage: () => storage,
-  getQuestionSubjects: () => getStudySubjects(allQuestions),
-  requestAutoSave: options => autoSaveToCloud(options),
-  requestSave: options => saveToCloud(options),
-  onViewModeChange: mode => setCombinedImageNoteMode(mode),
-  onOpenMaterialNote: materialId => studyNotes?.openMaterialNote(materialId),
-  confirmMaterialReplacement: (material, pageCount) => studyNotes?.confirmMaterialReplacement(material, pageCount),
-  finalizeMaterialReplacement: decision => studyNotes?.finalizeMaterialReplacement(decision),
-  confirmMaterialDeletion: materials => studyNotes?.confirmMaterialDeletion(materials),
-  archiveMaterialLinkedNotes: (decision, operation) => studyNotes?.archiveMaterialLinkedNotes(decision, operation),
-  finalizeMaterialDeletion: decision => studyNotes?.finalizeMaterialDeletion(decision)
-});
+const noopImageMemory = {
+  apply: () => {},
+  bindEvents: () => {},
+  ensureFilterUi: () => {},
+  ensureMaterialDefaultNoteId: async (_materialId, preferredNoteId) => preferredNoteId || null,
+  getMaterials: () => [],
+  render: () => {},
+  renderMasks: () => {},
+  renderViewer: () => {},
+  serialize: () => ({
+    pdfMaterials: [], pdfRevealStates: {}, selectedPdfId: "",
+    selectedMaskId: "", pdfSearchQuery: ""
+  })
+};
+
+function instantiateImageMemory(factory) {
+  return factory({
+    el,
+    getCurrentUser: () => isInteractionReady() ? currentUser : null,
+    getStorage: () => storage,
+    getQuestionSubjects: () => getStudySubjects(allQuestions),
+    requestAutoSave: options => autoSaveToCloud(options),
+    requestSave: options => saveToCloud(options),
+    onViewModeChange: mode => setCombinedImageNoteMode(mode),
+    onOpenMaterialNote: materialId => studyNotes?.openMaterialNote(materialId),
+    confirmMaterialReplacement: (material, pageCount) => studyNotes?.confirmMaterialReplacement(material, pageCount),
+    finalizeMaterialReplacement: decision => studyNotes?.finalizeMaterialReplacement(decision),
+    confirmMaterialDeletion: materials => studyNotes?.confirmMaterialDeletion(materials),
+    archiveMaterialLinkedNotes: (decision, operation) => studyNotes?.archiveMaterialLinkedNotes(decision, operation),
+    finalizeMaterialDeletion: decision => studyNotes?.finalizeMaterialDeletion(decision)
+  });
+}
+
+let imageMemory = createImageMemoryFactory
+  ? instantiateImageMemory(createImageMemoryFactory)
+  : noopImageMemory;
+let dedicatedImageMemoryPromise = null;
+
+async function ensureDedicatedImageMemory() {
+  if (imageMemory !== noopImageMemory) return imageMemory;
+  if (!dedicatedImageMemoryPromise) {
+    dedicatedImageMemoryPromise = import("./features/image-memory.js").then(module => {
+      imageMemory = instantiateImageMemory(module.createImageMemory);
+      return imageMemory;
+    }).catch(error => {
+      dedicatedImageMemoryPromise = null;
+      throw error;
+    });
+  }
+  return dedicatedImageMemoryPromise;
+}
 
 studyNotes = createStudyNotes({
   // Notes use an independent Firestore/Storage save pipeline. In the
@@ -354,8 +424,10 @@ studyNotes = createStudyNotes({
   getDb: () => db,
   getStorage: () => storage,
   getMaterials: () => imageMemory.getMaterials(),
+  startupMetrics: noteEditorStartupMetrics,
   prepareNoteResources: async note => {
     if (!noteEditorRoute || note?.type !== "material-linked") return;
+    await ensureDedicatedImageMemory();
     const result = await loadNoteEditorMaterials({ session: activeSyncSession });
     if (result.stale) return;
     el.cloudStatus.textContent = result.source === "legacy"
@@ -1355,10 +1427,17 @@ function clearLocalState() {
 }
 
 async function initFirebase() {
+  const finishFirebaseInitialization = noteEditorStartupMetrics.startSpan("firebase-initialization");
   try {
     el.cloudStatus.textContent = "Firebase初期化中です...";
     let emulatorHost = "";
+    const finishFirebaseServices = noteEditorStartupMetrics.startSpan("firebase-services-setup");
     ({ app, auth, db, storage, useEmulators: useFirebaseEmulators, emulatorHost } = initializeFirebaseServices());
+    finishFirebaseServices({ emulator: useFirebaseEmulators });
+    noteEditorStartupMetrics.setContext({
+      emulator: useFirebaseEmulators,
+      backend: useFirebaseEmulators ? "emulator" : "production"
+    });
     el.localEnvironmentBanner?.classList.toggle("hidden", !useFirebaseEmulators);
     if (useFirebaseEmulators) {
       const status = document.getElementById("localEnvironmentStatus");
@@ -1368,18 +1447,29 @@ async function initFirebase() {
       };
       renderStatus();
       el.cloudStatus.textContent = "Firebase Emulator 3サービスへ実疎通を確認中です...";
-      await verifyFirebaseEmulatorConnectivity(emulatorHost, {
-        onStatus: (name, state) => {
-          states[name] = state === "connected" ? "接続済み" : "接続エラー";
-          renderStatus();
-        }
-      });
+      const finishEmulatorConnectivity = noteEditorStartupMetrics.startSpan("emulator-connectivity");
+      try {
+        await verifyFirebaseEmulatorConnectivity(emulatorHost, {
+          onStatus: (name, state) => {
+            states[name] = state === "connected" ? "接続済み" : "接続エラー";
+            renderStatus();
+          }
+        });
+        finishEmulatorConnectivity({ services: 3 });
+      } catch (error) {
+        finishEmulatorConnectivity({ errorName: error?.name || "Error" }, "error");
+        throw error;
+      }
       const secureNotice = document.getElementById("localSecureContextNotice");
       if (secureNotice) secureNotice.classList.toggle("hidden", globalThis.isSecureContext === true);
     }
     el.cloudStatus.textContent = "Firebase初期化完了です。ログイン状態を確認しています...";
+    finishFirebaseInitialization({ emulator: useFirebaseEmulators });
 
+    const finishAuthStateWait = noteEditorStartupMetrics.startSpan("auth-state-wait");
     onAuthStateChanged(auth, async user => {
+      finishAuthStateWait({ authenticated: Boolean(user) });
+      noteEditorStartupMetrics.mark("auth-state-ready", { authenticated: Boolean(user) });
       const epoch = ++authEpoch;
       saveCoordinator.setSession(null);
       activeSyncSession = null;
@@ -1437,6 +1527,7 @@ async function initFirebase() {
           el.cloudStatus.textContent = "Firebase接続済みです。ノートを読み込みます。";
           updateLoginLockedUI();
           showDedicatedNoteEditorShell("loading-note-metadata", "現在の処理：ノート情報を読み込み中");
+          noteEditorStartupMetrics.mark("note-open-requested");
           void studyNotes.refresh();
           return;
         }
@@ -1467,6 +1558,7 @@ async function initFirebase() {
       }
     });
   } catch (error) {
+    finishFirebaseInitialization({ errorName: error?.name || "Error" }, "error");
     console.error(error);
     auth = null;
     db = null;

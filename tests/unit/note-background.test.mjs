@@ -33,4 +33,8 @@ test("ページ・寸法・背景ソースの変更を背景シグネチャへ�
     ...page,
     background: { ...page.background, pdfRotation: 90 }
   }));
+  assert.notEqual(
+    createNoteBackgroundSignature(page, "", "users/alice/material/page_1_old.png"),
+    createNoteBackgroundSignature(page, "", "users/alice/material/page_1_new.png")
+  );
 });

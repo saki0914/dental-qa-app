@@ -43,4 +43,14 @@ test("サムネイル署名は先頭ページ・背景・マスク表示内容�
     createNoteThumbnailSignature({ noteId: "note-1", firstPageId: "page-1", page, content: { ...content, noteMasks: [] } }),
     base
   );
+  assert.notEqual(
+    createNoteThumbnailSignature({
+      noteId: "note-1",
+      firstPageId: "page-1",
+      page,
+      content,
+      backgroundSource: "users/alice/material/page_1_new.png"
+    }),
+    base
+  );
 });

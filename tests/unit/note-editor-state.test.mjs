@@ -109,11 +109,17 @@ test("診断情報は許可項目だけを残し本文・token・passwordを含�
     noteId: "note-a",
     pageId: "page-a",
     saveState: "recoverable-error",
+    startup: { schemaVersion: 1, spans: [{ name: "note-metadata", durationMs: 12.3 }] },
     noteContent: "secret body",
     firebaseToken: "secret token",
     password: "secret password"
   });
-  assert.deepEqual(result, { noteId: "note-a", pageId: "page-a", saveState: "recoverable-error" });
+  assert.deepEqual(result, {
+    noteId: "note-a",
+    pageId: "page-a",
+    saveState: "recoverable-error",
+    startup: { schemaVersion: 1, spans: [{ name: "note-metadata", durationMs: 12.3 }] }
+  });
 });
 
 test("診断URLは既知の接続・編集識別子だけを残す", () => {

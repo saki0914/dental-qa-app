@@ -5,6 +5,15 @@ const DATABASE_NAME = "dentalQaNoteLocal";
 const VERSION = 2;
 const STORES = ["pageDrafts", "pendingAssets", "pendingSaves", "conflicts", "pendingCleanups", "thumbnails"];
 
+function isBlobLike(value) {
+  return Boolean(
+    value &&
+    Number(value.size) >= 0 &&
+    typeof value.arrayBuffer === "function" &&
+    typeof value.type === "string"
+  );
+}
+
 export function noteLocalKey(uid, noteId, pageId, suffix = "") {
   if (!uid || !noteId || !pageId) throw new Error("ローカル保存キーが不足しています。");
   return [uid, noteId, pageId, suffix].filter(Boolean).join("|");
@@ -24,7 +33,7 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
     if (!value?.uid || !value?.noteId) {
       throw new TypeError(`${storeName}のローカル保存にはuidとnoteIdが必要です。`);
     }
-    if (!(value?.blob instanceof Blob)) {
+    if (!isBlobLike(value?.blob)) {
       return structuredClone(value);
     }
     const { blob, ...metadata } = value;

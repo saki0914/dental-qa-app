@@ -27,6 +27,7 @@ export function createNoteThumbnailSignature({
   page,
   content,
   materialMasks = [],
+  backgroundSource = "",
   maskMode = "all",
   revealedMaskIds = []
 }) {
@@ -43,6 +44,7 @@ export function createNoteThumbnailSignature({
       pageType: page?.pageType || "",
       size: page?.size || null,
       background: page?.background || null,
+      backgroundSource: String(backgroundSource || ""),
       elements: content?.elements || [],
       noteMasks: content?.noteMasks || [],
       materialMasks,

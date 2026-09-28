@@ -44,7 +44,11 @@ import {
   recoverableStrokeMove,
   strokeSessionOwnsPointer
 } from "../core/note-stroke-session.js";
-import { createNoteEditorLease, getOrCreateNoteClientInstanceId } from "../core/note-editor-lock.js";
+import {
+  NOTE_EDITOR_CLAIM_CONFIRM_MS,
+  createNoteEditorLease,
+  getOrCreateNoteClientInstanceId
+} from "../core/note-editor-lock.js";
 import {
   createNoteEditorDiagnosticSnapshot,
   rebaseRecoveredNoteContent,
@@ -60,6 +64,10 @@ import {
   registerInputDebugPointerdownCapture
 } from "../core/note-input-guard.js";
 import { createNoteLocalStore, noteLocalKey } from "../core/note-local-store.js";
+import {
+  createIndexedDbNoteResourceWriter,
+  createNoteResourceCache,
+} from "../core/note-resource-cache.js";
 import { getMaterialPageMasks, maskVisibilityKey } from "../core/note-mask-adapter.js";
 import { notePageMetrics } from "../core/note-page-metrics.js";
 import {
@@ -191,7 +199,15 @@ export function createStudyNotes(dependencies) {
     getMaterials = () => [],
     prepareNoteResources = async () => {},
     ensureMaterialDefaultNoteId = null,
-    activateSection = () => {}
+    activateSection = () => {},
+    startupMetrics = {
+      enabled: false,
+      mark: () => null,
+      startSpan: () => () => null,
+      increment: () => 0,
+      setContext: () => {},
+      snapshot: () => ({})
+    }
   } = dependencies;
   const byId = id => document.getElementById(id);
   const routeParams = new URLSearchParams(globalThis.location?.search || "");
@@ -279,6 +295,12 @@ export function createStudyNotes(dependencies) {
     ui.localSlot.append(ui.localEnvironmentBanner);
   }
   const localStore = createNoteLocalStore();
+  const resourceCache = createNoteResourceCache();
+  const resourceIdbWriter = createIndexedDbNoteResourceWriter({
+    localStore,
+    onEvictions: count => startupMetrics.increment("resource-idb-cache-evictions", count)
+  });
+  startupMetrics.setContext({ resourceCacheAvailable: resourceCache.available });
   const noteStore = createNoteStore({
     getDb,
     getStorage,
@@ -357,6 +379,9 @@ export function createStudyNotes(dependencies) {
   let activeNoteCardThumbnails = 0;
   let startupState = dedicatedEditor ? "initializing" : "ready";
   let startupSlowTimer = null;
+  let startupCanEditMarked = false;
+  let startupThumbnailDrain = null;
+  let startupThumbnailDrainStarted = false;
   let lastStartupError = null;
   let lastSaveError = null;
   let lastSaveSucceededAt = "";
@@ -428,9 +453,40 @@ export function createStudyNotes(dependencies) {
     return session;
   }
 
+  async function measureStartupPhase(name, operation, resultDetails = () => ({})) {
+    const finish = startupMetrics.startSpan(name);
+    try {
+      const result = await operation();
+      finish(resultDetails(result));
+      return result;
+    } catch (error) {
+      finish({ errorName: error?.name || "Error" }, "error");
+      throw error;
+    }
+  }
+
+  function measureStartupWork(name, operation, resultDetails = () => ({})) {
+    const finish = startupMetrics.startSpan(name);
+    try {
+      const result = operation();
+      finish(resultDetails(result));
+      return result;
+    } catch (error) {
+      finish({ errorName: error?.name || "Error" }, "error");
+      throw error;
+    }
+  }
+
+  function markStartupCanEdit() {
+    if (startupCanEditMarked || startupState !== "ready" || !isEditableNow()) return;
+    startupCanEditMarked = true;
+    startupMetrics.mark("can-edit");
+  }
+
   function setEditorStartupState(state, { detail = "", error = null } = {}) {
     startupState = state;
     lastStartupError = error || (state.endsWith("error") ? lastStartupError : null);
+    if (dedicatedEditor) startupMetrics.mark("startup-state", { state });
     if (!dedicatedEditor || !ui.startup) return;
     clearTimeout(startupSlowTimer);
     ui.startup.dataset.state = state;
@@ -506,7 +562,7 @@ export function createStudyNotes(dependencies) {
 
   function noteListUrl() {
     const url = new URL(globalThis.location.href);
-    ["noteEditor", "noteId", "editorTabId", "study", "create", "creationSessionId"].forEach(name => url.searchParams.delete(name));
+    ["noteEditor", "noteId", "editorTabId", "study", "create", "creationSessionId", "noteStartupAt"].forEach(name => url.searchParams.delete(name));
     return url;
   }
 
@@ -714,6 +770,7 @@ export function createStudyNotes(dependencies) {
       pageRect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
       pageSpace,
       startupState,
+      startup: startupMetrics.snapshot(),
       drawing: {
         ...drawingDiagnostics,
         eventIntervals: undefined,
@@ -1184,6 +1241,7 @@ export function createStudyNotes(dependencies) {
     ui.lockBanner.classList.toggle("hidden", !message);
     if (message) ui.lockMessage.textContent = message;
     syncDrawingInputLayer();
+    markStartupCanEdit();
   }
 
   function hasWriterOwnership() {
@@ -1250,17 +1308,28 @@ export function createStudyNotes(dependencies) {
       setEditorReadOnly(true, "以前の編集セッションが終了していないようです。このタブで編集を再開するか、読み取り専用で開いてください。");
       return { acquired: false, stale: true, lease: previous };
     }
+    const blockedByLiveLease = Boolean(
+      previous &&
+      Number(previous.expiresAt || 0) > Date.now() &&
+      previous.editorTabId !== editorTabId
+    );
     const result = await editorLease.claim();
     if (result.acquired) setEditorReadOnly(false);
     else setEditorReadOnly(true, "このノートは別のタブで編集中です。");
-    return result;
+    return {
+      ...result,
+      claimAttempts: 1,
+      claimConfirmationWaitMs: blockedByLiveLease ? 0 : NOTE_EDITOR_CLAIM_CONFIRM_MS,
+      retryCount: 0
+    };
   }
 
-  function editorUrl(noteId, { study = false } = {}) {
+  function editorUrl(noteId, { study = false, startupAt = Date.now() } = {}) {
     const url = new URL(globalThis.location.href);
     url.searchParams.set("noteEditor", "1");
     url.searchParams.set("noteId", noteId);
     url.searchParams.set("editorTabId", randomId());
+    url.searchParams.set("noteStartupAt", String(Math.trunc(startupAt)));
     url.searchParams.delete("create");
     url.searchParams.delete("creationSessionId");
     if (study) url.searchParams.set("study", "1"); else url.searchParams.delete("study");
@@ -1272,7 +1341,7 @@ export function createStudyNotes(dependencies) {
     url.searchParams.set("noteEditor", "1");
     url.searchParams.set("create", "pdf");
     url.searchParams.set("creationSessionId", randomId());
-    ["noteId", "editorTabId", "study"].forEach(name => url.searchParams.delete(name));
+    ["noteId", "editorTabId", "study", "noteStartupAt"].forEach(name => url.searchParams.delete(name));
     return url;
   }
 
@@ -1300,9 +1369,10 @@ export function createStudyNotes(dependencies) {
   }
 
   function openEditorTab(noteId, options = {}, reservedWindow = null) {
-    const opened = reservedWindow || globalThis.open?.(editorUrl(noteId, options).toString(), "_blank");
+    const url = editorUrl(noteId, { ...options, startupAt: Date.now() }).toString();
+    const opened = reservedWindow || globalThis.open?.(url, "_blank");
     if (!opened) throw new Error("ノート編集タブを開けませんでした。ポップアップを許可して再試行してください。");
-    if (reservedWindow) opened.location.replace(editorUrl(noteId, options).toString());
+    if (reservedWindow) opened.location.replace(url);
     try { opened.opener = null; } catch {}
     return opened;
   }
@@ -1788,6 +1858,7 @@ export function createStudyNotes(dependencies) {
       page,
       content,
       materialMasks,
+      backgroundSource: materialSourceCacheIdentity(materialSourcePage(page)),
       maskMode: "all"
     });
     const cacheKey = noteLocalKey(session.uid, note.id, page.pageId, "note-card-thumbnail");
@@ -2088,101 +2159,217 @@ export function createStudyNotes(dependencies) {
       openEditorTab(noteId, { study });
       return;
     }
-    const session = captureUserSession();
-    assertUserSession(session);
-    cancelActiveInteraction("close");
-    cancelCropEditor({ restore: true });
-    closeTransientUi();
-    setLocalDraftRecoveryAvailable(false);
-    setEditorStartupState("loading-note-metadata");
-    if (currentNote && !await flushWithDecision(pages[currentPageIndex], "別のノートを開く操作")) return;
-    localRecoverySuppressed = preferCloud;
-    explicitReadOnlyMode = forceReadOnly === true;
-    assertUserSession(session);
-    currentNote = await noteStore.getNote(noteId, { expectedUid: session.uid });
-    assertUserSession(session);
-    if (!currentNote || currentNote.deletedAt) throw new Error("ノートが見つかりません。");
-    await prepareNoteResources(currentNote);
-    assertUserSession(session);
-    setEditorStartupState("loading-pages");
-    pages = await noteStore.listPages(noteId, { expectedUid: session.uid });
-    assertUserSession(session);
-    if (!pages.length) throw new Error("ノートにページがありません。");
-    setEditorStartupState("acquiring-editor-lock");
-    await establishEditorLease(noteId, session, { forceReadOnly });
-    currentPageIndex = 0;
-    applyToolSettingsToUi();
-    contentCache = new Map(); contentLoadPromises = new Map();
-    assetCache = new Map(); backgroundBlobCache = new Map(); backgroundBlobPromises = new Map(); selectedIds = [];
-    revealedMaskIds = new Set(); editingHiddenMaskIds = new Set();
-    const localRecords = await loadNoteLocalRecords(session.uid, noteId);
-    assertUserSession(session);
-    let pendingForNote = localRecords.pendingSaves;
-    let pendingAssetsForNote = localRecords.pendingAssets;
-    let localConflicts = localRecords.conflicts;
-    // Choosing the cloud version must only read cloud state. Local drafts and
-    // assets remain durable in IndexedDB until the user explicitly retries or
-    // creates a recovered copy from the save-status popover.
-    if (shouldRecoverLocalNoteState({ readOnly: readOnlyEditor, preferCloud })) {
-      setEditorStartupState("loading-assets");
-      pendingAssetsForNote = await recoverPendingAssets(noteId, session, localRecords);
-      setEditorStartupState("reconciling-local-draft");
-      const recovered = await recoverPendingSaves(noteId, pages, session, {
-        ...localRecords,
-        pendingAssets: pendingAssetsForNote
+    const finishOpenNote = startupMetrics.startSpan("open-note", { preferCloud, forceReadOnly });
+    startupCanEditMarked = false;
+    startupThumbnailDrainStarted = false;
+    let leaseForThisOpen = null;
+    try {
+      const session = captureUserSession();
+      assertUserSession(session);
+      cancelActiveInteraction("close");
+      cancelCropEditor({ restore: true });
+      closeTransientUi();
+      setLocalDraftRecoveryAvailable(false);
+      setEditorStartupState("loading-note-metadata");
+      if (currentNote && !await flushWithDecision(pages[currentPageIndex], "別のノートを開く操作")) {
+        finishOpenNote({}, "cancelled");
+        return;
+      }
+      localRecoverySuppressed = preferCloud;
+      explicitReadOnlyMode = forceReadOnly === true;
+      assertUserSession(session);
+      currentNote = await measureStartupPhase(
+        "note-metadata",
+        () => noteStore.getNote(noteId, { expectedUid: session.uid }),
+        note => ({ found: Boolean(note && !note.deletedAt), noteType: note?.type || "" })
+      );
+      assertUserSession(session);
+      if (!currentNote || currentNote.deletedAt) throw new Error("ノートが見つかりません。");
+      startupMetrics.setContext({ noteType: currentNote.type || "" });
+      setEditorStartupState("loading-pages");
+      contentCache = new Map(); contentLoadPromises = new Map();
+      assetCache = new Map(); backgroundBlobCache = new Map(); backgroundBlobPromises = new Map(); selectedIds = [];
+      revealedMaskIds = new Set(); editingHiddenMaskIds = new Set();
+      // These four operations have no data dependency on one another. Running
+      // them in series added a network round trip, the fixed lease wait, and an
+      // IndexedDB scan to every editor launch before the first page could load.
+      // Start the fixed lease-confirmation wait first. Firestore may spend
+      // noticeable synchronous time preparing listPages() before returning its
+      // Promise, so starting it first lets that CPU work overlap the 180ms wait.
+      const editorLeasePromise = measureStartupPhase(
+        "editor-lock",
+        () => establishEditorLease(noteId, session, { forceReadOnly }),
+        result => ({
+          acquired: result?.acquired === true,
+          readOnly: readOnlyEditor,
+          stale: result?.stale === true,
+          claimAttempts: Number(result?.claimAttempts || 0),
+          claimConfirmationWaitMs: Number(result?.claimConfirmationWaitMs || 0),
+          retryCount: Number(result?.retryCount || 0)
+        })
+      );
+      // establishEditorLease creates the lease synchronously before claim()
+      // begins its confirmation wait. Retain that exact instance so a failure
+      // in any parallel startup branch cannot leave its heartbeat running.
+      leaseForThisOpen = editorLease;
+      const localRecordsPromise = measureStartupPhase(
+        "local-record-scan",
+        () => loadNoteLocalRecords(session.uid, noteId),
+        records => ({
+          conflicts: records.conflicts.length,
+          pendingSaves: records.pendingSaves.length,
+          pendingAssets: records.pendingAssets.length,
+          pageDrafts: records.pageDrafts.length
+        })
+      );
+      const resourcePreparationPromise = measureStartupPhase(
+        "note-resource-preparation",
+        () => prepareNoteResources(currentNote)
+      );
+      const pageMetadataPromise = measureStartupPhase(
+        "page-metadata",
+        () => noteStore.listPages(noteId, { expectedUid: session.uid }),
+        loadedPages => ({ pageCount: loadedPages.length })
+      );
+      const [leaseResult, localRecords, , loadedPages] = await Promise.all([
+        editorLeasePromise,
+        localRecordsPromise,
+        resourcePreparationPromise,
+        pageMetadataPromise
+      ]);
+      assertUserSession(session);
+      pages = loadedPages;
+      if (!pages.length) throw new Error("ノートにページがありません。");
+      startupMetrics.setContext({
+        pageCount: pages.length,
+        backgroundPageCount: pages.filter(page => ["pdf-source-page", "material-page"].includes(page.background?.type)).length
       });
-      pendingForNote = recovered.pendingSaves;
-      localConflicts = recovered.conflicts;
-    }
-    assertUserSession(session);
-    if (!preferCloud) {
-      const pagesById = new Map(pages.map(page => [page.pageId, page]));
-      localRecords.pageDrafts.forEach(draft => {
-        const page = pagesById.get(draft.pageId);
-        if (page && draft.content && !contentCache.has(page.pageId)) {
-          contentCache.set(page.pageId, normalizeNoteLineElements(draft.content, page.size));
-        }
+      startupMetrics.increment("editor-lock-retries", Number(leaseResult?.retryCount || 0));
+      currentPageIndex = 0;
+      applyToolSettingsToUi();
+      let pendingForNote = localRecords.pendingSaves;
+      let pendingAssetsForNote = localRecords.pendingAssets;
+      let localConflicts = localRecords.conflicts;
+      const recoverLocalState = shouldRecoverLocalNoteState({ readOnly: readOnlyEditor, preferCloud });
+      startupMetrics.setContext({ recoveryAttempted: recoverLocalState });
+      // Choosing the cloud version must only read cloud state. Local drafts and
+      // assets remain durable in IndexedDB until the user explicitly retries or
+      // creates a recovered copy from the save-status popover.
+      if (recoverLocalState) {
+        setEditorStartupState("loading-assets");
+        pendingAssetsForNote = await measureStartupPhase(
+          "pending-asset-recovery",
+          () => recoverPendingAssets(noteId, session, localRecords),
+          remaining => ({ before: localRecords.pendingAssets.length, remaining: remaining.length })
+        );
+        setEditorStartupState("reconciling-local-draft");
+        const recovered = await measureStartupPhase(
+          "pending-save-recovery",
+          () => recoverPendingSaves(noteId, pages, session, {
+            ...localRecords,
+            pendingAssets: pendingAssetsForNote
+          }),
+          result => ({
+            before: localRecords.pendingSaves.length,
+            remaining: result.pendingSaves.length,
+            conflicts: result.conflicts.length
+          })
+        );
+        pendingForNote = recovered.pendingSaves;
+        localConflicts = recovered.conflicts;
+      }
+      assertUserSession(session);
+      if (!preferCloud) {
+        const pagesById = new Map(pages.map(page => [page.pageId, page]));
+        measureStartupWork("local-draft-cache", () => localRecords.pageDrafts.forEach(draft => {
+          const page = pagesById.get(draft.pageId);
+          if (page && draft.content && !contentCache.has(page.pageId)) {
+            contentCache.set(page.pageId, normalizeNoteLineElements(draft.content, page.size));
+          }
+        }), () => ({ cachedDrafts: contentCache.size }));
+      }
+      conflictPageIds = new Set(localConflicts.map(conflict => conflict.pageId));
+      startupMetrics.increment("conflicts-detected", localConflicts.length);
+      startupMetrics.setContext({
+        pendingSaveCount: pendingForNote.length,
+        pendingAssetCount: pendingAssetsForNote.length,
+        conflictCount: localConflicts.length
       });
+      currentNote.conflicts = localConflicts;
+      currentNote.hasConflict = conflictPageIds.size > 0;
+      history.clear();
+      ui.title.value = currentNote.title || "無題ノート";
+      show("editor");
+      setEditorStartupState("loading-content");
+      await loadCurrentPage({ preferCloud });
+      startupMetrics.mark("first-page-rendered");
+      setLocalDraftRecoveryAvailable(pendingForNote.length > 0 || pendingAssetsForNote.length > 0);
+      if (pendingForNote.length || pendingAssetsForNote.length) {
+        const pendingDetail = [
+          pendingForNote.length ? `下書き再送待ち ${pendingForNote.length}件` : "",
+          pendingAssetsForNote.length ? `画像再送待ち ${pendingAssetsForNote.length}件` : ""
+        ].filter(Boolean).join(" / ");
+        setSaveState(navigator.onLine === false ? "offline-local" : "recoverable-error", { detail: pendingDetail });
+      } else {
+        setSaveState("saved");
+      }
+      if (currentNote.hasConflict) {
+        setSaveState("conflict");
+      }
+      ui.conflictBanner.classList.toggle("hidden", !conflictPageIds.has(pages[currentPageIndex]?.pageId));
+      setMarkupMode(true);
+      setStudyMode(study);
+      setEditorStartupState("ready");
+      startupMetrics.mark("first-visible-page", { canEdit: isEditableNow() });
+      startupMetrics.mark("interactive-ready", { canEdit: isEditableNow() });
+      markStartupCanEdit();
+      globalThis.requestAnimationFrame?.(() => globalThis.requestAnimationFrame?.(() => {
+        startupMetrics.mark("first-visible-page-painted");
+      }));
+      finishOpenNote({ ready: true, canEdit: isEditableNow() });
+      console.info("ノートエディタ起動計測", startupMetrics.snapshot());
+      schedulePageThumbnails();
+    } catch (error) {
+      if (leaseForThisOpen && editorLease === leaseForThisOpen) {
+        leaseForThisOpen.dispose();
+        editorLease = null;
+      }
+      finishOpenNote({ errorName: error?.name || "Error" }, "error");
+      throw error;
     }
-    conflictPageIds = new Set(localConflicts.map(conflict => conflict.pageId));
-    currentNote.conflicts = localConflicts;
-    currentNote.hasConflict = conflictPageIds.size > 0;
-    history.clear();
-    ui.title.value = currentNote.title || "無題ノート";
-    show("editor");
-    setEditorStartupState("loading-content");
-    await loadCurrentPage({ preferCloud });
-    setLocalDraftRecoveryAvailable(pendingForNote.length > 0 || pendingAssetsForNote.length > 0);
-    if (pendingForNote.length || pendingAssetsForNote.length) {
-      const pendingDetail = [
-        pendingForNote.length ? `下書き再送待ち ${pendingForNote.length}件` : "",
-        pendingAssetsForNote.length ? `画像再送待ち ${pendingAssetsForNote.length}件` : ""
-      ].filter(Boolean).join(" / ");
-      setSaveState(navigator.onLine === false ? "offline-local" : "recoverable-error", { detail: pendingDetail });
-    } else {
-      setSaveState("saved");
-    }
-    if (currentNote.hasConflict) {
-      setSaveState("conflict");
-    }
-    ui.conflictBanner.classList.toggle("hidden", !conflictPageIds.has(pages[currentPageIndex]?.pageId));
-    setMarkupMode(true);
-    setStudyMode(study);
-    setEditorStartupState("ready");
-    schedulePageThumbnails();
   }
 
   async function loadCurrentPage(options = {}) {
     const page = pages[currentPageIndex];
     if (!page) return;
+    const measureInitialLoad = startupState === "loading-content";
     selectedIds = [];
     cancelActiveInteraction("page-change");
     cancelCropEditor({ restore: true });
     closeTransientUi();
-    currentContent = await pageContent(page, options);
+    currentContent = measureInitialLoad
+      ? await measureStartupPhase(
+        "page-content-json",
+        () => pageContent(page, options),
+        content => ({
+          elementCount: content.elements.length,
+          imageCount: content.elements.filter(element => element.type === "image").length,
+          noteMaskCount: content.noteMasks.length
+        })
+      )
+      : await pageContent(page, options);
     ui.conflictBanner.classList.toggle("hidden", !conflictPageIds.has(page.pageId));
-    renderPageList();
-    await renderPage();
+    const pageRenderPromise = measureInitialLoad
+      ? measureStartupPhase("first-page-render", renderPage, () => ({
+        elementCount: currentContent.elements.length,
+        imageCount: currentContent.elements.filter(element => element.type === "image").length
+      }))
+      : renderPage();
+    // renderPage starts the background and pasted-image requests before its
+    // first await. Build the sidebar while that I/O is already in flight.
+    if (measureInitialLoad) measureStartupWork("page-list-dom", renderPageList, () => ({ pageCount: pages.length }));
+    else renderPageList();
+    await pageRenderPromise;
     preloadAdjacentPages();
     if (startupState === "ready") schedulePageThumbnails();
   }
@@ -2210,6 +2397,14 @@ export function createStudyNotes(dependencies) {
   }
 
   function cancelPageThumbnailQueue() {
+    if (startupThumbnailDrain) {
+      startupThumbnailDrain.finish({
+        completed: startupThumbnailDrain.completed.size,
+        failed: startupThumbnailDrain.failed,
+        expected: startupThumbnailDrain.expected.size
+      }, "cancelled");
+      startupThumbnailDrain = null;
+    }
     pageThumbnailGeneration += 1;
     pageThumbnailQueue = [];
     if (pageThumbnailIdleHandle) {
@@ -2245,6 +2440,7 @@ export function createStudyNotes(dependencies) {
       activePageThumbnails += 1;
       void hydratePageThumbnail(task.page, task.button, { force: task.force })
         .catch(error => {
+          if (startupThumbnailDrain?.generation === task.generation) startupThumbnailDrain.failed += 1;
           if (task.generation !== pageThumbnailGeneration || !task.button.isConnected) return;
           task.button.classList.remove("loading");
           task.button.classList.add("fallback");
@@ -2253,6 +2449,17 @@ export function createStudyNotes(dependencies) {
         })
         .finally(() => {
           activePageThumbnails -= 1;
+          if (startupThumbnailDrain?.generation === task.generation) {
+            startupThumbnailDrain.completed.add(task.page.pageId);
+            if (startupThumbnailDrain.completed.size >= startupThumbnailDrain.expected.size) {
+              startupThumbnailDrain.finish({
+                completed: startupThumbnailDrain.completed.size,
+                failed: startupThumbnailDrain.failed,
+                expected: startupThumbnailDrain.expected.size
+              });
+              startupThumbnailDrain = null;
+            }
+          }
           pumpPageThumbnailQueue();
         });
     }
@@ -2263,6 +2470,16 @@ export function createStudyNotes(dependencies) {
     const ordered = pages
       .map((page, index) => ({ page, index, distance: Math.abs(index - currentPageIndex) }))
       .sort((a, b) => a.distance - b.distance || a.index - b.index);
+    if (startupState === "ready" && !startupThumbnailDrainStarted) {
+      startupThumbnailDrainStarted = true;
+      startupThumbnailDrain = {
+        generation: pageThumbnailGeneration,
+        expected: new Set(ordered.map(item => item.page.pageId)),
+        completed: new Set(),
+        failed: 0,
+        finish: startupMetrics.startSpan("thumbnail-queue-drain", { concurrency: pageThumbnailConcurrency })
+      };
+    }
     const enqueue = ({ page }) => {
       const button = ui.pageList.querySelector(`[data-page-id="${CSS.escape(page.pageId)}"]`);
       enqueuePageThumbnail(page, button);
@@ -2328,6 +2545,7 @@ export function createStudyNotes(dependencies) {
       page,
       content,
       materialMasks,
+      backgroundSource: materialSourceCacheIdentity(materialSourcePage(page)),
       maskMode: "all"
     });
     const key = noteLocalKey(uid, noteId, page.pageId, "thumbnail");
@@ -2422,24 +2640,98 @@ export function createStudyNotes(dependencies) {
     return material?.pages?.find(item => Number(item.page) === pageNumber) || material?.pages?.[pageNumber - 1] || null;
   }
 
+  function materialSourceCacheIdentity(source) {
+    if (!source) return "";
+    return JSON.stringify({
+      path: source.imagePath || source.path || source.storagePath || "",
+      url: source.imageUrl || source.url || "",
+      revision: source.contentHash || source.hash || source.updatedAt || source.version || ""
+    });
+  }
+
+  function resourceLocalCacheKey(session, noteId, pageId, resourceKey) {
+    return noteLocalKey(session.uid, noteId, pageId, `resource-${stableLegacyMutationId(resourceKey)}`);
+  }
+
+  async function readCachedNoteResource(session, noteId, pageId, resourceKey) {
+    const localKey = resourceLocalCacheKey(session, noteId, pageId, resourceKey);
+    try {
+      const cached = await localStore.get("thumbnails", localKey);
+      assertUserSession(session);
+      if (
+        cached?.kind === "note-resource" &&
+        cached.resourceKey === resourceKey &&
+        Number(cached.blob?.size) > 0
+      ) {
+        startupMetrics.increment("resource-idb-cache-hits");
+        return cached.blob;
+      }
+    } catch (error) {
+      if (error?.name === "NoteSessionChangedError") throw error;
+      console.debug("IndexedDBのノート画像キャッシュを読み込めませんでした。", error);
+    }
+    const cached = await resourceCache.get(session.uid, resourceKey);
+    assertUserSession(session);
+    if (cached) startupMetrics.increment("resource-cache-api-hits");
+    return cached;
+  }
+
+  function cacheNoteResource(session, noteId, pageId, resourceKey, blob) {
+    const localKey = resourceLocalCacheKey(session, noteId, pageId, resourceKey);
+    const updatedAt = new Date().toISOString();
+    const indexedDbWrite = resourceIdbWriter.enqueue({
+      key: localKey,
+      uid: session.uid,
+      noteId,
+      pageId,
+      kind: "note-resource",
+      resourceKey,
+      blob,
+      blobSize: Number(blob?.size || 0),
+      updatedAt
+    }).then(stored => stored === true).catch(error => {
+      console.debug("IndexedDBへノート画像キャッシュを保存できませんでした。", error);
+      return false;
+    });
+    const cacheApiWrite = resourceCache.put(session.uid, resourceKey, blob);
+    void Promise.all([indexedDbWrite, cacheApiWrite]).then(results => {
+      startupMetrics.increment(results.some(Boolean) ? "resource-cache-writes" : "resource-cache-write-failures");
+    });
+  }
+
   async function resolveBackgroundBlob(page) {
     const session = captureUserSession();
     assertUserSession(session);
     const noteId = page?.noteId || currentNote?.id || "note";
-    const key = `${noteId}|${page?.pageId || "page"}|${createNoteBackgroundSignature(page, noteId)}`;
+    const currentMaterialSource = page?.background?.type === "material-page" ? materialSourcePage(page) : null;
+    const resolvedMaterialSource = currentMaterialSource ? { ...currentMaterialSource } : null;
+    const resolvedSourceIdentity = materialSourceCacheIdentity(resolvedMaterialSource);
+    const key = `${noteId}|${page?.pageId || "page"}|${createNoteBackgroundSignature(page, noteId, resolvedSourceIdentity)}`;
     if (backgroundBlobCache.has(key)) return backgroundBlobCache.get(key);
     if (backgroundBlobPromises.has(key)) return backgroundBlobPromises.get(key);
-    const loading = loadSessionBoundBackgroundBlob({
-      page,
-      session,
-      assertUserSession,
-      getStorageBlob: (path, options) => noteStore.getStorageBlob(path, options),
-      getMaterialSourcePage: materialSourcePage
-    }).then(blob => {
+    const resourceKey = `background|${key}`;
+    const loading = (async () => {
+      startupMetrics.setContext({ resourceCacheAvailable: resourceCache.available });
+      const cached = await readCachedNoteResource(session, noteId, page?.pageId || "page", resourceKey);
+      assertUserSession(session);
+      if (cached) {
+        startupMetrics.increment("resource-cache-hits");
+        backgroundBlobCache.set(key, cached);
+        return cached;
+      }
+      startupMetrics.increment("resource-cache-misses");
+      const blob = await loadSessionBoundBackgroundBlob({
+        page,
+        session,
+        assertUserSession,
+        getStorageBlob: (path, options) => noteStore.getStorageBlob(path, options),
+        getMaterialSourcePage: () => resolvedMaterialSource
+      });
       assertUserSession(session);
       backgroundBlobCache.set(key, blob);
+      cacheNoteResource(session, noteId, page?.pageId || "page", resourceKey, blob);
       return blob;
-    }).finally(() => {
+    })().finally(() => {
       if (backgroundBlobPromises.get(key) === loading) backgroundBlobPromises.delete(key);
     });
     backgroundBlobPromises.set(key, loading);
@@ -2451,6 +2743,15 @@ export function createStudyNotes(dependencies) {
     assertUserSession(session);
     const key = `${sourceNoteId}|${assetId}`;
     if (assetCache.has(key)) return assetCache.get(key);
+    const resourceKey = `asset|${key}`;
+    const cached = await readCachedNoteResource(session, sourceNoteId, assetId, resourceKey);
+    assertUserSession(session);
+    if (cached) {
+      startupMetrics.increment("resource-cache-hits");
+      assetCache.set(key, cached);
+      return cached;
+    }
+    startupMetrics.increment("resource-cache-misses");
     try {
       const metadata = await noteStore.getAsset(sourceNoteId, assetId, { expectedUid: session.uid });
       assertUserSession(session);
@@ -2458,6 +2759,7 @@ export function createStudyNotes(dependencies) {
         const blob = await noteStore.getStorageBlob(metadata.storagePath, { expectedUid: session.uid });
         assertUserSession(session);
         assetCache.set(key, blob);
+        cacheNoteResource(session, sourceNoteId, assetId, resourceKey, blob);
         return blob;
       }
     } catch (error) {
@@ -2469,6 +2771,7 @@ export function createStudyNotes(dependencies) {
     assertUserSession(session);
     if (!pending) throw new Error(`貼り付け画像 ${assetId} をクラウドまたは端末内下書きから取得できません。`);
     assetCache.set(key, pending.blob);
+    cacheNoteResource(session, sourceNoteId, assetId, resourceKey, pending.blob);
     return pending.blob;
   }
 
@@ -3164,16 +3467,29 @@ export function createStudyNotes(dependencies) {
 
   async function renderPage() {
     if (!currentContent || !pages[currentPageIndex]) return;
+    const measureInitialLoad = startupState === "loading-content";
     const token = ++renderToken;
     const page = pages[currentPageIndex];
     const metrics = notePageMetrics(page.size);
     // Apply the next page geometry before background I/O yields. Pointer input
     // must never observe the previous page's aspect ratio during a page switch.
     ui.stage.style.aspectRatio = `${page.size?.width || A4_SIZE.width} / ${page.size?.height || A4_SIZE.height}`;
-    const backgroundSignature = createNoteBackgroundSignature(page, currentNote?.id);
+    const backgroundSignature = createNoteBackgroundSignature(
+      page,
+      currentNote?.id,
+      materialSourceCacheIdentity(materialSourcePage(page))
+    );
     const keepBackground = renderedBackgroundSignature === backgroundSignature &&
       Boolean(ui.stage.querySelector(".note-paper-layer"));
-    if (keepBackground) clearInteractiveLayers();
+    const finishBackgroundLoad = measureInitialLoad ? startupMetrics.startSpan("current-page-background") : () => null;
+    const finishBackgroundDecode = measureInitialLoad ? startupMetrics.startSpan("current-page-background-decode") : () => null;
+    let backgroundLoadPromise = Promise.resolve({ ok: true, required: false });
+    let backgroundDecodePromise = Promise.resolve({ ok: true, required: false });
+    if (keepBackground) {
+      clearInteractiveLayers();
+      finishBackgroundLoad({ cached: true, required: ["pdf-source-page", "material-page"].includes(page.background?.type) });
+      finishBackgroundDecode({ cached: true, required: ["pdf-source-page", "material-page"].includes(page.background?.type) });
+    }
     else {
       const backgroundToken = ++backgroundRenderToken;
       renderedBackgroundSignature = backgroundSignature;
@@ -3191,17 +3507,52 @@ export function createStudyNotes(dependencies) {
       ui.stage.append(paper);
 
       if (["pdf-source-page", "material-page"].includes(page.background?.type)) {
-        try {
-          const blob = await resolveBackgroundBlob(page);
-          if (backgroundToken !== backgroundRenderToken || backgroundSignature !== renderedBackgroundSignature) return;
-          const url = URL.createObjectURL(blob); objectUrls.push(url);
-          const image = document.createElement("img"); image.className = "note-background-image"; image.alt = "ノート背景"; image.src = url;
-          ui.stage.append(image);
-        } catch (error) {
-          if (backgroundToken !== backgroundRenderToken || backgroundSignature !== renderedBackgroundSignature) return;
-          const message = document.createElement("div"); message.className = "note-layer note-background-error"; message.textContent = `背景画像を表示できません: ${error.message}`;
-          ui.stage.append(message);
-        }
+        // Keep the background nodes in their stable stacking position, but do
+        // not make pasted image retrieval wait for the PDF/material download.
+        const image = document.createElement("img");
+        image.className = "note-background-image hidden";
+        image.alt = "ノート背景";
+        const message = document.createElement("div");
+        message.className = "note-layer note-background-error hidden";
+        ui.stage.append(image, message);
+        backgroundLoadPromise = resolveBackgroundBlob(page).then(blob => {
+          finishBackgroundLoad({ cached: false, required: true, byteSize: Number(blob?.size || 0) });
+          if (backgroundToken !== backgroundRenderToken || backgroundSignature !== renderedBackgroundSignature) {
+            return { ok: false, required: true, stale: true };
+          }
+          const url = URL.createObjectURL(blob);
+          objectUrls.push(url);
+          image.src = url;
+          image.classList.remove("hidden");
+          backgroundDecodePromise = typeof image.decode === "function"
+            ? image.decode().then(
+              () => {
+                finishBackgroundDecode({ cached: false, required: true });
+                return { ok: true, required: true };
+              },
+              error => {
+                finishBackgroundDecode({ required: true, errorName: error?.name || "Error" }, "error");
+                return { ok: false, required: true };
+              }
+            )
+            : Promise.resolve({ ok: true, required: true }).then(result => {
+              finishBackgroundDecode({ cached: false, required: true, decodeUnsupported: true });
+              return result;
+            });
+          return { ok: true, required: true };
+        }).catch(error => {
+          finishBackgroundLoad({ required: true, errorName: error?.name || "Error" }, "error");
+          finishBackgroundDecode({ required: true, skipped: true, errorName: error?.name || "Error" }, "error");
+          backgroundDecodePromise = Promise.resolve({ ok: false, required: true });
+          if (backgroundToken === backgroundRenderToken && backgroundSignature === renderedBackgroundSignature) {
+            message.textContent = `背景画像を表示できません: ${error.message}`;
+            message.classList.remove("hidden");
+          }
+          return { ok: false, required: true };
+        });
+      } else {
+        finishBackgroundLoad({ cached: false, required: false, byteSize: 0 });
+        finishBackgroundDecode({ cached: false, required: false });
       }
     }
     if (token !== renderToken) return;
@@ -3212,6 +3563,11 @@ export function createStudyNotes(dependencies) {
     elementLayer.dataset.layer = "elements";
     elementLayer.style.zIndex = "10";
     const assetRenderPromises = [];
+    const finishAssetLoad = measureInitialLoad ? startupMetrics.startSpan("current-page-assets") : () => null;
+    const finishAssetDecode = measureInitialLoad ? startupMetrics.startSpan("current-page-assets-decode") : () => null;
+    const assetDecodePromises = [];
+    let assetByteSize = 0;
+    let failedAssetCount = 0;
     const ordered = [...currentContent.elements].sort((a, b) => Number(a.zIndex || 0) - Number(b.zIndex || 0));
     for (const [stackIndex, element] of ordered.entries()) {
       const layerZIndex = String(stackIndex + 1);
@@ -3226,8 +3582,18 @@ export function createStudyNotes(dependencies) {
         image.style.left = `${-crop.x / crop.width * 100}%`; image.style.top = `${-crop.y / crop.height * 100}%`;
         const assetRender = resolveAssetBlob(element.assetId, element.assetNoteId || currentNote.id).then(blob => {
           if (token !== renderToken) return;
+          assetByteSize += Number(blob?.size || 0);
           const url = URL.createObjectURL(blob); objectUrls.push(url); image.src = url; image.dataset.noteObjectUrl = url;
-        }).catch(error => { wrap.title = error.message; });
+          if (typeof image.decode === "function") {
+            assetDecodePromises.push(image.decode().then(
+              () => ({ ok: true }),
+              () => ({ ok: false })
+            ));
+          }
+        }).catch(error => {
+          failedAssetCount += 1;
+          wrap.title = error.message;
+        });
         assetRenderPromises.push(assetRender);
         wrap.append(image); elementLayer.append(wrap);
         continue;
@@ -3330,7 +3696,34 @@ export function createStudyNotes(dependencies) {
     });
     // The initial editor load awaits renderPage(), so current-page images and
     // background always receive priority over the deferred thumbnail queue.
-    await Promise.allSettled(assetRenderPromises);
+    const [, assetResults] = await Promise.all([
+      backgroundLoadPromise,
+      Promise.allSettled(assetRenderPromises)
+    ]);
+    finishAssetLoad({
+      assetCount: assetResults.length,
+      failedAssetCount,
+      byteSize: assetByteSize
+    });
+    const assetDecodePromise = Promise.all(assetDecodePromises).then(results => {
+      const failedDecodeCount = results.filter(result => result.ok !== true).length;
+      finishAssetDecode({
+        assetCount: assetResults.length,
+        decodedAssetCount: results.length - failedDecodeCount,
+        failedDecodeCount
+      }, failedDecodeCount ? "error" : "ok");
+      return { ok: failedDecodeCount === 0 };
+    });
+    if (!assetDecodePromises.length) {
+      finishAssetDecode({ assetCount: assetResults.length, decodedAssetCount: 0, failedDecodeCount: 0 });
+    }
+    if (measureInitialLoad) {
+      void Promise.all([backgroundDecodePromise, assetDecodePromise]).then(results => {
+        startupMetrics.mark("first-page-visual-complete", {
+          failedVisualCount: results.filter(result => result.ok !== true).length
+        });
+      });
+    }
   }
 
   function commitChange(before, label) {

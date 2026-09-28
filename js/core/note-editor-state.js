@@ -113,7 +113,7 @@ export function createNoteEditorDiagnosticSnapshot(value = {}) {
     "localDraftRevision", "saveState", "lockOwner", "lockAgeMs",
     "pendingSaves", "pendingAssets", "conflicts", "lastSaveSucceededAt",
     "lastError", "emulator", "urlParameters", "userAgent", "viewport",
-    "zoom", "pageRect", "pageSpace", "startupState", "drawing"
+    "zoom", "pageRect", "pageSpace", "startupState", "startup", "drawing"
   ];
   return allowed.reduce((result, key) => {
     if (value[key] !== undefined) result[key] = structuredClone(value[key]);

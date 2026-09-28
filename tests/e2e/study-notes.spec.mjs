@@ -735,6 +735,7 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await page.locator("#noteStudyModeBtn").click();
   await expect(page.locator("#noteStudyControls")).toBeVisible();
   await page.locator("#noteEditModeBtn").click();
+  expect(await page.evaluate(() => Boolean(globalThis.PDFLib)), "PDF生成前はpdf-libを評価しない").toBe(false);
 
   await page.locator(".note-more-menu summary").click();
   await page.locator('[data-note-action="export"]').click();
@@ -743,6 +744,7 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await expect(page.locator("#noteExportPageNumbers")).toBeChecked();
   await page.locator("#createNotePdfBtn").click();
   await expect(page.locator("#noteExportStatus")).toContainText("作成したPDF", { timeout: 60_000 });
+  expect(await page.evaluate(() => Boolean(globalThis.PDFLib?.PDFDocument)), "PDF生成時にローカルpdf-libを遅延読込する").toBe(true);
   await expect(page.locator("#noteExportFilename")).toHaveValue(/AI共有用.*\.pdf$/);
   await page.locator("#noteExportFilename").fill(" 症例/共有.pdf.pdf. ");
   const downloadPromise = page.waitForEvent("download");
@@ -1141,6 +1143,15 @@ test("@authenticated 読み取り専用タブではUndo・Redo・コピー貼り
     await takeover.goto(takeoverUrl.toString(), { waitUntil: "domcontentloaded" });
     await expect(takeover.locator("#noteEditorView")).toBeVisible({ timeout: 20_000 });
     await expect(takeover.locator("#noteEditorLockBanner")).toContainText("別のタブで編集中");
+    await expect(takeover.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
+    const blockedLockMetric = await takeover.evaluate(() => globalThis.__noteEditorStartupMetrics.spans
+      .find(span => span.name === "editor-lock"));
+    expect(blockedLockMetric?.details).toMatchObject({
+      acquired: false,
+      readOnly: true,
+      claimConfirmationWaitMs: 0,
+      retryCount: 0
+    });
     await takeover.locator("#noteEditorTakeoverBtn").click();
     await expect(takeover.locator("#noteEditorView")).not.toHaveClass(/is-readonly/);
     await expect(page.locator("#noteEditorView")).toHaveClass(/is-readonly/);
@@ -1620,6 +1631,20 @@ test("@authenticated 画像Storage失敗時はIndexedDBへ保持し再読込後�
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
   await expect(page.locator("#notePageStage .note-image-element img")).toHaveAttribute("src", /blob:/, { timeout: 20_000 });
+  const recoveryStartupMetrics = await page.evaluate(() => globalThis.__noteEditorStartupMetrics);
+  expect(recoveryStartupMetrics.context).toMatchObject({
+    pendingSaveCount: 1,
+    pendingAssetCount: 1,
+    conflictCount: 0
+  });
+  expect(recoveryStartupMetrics.spans.find(span => span.name === "pending-asset-recovery")?.details).toMatchObject({
+    before: 1,
+    remaining: 1
+  });
+  expect(recoveryStartupMetrics.spans.find(span => span.name === "current-page-assets")?.details).toMatchObject({
+    assetCount: 1,
+    failedAssetCount: 0
+  });
   await page.locator("#noteSaveStatus").click();
   await expect(page.locator("#noteRetrySaveBtn")).toBeVisible();
   await page.locator("#noteSaveStatus").click();
@@ -2207,7 +2232,30 @@ test("@authenticated 不正なノートURLでも灰色画面だけにならず�
   expect(blockedRequests).toEqual([]);
 });
 
-test("@authenticated 専用エディタは対象外ノート一覧を構築せずローカル4ストアを各1回だけ走査する", async ({ page }) => {
+test("@authenticated ページ内容の初期読込失敗後は取得済み編集leaseを解放する", async ({ page }) => {
+  test.setTimeout(60_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "初期読込失敗lease解放E2Eノート");
+  await updateNotePage(user.uid, note.noteId, note.pageId, {
+    contentRevision: 1,
+    contentPath: `users/${user.uid}/notes/${note.noteId}/pages/${note.pageId}/revisions/missing.json`,
+    contentHash: "missing-content"
+  });
+  await login(page, user);
+
+  const editorTabId = crypto.randomUUID();
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${editorTabId}`, {
+    waitUntil: "domcontentloaded"
+  });
+  await expect(page.locator("#noteEditorStartupTitle")).toHaveText("ノートを開けませんでした", { timeout: 20_000 });
+  await expect.poll(() => page.evaluate(({ uid, noteId }) => (
+    localStorage.getItem(`dentalQaNoteEditorLease:${uid}:${noteId}`)
+  ), { uid: user.uid, noteId: note.noteId })).toBeNull();
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 専用エディタは対象外ノート一覧を構築せずローカル4ストアを各1回だけ走査する", async ({ page }, testInfo) => {
   test.setTimeout(90_000);
   const blockedRequests = await guardProductionFirebase(page);
   await page.addInitScript(() => {
@@ -2239,6 +2287,11 @@ test("@authenticated 専用エディタは対象外ノート一覧を構築せ�
   await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
   await expect(page.locator("#noteTitleInput")).toHaveValue("直行読込E2Eノート");
   await expect(page.locator("#noteList").locator(":scope > *")).toHaveCount(0);
+  const dedicatedEditorResources = await page.evaluate(() => performance.getEntriesByType("resource")
+    .map(entry => new URL(entry.name).pathname));
+  expect(dedicatedEditorResources).not.toContain("/js/features/question-manager.js");
+  expect(dedicatedEditorResources).not.toContain("/js/features/image-memory.js");
+  expect(dedicatedEditorResources).not.toContain("/vendor/pdf-lib/pdf-lib.min.js");
   await expect.poll(() => page.evaluate(() => globalThis.__noteLocalObjectStoreGetAllCalls
     .filter(call => call.database === "dentalQaNoteLocal")
     .sort((left, right) => left.store.localeCompare(right.store)))).toEqual(
@@ -2249,6 +2302,145 @@ test("@authenticated 専用エディタは対象外ノート一覧を構築せ�
       upper: `${user.uid}|${target.noteId}|\uffff`
     }))
   );
+  const startupMetrics = await page.evaluate(() => globalThis.__noteEditorStartupMetrics);
+  const startupSpanNames = startupMetrics.spans.map(span => span.name);
+  const startupMarkNames = startupMetrics.marks.map(mark => mark.name);
+  expect(startupSpanNames).toEqual(expect.arrayContaining([
+    "firebase-initialization",
+    "auth-state-wait",
+    "note-metadata",
+    "page-metadata",
+    "editor-lock",
+    "local-record-scan",
+    "pending-asset-recovery",
+    "pending-save-recovery",
+    "page-content-json",
+    "page-list-dom",
+    "current-page-background",
+    "current-page-assets",
+    "first-page-render",
+    "open-note"
+  ]));
+  expect(startupMarkNames).toEqual(expect.arrayContaining([
+    "app-module-evaluated",
+    "auth-state-ready",
+    "note-open-requested",
+    "first-page-rendered",
+    "first-visible-page",
+    "interactive-ready",
+    "can-edit"
+  ]));
+  expect(startupMetrics.spans.find(span => span.name === "editor-lock")?.details).toMatchObject({
+    acquired: true,
+    claimConfirmationWaitMs: 180,
+    retryCount: 0
+  });
+  const parallelStartupSpans = [
+    "note-resource-preparation",
+    "page-metadata",
+    "editor-lock",
+    "local-record-scan"
+  ].map(name => startupMetrics.spans.find(span => span.name === name));
+  expect(parallelStartupSpans.every(Boolean)).toBe(true);
+  expect(
+    Math.max(...parallelStartupSpans.map(span => span.startMs)),
+    "独立した初期化処理は少なくとも1区間で重なり、直列完了を待たない"
+  ).toBeLessThanOrEqual(Math.min(...parallelStartupSpans.map(span => span.endMs)));
+  await testInfo.attach("note-startup-metrics.json", {
+    body: JSON.stringify(startupMetrics, null, 2),
+    contentType: "application/json"
+  });
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated PDF背景は再表示時に端末キャッシュを使いStorage再取得を待たない", async ({ page }) => {
+  test.setTimeout(90_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "背景キャッシュE2Eノート");
+  await seedNotePageBackground(user.uid, note.noteId, note.pageId, {
+    image: createRgbPng(1240, 1754),
+    size: { width: 1240, height: 1754 }
+  });
+  await login(page, user);
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, {
+    waitUntil: "domcontentloaded"
+  });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  await expect(page.locator("#notePageStage .note-background-image")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const counters = globalThis.__noteEditorStartupMetrics?.counters || {};
+    return Number(counters["resource-cache-writes"] || 0) +
+      Number(counters["resource-idb-cache-hits"] || 0) +
+      Number(counters["resource-cache-api-hits"] || 0);
+  })).toBeGreaterThan(0);
+  expect(await page.evaluate(() => globalThis.__noteEditorStartupMetrics.counters["resource-cache-write-failures"] || 0)).toBe(0);
+
+  let storageRequests = 0;
+  await page.route("**/v0/b/demo-dental-qa.firebasestorage.app/o**", route => {
+    storageRequests += 1;
+    return route.abort("failed");
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  await expect(page.locator("#notePageStage .note-background-image")).toBeVisible();
+  expect(await page.evaluate(() => globalThis.__noteEditorStartupMetrics.counters["resource-cache-hits"] || 0)).toBeGreaterThan(0);
+  expect(storageRequests, "再表示時はStorageへ背景を取りに行かない").toBe(0);
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 教材画像のStorageパス差し替え後は永続背景キャッシュを更新する", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  const material = await seedOpenableMaterial(user.uid);
+  await login(page, user);
+  await page.locator("#newNoteBtn").click();
+  await page.locator('[data-create-note="material"]').click();
+  const editor = await openEditorPopup(page, () => page.locator("#noteMaterialPicker button", {
+    hasText: "既定ノート更新E2E教材"
+  }).click(), { blockedRequests });
+  const background = editor.locator("#notePageStage .note-background-image");
+  await expect(background).toBeVisible({ timeout: 20_000 });
+  await expect.poll(() => background.evaluate(image => image.naturalWidth)).toBe(1);
+  await expect.poll(() => editor.evaluate(() => {
+    const counters = globalThis.__noteEditorStartupMetrics?.counters || {};
+    return Number(counters["resource-cache-writes"] || 0) +
+      Number(counters["resource-idb-cache-hits"] || 0) +
+      Number(counters["resource-cache-api-hits"] || 0);
+  })).toBeGreaterThan(0);
+
+  const replacementPath = `users/${user.uid}/imageMaterials/${material.materialId}/page-1-replacement.png`;
+  const environment = await initializeTestEnvironment({
+    projectId: "demo-dental-qa",
+    firestore: { host: "127.0.0.1", port: 8080 },
+    storage: { host: "127.0.0.1", port: 9199 }
+  });
+  try {
+    const context = environment.authenticatedContext(user.uid);
+    await uploadBytes(
+      ref(context.storage("gs://demo-dental-qa.firebasestorage.app"), replacementPath),
+      createRgbPng(2, 1),
+      { contentType: "image/png" }
+    );
+    const materialsRef = doc(context.firestore(), "users", user.uid, "app", "pdfMaterials");
+    const snapshot = await getDoc(materialsRef);
+    await setDoc(materialsRef, {
+      ...snapshot.data(),
+      pdfMaterials: snapshot.data().pdfMaterials.map(item => item.id === material.materialId ? {
+        ...item,
+        pages: item.pages.map(source => Number(source.page) === 1 ? { ...source, imagePath: replacementPath } : source)
+      } : item)
+    });
+  } finally {
+    await environment.cleanup();
+  }
+
+  await editor.reload({ waitUntil: "domcontentloaded" });
+  await expect(editor.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  await expect(background).toBeVisible({ timeout: 20_000 });
+  await expect.poll(() => background.evaluate(image => image.naturalWidth)).toBe(2);
+  expect(await editor.evaluate(() => globalThis.__noteEditorStartupMetrics.counters["resource-cache-misses"] || 0)).toBeGreaterThan(0);
   expect(blockedRequests).toEqual([]);
 });
 
@@ -2269,7 +2461,11 @@ test("@authenticated split未整備では大きい旧mainへfallbackしても許
   const elapsedMs = Date.now() - startedAt;
 
   await testInfo.attach("legacy-main-fallback-timing.json", {
-    body: JSON.stringify({ elapsedMs, legacyPayloadBytes: seeded.legacyPayloadBytes }, null, 2),
+    body: JSON.stringify({
+      elapsedMs,
+      legacyPayloadBytes: seeded.legacyPayloadBytes,
+      startupMetrics: await page.evaluate(() => globalThis.__noteEditorStartupMetrics)
+    }, null, 2),
     contentType: "application/json"
   });
   await expect(page.locator("#noteTitleInput")).toHaveValue("旧形式fallback E2Eノート");
@@ -2318,6 +2514,12 @@ test("@authenticated ページサムネイルはエディタready後に最大2�
     started: 6,
     completed: 6,
     startedBeforeReady: 0
+  });
+  const thumbnailDrain = await page.evaluate(() => globalThis.__noteEditorStartupMetrics.spans
+    .find(span => span.name === "thumbnail-queue-drain"));
+  expect(thumbnailDrain).toMatchObject({
+    status: "ok",
+    details: { concurrency: 2, completed: 6, failed: 0, expected: 6 }
   });
   expect(blockedRequests).toEqual([]);
 });
