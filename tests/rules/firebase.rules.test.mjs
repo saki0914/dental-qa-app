@@ -13,6 +13,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  increment,
   query,
   serverTimestamp,
   setDoc,
@@ -99,6 +100,90 @@ test("Firestoreは本人のノート階層だけを許可する", async () => {
   await assertFails(getDoc(doc(bobDb, "users/alice/notes/note-1")));
   await assertFails(setDoc(doc(bobDb, "users/alice/notes/note-1/pages/page-1"), { denied: true }));
   await assertFails(setDoc(doc(guestDb, "users/alice/notes/note-1"), { denied: true }));
+});
+
+test("Firestoreは白紙ノートの親作成・page作成・ready化を許可する", async () => {
+  const aliceDb = testEnv.authenticatedContext("alice").firestore();
+  const noteRef = doc(aliceDb, "users/alice/notes/note-blank");
+  const pageRef = doc(aliceDb, "users/alice/notes/note-blank/pages/page-1");
+
+  await assertSucceeds(setDoc(noteRef, {
+    schemaVersion: 1,
+    title: "新しい学習ノート",
+    type: "standalone",
+    defaultBackground: {
+      type: "blank",
+      paperColor: "#FFFFFF",
+      ruleType: "none",
+      ruleSpacingRatio: 0.035,
+      ruleColor: "#D9DEE7",
+      ruleOpacity: 0.7,
+      ruleWidthRatio: 0.001
+    },
+    status: "creating",
+    pageCount: 1,
+    createdPageCount: 0,
+    pendingStoragePaths: [],
+    noteMaskCount: 0,
+    orderRevision: 1,
+    deletedAt: null,
+    deletedReason: null,
+    deletedMaterialRefs: [],
+    materialRefs: [],
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp()
+  }));
+
+  const pageBatch = writeBatch(aliceDb);
+  pageBatch.set(pageRef, {
+    schemaVersion: 1,
+    pageId: "page-1",
+    order: 1,
+    pageType: "blank",
+    size: { width: 1240, height: 1754 },
+    background: {
+      type: "blank",
+      paperColor: "#FFFFFF",
+      ruleType: "none",
+      ruleSpacingRatio: 0.035,
+      ruleColor: "#D9DEE7",
+      ruleOpacity: 0.7,
+      ruleWidthRatio: 0.001
+    },
+    noteId: "note-blank",
+    contentRevision: 0,
+    contentPath: "",
+    contentHash: "",
+    noteMaskCount: 0,
+    deletedAt: null,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp()
+  });
+  pageBatch.update(noteRef, {
+    createdPageCount: increment(1),
+    updatedAt: serverTimestamp()
+  });
+  await assertSucceeds(pageBatch.commit());
+
+  await assertSucceeds(updateDoc(noteRef, {
+    status: "ready",
+    pageCount: 1,
+    createdPageCount: 1,
+    orderRevision: 1,
+    failedAt: null,
+    errorPhase: null,
+    errorMessage: null,
+    pendingStoragePaths: [],
+    updatedAt: serverTimestamp()
+  }));
+
+  const [noteSnapshot, pageSnapshot] = await Promise.all([
+    getDoc(noteRef),
+    getDoc(pageRef)
+  ]);
+  assert.equal(noteSnapshot.data().status, "ready");
+  assert.equal(noteSnapshot.data().createdPageCount, 1);
+  assert.equal(pageSnapshot.data().noteId, "note-blank");
 });
 
 test("Firestoreノートrulesは疎な旧documentを許容し、存在するschema fieldだけを検証する", async () => {

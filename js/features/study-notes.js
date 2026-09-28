@@ -33,6 +33,7 @@ import { chooseClipboardImage, imageFileFromPasteEvent, isTextEditingTarget, rea
 import { createNoteBackgroundSignature } from "../core/note-background.js";
 import { resolveNoteConflicts } from "../core/note-conflict-resolution.js";
 import { createNoteHistory } from "../core/note-history.js";
+import { getStandaloneNoteCreationErrorMessage } from "../core/note-errors.js";
 import {
   appendPointerSamples,
   copyStrokePointsForCommit,
@@ -1784,9 +1785,9 @@ export function createStudyNotes(dependencies) {
     preview.classList.remove("loading", "fallback");
   }
 
-  function reportError(error) {
+  function reportError(error, userMessage = "") {
     console.error(error);
-    alert(error?.message || error || "処理に失敗しました。");
+    alert(userMessage || error?.message || error || "処理に失敗しました。");
   }
 
   async function compensateCreationFailure(noteId, options, primaryError) {
@@ -5643,7 +5644,10 @@ export function createStudyNotes(dependencies) {
         let reservedWindow;
         try { reservedWindow = reserveEditorTab(); }
         catch (error) { reportError(error); return; }
-        createStandalone(type, reservedWindow).catch(error => { reservedWindow.close?.(); reportError(error); });
+        createStandalone(type, reservedWindow).catch(error => {
+          reservedWindow.close?.();
+          reportError(error, getStandaloneNoteCreationErrorMessage(error));
+        });
       }
     }));
     ui.pdfInput.addEventListener("change", () => {
