@@ -275,6 +275,8 @@
     </div>
 
     <div id="tab-pdf" class="hidden">
+      <!-- 改訂3以前のapp.jsとの互換用（表示しない）。デプロイ直後は新しいHTMLと端末にキャッシュされた旧JSが組み合わさるため、旧JSが参照する要素を残す。 -->
+      <div id="pdfLockBanner" hidden aria-hidden="true" style="display:none"></div>
       <h2>ノート・画像暗記</h2>
       <div class="sub">
         学習ノートへの書き込み、暗記学習、教材管理を1か所から行えます。
@@ -329,6 +331,7 @@
               <p id="noteEditorStartupSlow" class="hidden">読み込みに時間がかかっています</p>
               <div id="noteEditorStartupActions" class="note-editor-startup-actions hidden">
                 <button type="button" data-startup-action="retry">再試行</button>
+                <button type="button" data-startup-action="reload">ページを再読み込み</button>
                 <button type="button" data-startup-action="local">端末内の下書きから復元</button>
                 <button type="button" data-startup-action="cloud">クラウド版を開く</button>
                 <button type="button" data-startup-action="readonly">読み取り専用で開く</button>

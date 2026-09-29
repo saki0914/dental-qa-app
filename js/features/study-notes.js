@@ -146,6 +146,9 @@ const TOOL_LABELS = {
 const NOTE_COPY_CONCURRENCY = 3;
 // Page images waiting for or in upload while the next page converts.
 const PDF_UPLOAD_QUEUE_LIMIT = 2;
+// Dedicated editor startup actions (see updateStartupActions).
+const SLOW_STARTUP_ACTIONS = new Set(["reload", "list", "copy-diagnostics"]);
+const SESSION_STARTUP_ACTIONS = new Set(["local", "cloud", "readonly"]);
 const TOUCH_PREEMPT_POLICY = Object.freeze({
   pan: "preserve-viewport",
   lasso: "rollback",
@@ -517,10 +520,7 @@ export function createStudyNotes(dependencies) {
     ui.startup.dataset.state = state;
     const ready = state === "ready";
     ui.startup.classList.toggle("hidden", ready);
-    ui.startupActions.classList.toggle("hidden", !state.endsWith("error"));
-    const hasAuthenticatedUser = Boolean(captureUserSession());
-    ui.startupActions.querySelectorAll('[data-startup-action="local"], [data-startup-action="cloud"], [data-startup-action="readonly"]')
-      .forEach(button => button.classList.toggle("hidden", !hasAuthenticatedUser));
+    updateStartupActions(state.endsWith("error") ? "error" : "none");
     ui.startupSlow.classList.add("hidden");
     const labels = {
       initializing: ["ノートを読み込んでいます", "初期化中"],
@@ -539,8 +539,27 @@ export function createStudyNotes(dependencies) {
     ui.startupTitle.textContent = title;
     ui.startupDetail.textContent = detail || `現在の処理：${phase}`;
     if (!ready && !state.endsWith("error")) {
-      startupSlowTimer = setTimeout(() => ui.startupSlow.classList.remove("hidden"), 8_000);
+      startupSlowTimer = setTimeout(() => {
+        ui.startupSlow.classList.remove("hidden");
+        updateStartupActions("slow");
+      }, 8_000);
     }
+  }
+
+  // "error": every recovery action (restoring or reopening needs a signed-in
+  // user). "slow": a startup step has not finished for a while; only actions
+  // that cannot race the open still in progress. "none": no actions.
+  function updateStartupActions(mode) {
+    const hasAuthenticatedUser = mode === "error" && Boolean(captureUserSession());
+    ui.startupActions.dataset.mode = mode;
+    ui.startupActions.classList.toggle("hidden", mode === "none");
+    ui.startupActions.querySelectorAll("button[data-startup-action]").forEach(button => {
+      const action = button.dataset.startupAction;
+      const available = mode === "slow"
+        ? SLOW_STARTUP_ACTIONS.has(action)
+        : !SESSION_STARTUP_ACTIONS.has(action) || hasAuthenticatedUser;
+      button.classList.toggle("hidden", !available);
+    });
   }
 
   function setSaveState(state, { detail = "", error = null } = {}) {
@@ -7303,6 +7322,7 @@ export function createStudyNotes(dependencies) {
       const action = event.target.closest("button[data-startup-action]")?.dataset.startupAction;
       if (!action) return;
       if (action === "retry") void retryDedicatedOpen();
+      else if (action === "reload") globalThis.location.reload();
       else if (action === "local") void restoreDedicatedLocalDraft().catch(error => setEditorStartupState("recoverable-error", { detail: error.message || String(error), error }));
       else if (action === "cloud") void retryDedicatedOpen({ preferCloud: true });
       else if (action === "readonly") void retryDedicatedOpen({ forceReadOnly: true });

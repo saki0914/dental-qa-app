@@ -1268,13 +1268,46 @@ function showTab(tabName) {
   document.getElementById(`tab-${tabName}`).classList.remove("hidden");
 }
 
-function showDedicatedNoteEditorShell(state = "authenticating", detail = "現在の処理：ログイン状態を確認中") {
+function showDedicatedNoteEditorShell(state = "authenticating", detail = "現在の処理：ログイン状態を確認中", error = null) {
   if (!noteEditorRoute) return;
   document.querySelectorAll(".tab").forEach(tab => tab.classList.remove("active"));
   document.querySelectorAll('[id^="tab-"]').forEach(panel => panel.classList.add("hidden"));
   document.getElementById("tab-pdf")?.classList.remove("hidden");
   setCombinedImageNoteMode("note");
-  studyNotes?.setStartupState?.(state, { detail });
+  studyNotes?.setStartupState?.(state, { detail, error });
+}
+
+// An exception while applying a sign-in state (for example a screen element
+// missing from the HTML) must not leave the startup screen spinning: lock
+// editing and tell the user to reload.
+function showAuthStateFailure(error) {
+  console.error("ログイン状態を画面へ反映できませんでした。", error);
+  const message = error?.message || String(error);
+  syncPhase = "error";
+  if (activeSyncSession) {
+    activeSyncSession.loaded = false;
+    activeSyncSession.noteEditorReady = false;
+  }
+  if (el.cloudStatus) {
+    el.cloudStatus.textContent =
+      "ログイン状態を画面へ反映できなかったため、編集をロックしています。\n" +
+      "ページを再読み込みしてください。\n" + message;
+  }
+  try {
+    updateLoginLockedUI();
+  } catch (uiError) {
+    console.error("updateLoginLockedUI failed", uiError);
+  }
+  if (!noteEditorRoute) return;
+  try {
+    showDedicatedNoteEditorShell(
+      "fatal-error",
+      `ログイン状態を画面へ反映できませんでした。ページを再読み込みしてください。（${message}）`,
+      error
+    );
+  } catch (shellError) {
+    console.error("showDedicatedNoteEditorShell failed", shellError);
+  }
 }
 
 
@@ -1462,7 +1495,7 @@ async function initFirebase() {
     finishFirebaseInitialization({ emulator: useFirebaseEmulators });
 
     const finishAuthStateWait = noteEditorStartupMetrics.startSpan("auth-state-wait");
-    onAuthStateChanged(auth, async user => {
+    const applyAuthState = async user => {
       finishAuthStateWait({ authenticated: Boolean(user) });
       noteEditorStartupMetrics.mark("auth-state-ready", { authenticated: Boolean(user) });
       const epoch = ++authEpoch;
@@ -1551,6 +1584,14 @@ async function initFirebase() {
           showDedicatedNoteEditorShell("recoverable-error", `クラウド初期読込に失敗しました：${error.message || error}`);
         }
       }
+    };
+    onAuthStateChanged(auth, user => {
+      const invocationEpoch = authEpoch + 1;
+      void applyAuthState(user).catch(error => {
+        // A later sign-in state owns the screen.
+        if (authEpoch > invocationEpoch) return;
+        showAuthStateFailure(error);
+      });
     });
   } catch (error) {
     finishFirebaseInitialization({ errorName: error?.name || "Error" }, "error");

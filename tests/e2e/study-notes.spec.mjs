@@ -2227,6 +2227,63 @@ test("@authenticated 保存状態と設定popoverの変化で編集面を動か�
   expect(blockedRequests).toEqual([]);
 });
 
+test("@authenticated ログイン状態の反映中に画面要素が欠けても読み込み中のまま止めず再読み込みを案内する", async ({ page }) => {
+  test.setTimeout(60_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "要素欠落E2Eノート");
+  await login(page, user);
+  // Stands in for an HTML/JS version mismatch after a deploy: an element that
+  // app.js updates on every sign-in state is missing when the module runs.
+  await page.addInitScript(() => {
+    document.addEventListener("readystatechange", () => {
+      if (document.readyState === "interactive") document.getElementById("studyLockBanner")?.remove();
+    });
+  });
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartupTitle")).toHaveText("ノートを開けませんでした", { timeout: 20_000 });
+  await expect(page.locator("#noteEditorStartupDetail")).toContainText("ログイン状態を画面へ反映できませんでした。ページを再読み込みしてください。");
+  const actions = page.locator("#noteEditorStartupActions");
+  await expect(actions.getByRole("button", { name: "ページを再読み込み" })).toBeVisible();
+  await expect(actions.getByRole("button", { name: "ノート一覧へ戻る" })).toBeVisible();
+  await expect(actions.getByRole("button", { name: "端末内の下書きから復元" })).toBeHidden();
+  expect(await page.evaluate(() => document.getElementById("studyLockBanner"))).toBeNull();
+  expect(pageErrors, "例外は画面の復旧案内として扱い、未処理のまま残さない").toEqual([]);
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated 起動処理が進まないときは競合しない操作だけを示し再読み込みで開ける", async ({ page }) => {
+  test.setTimeout(90_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "起動停滞E2Eノート");
+  await login(page, user);
+  // Firebase Auth confirms a restored sign-in with accounts:lookup before it
+  // reports the state; leaving that request unanswered keeps startup waiting.
+  const lookupPattern = /127\.0\.0\.1:9099\/identitytoolkit\.googleapis\.com\/v1\/accounts:lookup/;
+  const heldLookups = [];
+  await page.route(lookupPattern, route => { heldLookups.push(route); });
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartupSlow")).toBeVisible({ timeout: 15_000 });
+  const actions = page.locator("#noteEditorStartupActions");
+  await expect(actions).toBeVisible();
+  await expect(actions.locator("button:not(.hidden)")).toHaveText(["ページを再読み込み", "ノート一覧へ戻る", "診断情報をコピー"]);
+  await expect(page.locator("#noteEditorStartupTitle")).toHaveText("ノートを読み込んでいます");
+  expect(heldLookups.length).toBeGreaterThan(0);
+
+  await page.unroute(lookupPattern);
+  await Promise.all([
+    page.waitForEvent("load"),
+    actions.getByRole("button", { name: "ページを再読み込み" }).click()
+  ]);
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
+  await expect(page.locator("#noteTitleInput")).toHaveValue("起動停滞E2Eノート");
+  await expect(actions).toBeHidden();
+  expect(blockedRequests).toEqual([]);
+});
+
 test("@authenticated 不正なノートURLでも灰色画面だけにならず復旧操作を表示する", async ({ page }) => {
   test.setTimeout(60_000);
   const blockedRequests = await guardProductionFirebase(page);
@@ -2237,6 +2294,7 @@ test("@authenticated 不正なノートURLでも灰色画面だけにならず�
   await expect(page.locator("#noteEditorStartupTitle")).toHaveText("ノートを開けませんでした");
   await expect(page.locator("#noteEditorStartupActions")).toBeVisible();
   await expect(page.getByRole("button", { name: "再試行" })).toBeVisible();
+  await expect(page.locator("#noteEditorStartupActions").getByRole("button", { name: "ページを再読み込み" })).toBeVisible();
   await expect(page.locator("#noteEditorStartupActions").getByRole("button", { name: "ノート一覧へ戻る" })).toBeVisible();
   await expect(page.getByRole("button", { name: "診断情報をコピー" })).toBeVisible();
   await expect(page.locator("#noteViewport")).toBeVisible();
