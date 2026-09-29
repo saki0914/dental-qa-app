@@ -3785,6 +3785,133 @@ test("@authenticated @ipad-v-next PDF作成タブが拒否されても同じタ�
   expect(blockedRequests).toEqual([]);
 });
 
+test("@authenticated @ipad-v-next ノートのマスクは暗記学習と同じ見た目で、ピンチは指の位置を中心に拡大し、弧を描く指スワイプでページを送る", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "ジェスチャーE2Eノート", { pageCount: 2 });
+  await seedNotePageBackground(user.uid, note.noteId, note.pageId, {
+    image: createRgbPng(1240, 1754),
+    size: { width: 1240, height: 1754 }
+  });
+  await login(page, user);
+  // An Apple Pencil user: fingers pan, zoom and turn pages instead of drawing.
+  await page.evaluate(uid => localStorage.setItem(`dentalQaNoteToolSettings:${uid}`, JSON.stringify({ pencilMode: true, fingerDraw: false })), user.uid);
+  await page.addInitScript(() => {
+    globalThis.__noteNotices = [];
+    document.addEventListener("DOMContentLoaded", () => {
+      const notice = document.querySelector("#noteEditorNotice");
+      new MutationObserver(() => {
+        if (notice.textContent) globalThis.__noteNotices.push(notice.textContent);
+      }).observe(notice, { childList: true, characterData: true, subtree: true });
+    });
+  });
+  // A slow network: the page background arrives well after the page is drawn.
+  await page.route(url => url.port === "9199" && url.searchParams.get("alt") === "media", async route => {
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    await route.fallback();
+  });
+  const editorUrl = `/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`;
+  await page.goto(editorUrl, { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  const stage = page.locator("#notePageStage");
+  await expect(stage.locator(".note-background-image")).toBeVisible({ timeout: 30_000 });
+  await page.waitForTimeout(700);
+  expect(await page.evaluate(() => globalThis.__noteNotices), "背景の読込みが遅くても、レイヤーのずれを通知しない").toEqual([]);
+  await expect(stage.locator('[data-layer="drawing-input"]'), "Pencilの入力面は有効のまま").toHaveClass(/active/);
+
+  // A note mask, drawn with the mask tool.
+  await page.locator('[data-note-tool="mask"]').click();
+  const pageBox = await stage.boundingBox();
+  await page.mouse.move(pageBox.x + pageBox.width * .3, pageBox.y + 120);
+  await page.mouse.down();
+  await page.mouse.move(pageBox.x + pageBox.width * .55, pageBox.y + 190, { steps: 5 });
+  await page.mouse.up();
+  const mask = stage.locator(".note-mask").first();
+  await expect(stage.locator(".note-mask")).toHaveCount(1);
+  await expect(mask, "編集中は暗記学習でめくったマスクと同じ細い破線").toHaveCSS("border-top-style", "dashed");
+  await expect(mask).toHaveCSS("border-top-width", "1px");
+  await expect(mask).toHaveCSS("border-top-color", "rgba(37, 99, 235, 0.55)");
+  await expect(mask, "選択中は暗記学習と同じオレンジの枠").toHaveCSS("outline-color", "rgb(245, 158, 11)");
+  await page.locator('[data-note-tool="pen"]').click();
+
+  // Study mode: masks look like the image memory screen's, and only a tap
+  // opens or closes one.
+  await page.locator("#noteStudyModeBtn").click();
+  await expect(stage).toHaveClass(/study-mode/);
+  await expect(mask).toHaveCSS("background-color", "rgb(17, 24, 39)");
+  await expect(mask).toHaveCSS("border-top-style", "solid");
+  await expect(mask).toHaveCSS("border-top-width", "2px");
+  await expect(mask).toHaveCSS("border-top-left-radius", "6px");
+  const maskBox = await mask.boundingBox();
+  const maskCenter = { x: maskBox.x + maskBox.width / 2, y: maskBox.y + maskBox.height / 2 };
+  const touchOn = (locator, type, pointerId, x, y) => locator.dispatchEvent(type, {
+    pointerId, pointerType: "touch", button: 0, clientX: x, clientY: y, width: 8, height: 8, pressure: type === "pointerup" ? 0 : .5
+  });
+  await touchOn(mask, "pointerdown", 501, maskCenter.x, maskCenter.y);
+  await touchOn(mask, "pointermove", 501, maskCenter.x + 40, maskCenter.y + 6);
+  await touchOn(mask, "pointerup", 501, maskCenter.x + 40, maskCenter.y + 6);
+  await expect(stage.locator(".note-mask.revealed"), "マスクの上から動かした指ではめくらない").toHaveCount(0);
+  await touchOn(mask, "pointerdown", 502, maskCenter.x, maskCenter.y);
+  await touchOn(mask, "pointerup", 502, maskCenter.x, maskCenter.y);
+  await expect(stage.locator(".note-mask.revealed"), "タップでめくる").toHaveCount(1);
+  await expect(stage.locator(".note-mask.revealed")).toHaveCSS("border-top-style", "dashed");
+  await expect(stage.locator(".note-mask.revealed")).toHaveCSS("border-top-color", "rgba(37, 99, 235, 0.55)");
+  await page.locator("#noteEditModeBtn").click();
+
+  // Pinch: the page point between the fingers stays between them.
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  const pageState = () => stage.evaluate(node => {
+    const rect = node.getBoundingClientRect();
+    return { left: rect.left, top: rect.top, zoom: Number(getComputedStyle(node).getPropertyValue("--page-zoom") || 1) };
+  });
+  const before = await pageState();
+  const focus = { x: pageBox.x + pageBox.width * .62, y: pageBox.y + 260 };
+  const pagePoint = { x: (focus.x - before.left) / before.zoom, y: (focus.y - before.top) / before.zoom };
+  await touchOn(capture, "pointerdown", 301, focus.x - 30, focus.y);
+  await touchOn(capture, "pointerdown", 302, focus.x + 30, focus.y);
+  for (const spread of [45, 60, 75, 90]) {
+    await touchOn(capture, "pointermove", 301, focus.x - spread, focus.y);
+    await touchOn(capture, "pointermove", 302, focus.x + spread, focus.y);
+  }
+  await touchOn(capture, "pointerup", 301, focus.x - 90, focus.y);
+  await touchOn(capture, "pointerup", 302, focus.x + 90, focus.y);
+  await expect.poll(async () => (await pageState()).zoom).toBeGreaterThan(2.5);
+  const after = await pageState();
+  expect(Math.abs(after.left + pagePoint.x * after.zoom - focus.x), "横方向に指の位置からずれない").toBeLessThan(2);
+  expect(Math.abs(after.top + pagePoint.y * after.zoom - focus.y), "縦方向に指の位置からずれない").toBeLessThan(2);
+
+  // Page swipes at the normal zoom: a finger arcs, so drift is allowed.
+  await page.goto(editorUrl, { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  await expect(page.locator("#notePageCounter")).toHaveText("1 / 2");
+  const swipe = async (dx, dy) => {
+    const box = await stage.boundingBox();
+    const start = { x: box.x + box.width * .7, y: box.y + Math.min(box.height, 600) * .5 };
+    await touchOn(capture, "pointerdown", 401, start.x, start.y);
+    for (let step = 1; step <= 10; step += 1) {
+      await page.waitForTimeout(16);
+      await touchOn(capture, "pointermove", 401, start.x + dx * step / 10, start.y + dy * step / 10);
+    }
+    await touchOn(capture, "pointerup", 401, start.x + dx, start.y + dy);
+  };
+  await swipe(-260, 60);
+  await expect(page.locator("#notePageCounter"), "60 px斜めにずれても次のページへ").toHaveText("2 / 2");
+  await expect.poll(() => stage.evaluate(node => `${node.style.visibility}|${node.style.translate}`)).toBe("|");
+  await expect(page.locator("#noteAdjacentPagePreview")).toBeHidden();
+  await swipe(260, -40);
+  await expect(page.locator("#notePageCounter"), "前のページへ戻る").toHaveText("1 / 2");
+  await expect.poll(() => stage.evaluate(node => `${node.style.visibility}|${node.style.translate}`)).toBe("|");
+  await swipe(-60, -260);
+  await page.waitForTimeout(600);
+  await expect(page.locator("#notePageCounter"), "縦の動きではページを送らない").toHaveText("1 / 2");
+  expect(await page.evaluate(() => globalThis.__noteNotices)).toEqual([]);
+  expect(blockedRequests).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
 test("@authenticated 教材をノートで繰り返し開いても既定ノートを重複作成しない", async ({ page }) => {
   test.setTimeout(90_000);
   const blockedRequests = await guardProductionFirebase(page);
@@ -5348,7 +5475,10 @@ test("@authenticated @ipad-writing-mask 交差する複数画・日本語IME・�
   await expect(stage.locator(".note-mask").first()).toHaveCSS("opacity", "1");
   await page.locator('[data-study-action="show-all"]').click();
   await expect(stage.locator(".note-mask.revealed").first()).toHaveCSS("opacity", "1");
-  await expect(stage.locator(".note-mask.revealed").first()).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  // Both masks here are weak: shown, they keep the image memory screen's
+  // light red fill and red dashed edge.
+  await expect(stage.locator(".note-mask.revealed").first()).toHaveCSS("background-color", "rgba(185, 28, 28, 0.18)");
+  await expect(stage.locator(".note-mask.revealed").first()).toHaveCSS("border-top-style", "dashed");
   await expect(stage.locator(".note-mask.revealed").first()).toHaveCSS("pointer-events", "auto");
   await page.locator("#noteEditModeBtn").click();
   await expect(page.locator("#noteEditModeBtn")).toHaveAttribute("aria-pressed", "true");

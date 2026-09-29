@@ -107,7 +107,7 @@ import {
   setNoteTextCanvasFont,
   textLineBaselines
 } from "../core/note-text-layout.js";
-import { pageSwipeVisualOffset, resolvePageSwipe, resolvePageSwipeIntent } from "../core/note-page-swipe.js";
+import { pageSwipeReleaseVelocity, pageSwipeVisualOffset, resolvePageSwipe, resolvePageSwipeIntent } from "../core/note-page-swipe.js";
 import { createNoteThumbnailSignature } from "../core/note-thumbnail.js";
 import {
   cancelledStrokeCanBeCommitted,
@@ -354,7 +354,11 @@ export function createStudyNotes(dependencies) {
   let pendingThumbnailTimer = 0;
   let lastDrawingActivityAt = 0;
   let swipeGesture = null;
+  // A pointer that went down on a mask in study mode: { pointerId, key, x, y, startedAt }.
+  let studyMaskTap = null;
   let pageSwitching = false;
+  // From the release of a page swipe until the next page replaces its preview.
+  let swipeTransitionActive = false;
   let maskMultiSelect = false;
   let eraserCursorFrame = 0;
   let transientUi = createClosedTransientUi();
@@ -619,8 +623,12 @@ export function createStudyNotes(dependencies) {
     return url;
   }
 
+  // The client rect of a displayed node, or null for a node that is not
+  // displayed (display: none, such as a background image still loading) or
+  // not in the document: such a node has no place to compare.
   function rectSnapshot(node) {
-    const rect = node?.getBoundingClientRect?.();
+    if (!node?.isConnected || node.getClientRects?.().length === 0) return null;
+    const rect = node.getBoundingClientRect?.();
     return rect ? {
       left: Number(rect.left), top: Number(rect.top),
       width: Number(rect.width), height: Number(rect.height),
@@ -679,7 +687,9 @@ export function createStudyNotes(dependencies) {
     const pageRootRect = rectSnapshot(ui.stage);
     const backgroundImage = ui.stage?.querySelector?.(".note-background-image");
     const paper = ui.stage?.querySelector?.(".note-paper-layer");
-    const background = backgroundImage || paper;
+    // The background image is hidden until it has loaded; the paper stands
+    // for the background until then.
+    const background = rectSnapshot(backgroundImage) ? backgroundImage : paper;
     const svg = ui.stage?.querySelector?.("svg.note-layer");
     const masks = ui.stage?.querySelector?.('[data-layer="masks"]');
     const elements = ui.stage?.querySelector?.('[data-layer="elements"]');
@@ -768,7 +778,15 @@ export function createStudyNotes(dependencies) {
     };
   }
 
-  function validatePageLayerGeometry() {
+  // A layer can be caught in the middle of an update, so a mismatch is checked
+  // again shortly before it is reported. Until then the Pencil input surface
+  // stays off, as the mismatch requires.
+  const PAGE_LAYER_RECHECK_MS = 300;
+  let pageLayerRecheckTimer = null;
+
+  function validatePageLayerGeometry({ recheck = true } = {}) {
+    clearTimeout(pageLayerRecheckTimer);
+    pageLayerRecheckTimer = null;
     const diagnostic = pageLayerDiagnostics();
     pageLayerGeometryValid = diagnostic.valid;
     pageLayerGeometryIssue = diagnostic.valid
@@ -778,7 +796,17 @@ export function createStudyNotes(dependencies) {
         diagnostic.positionedLayerMaximumDeltaPx
       ).toFixed(2)}px ずれています。`;
     syncDrawingInputLayer();
-    if (!diagnostic.valid) showEditorNotice(pageLayerGeometryIssue);
+    if (!diagnostic.valid) {
+      if (recheck) {
+        pageLayerRecheckTimer = setTimeout(() => {
+          pageLayerRecheckTimer = null;
+          if (currentContent) validatePageLayerGeometry({ recheck: false });
+        }, PAGE_LAYER_RECHECK_MS);
+      } else {
+        console.warn(pageLayerGeometryIssue, diagnostic);
+        showEditorNotice(pageLayerGeometryIssue);
+      }
+    }
     return diagnostic;
   }
 
@@ -3990,6 +4018,11 @@ export function createStudyNotes(dependencies) {
           objectUrls.push(url);
           image.src = url;
           image.classList.remove("hidden");
+          // The layers were checked without the image (it was still hidden);
+          // check them again now that it is in place.
+          requestAnimationFrame(() => {
+            if (backgroundToken === backgroundRenderToken && image.isConnected && currentContent) validatePageLayerGeometry();
+          });
           backgroundDecodePromise = typeof image.decode === "function"
             ? image.decode().then(
               () => {
@@ -4735,10 +4768,11 @@ export function createStudyNotes(dependencies) {
     const transformHandle = requestedHandle;
 
     if (studyMode) {
-      if (maskVisibilityId) {
-        revealedMaskIds.has(maskVisibilityId) ? revealedMaskIds.delete(maskVisibilityId) : revealedMaskIds.add(maskVisibilityId);
-        renderPage();
-      }
+      // A mask is shown or hidden when it is tapped (see endPointer), not
+      // when a finger that pans, zooms or turns the page lands on it.
+      studyMaskTap = maskVisibilityId
+        ? { pointerId: event.pointerId, key: maskVisibilityId, x: event.clientX, y: event.clientY, startedAt: Number(event.timeStamp || performance.now()) }
+        : null;
       return;
     }
     if (transformHandle) {
@@ -5002,7 +5036,7 @@ export function createStudyNotes(dependencies) {
     } else if (activeGesture.type === "text") {
       textEditorSession?.setBounds(normalizedBoundsFromPoints(activeGesture.start, point, .01));
     } else if (["shape", "mask"].includes(activeGesture.type)) {
-      drawSelectionRect(activeGesture.start, point);
+      drawSelectionRect(activeGesture.start, point, activeGesture.type === "mask" ? "note-mask-draft" : "");
     }
     event.preventDefault();
   }
@@ -5132,7 +5166,22 @@ export function createStudyNotes(dependencies) {
     return true;
   }
 
+  // A tap on a mask in study mode: the pointer lifts where it went down,
+  // soon, and no second finger joined it (a pinch).
+  function finishStudyMaskTap(event) {
+    const tap = studyMaskTap;
+    if (tap?.pointerId !== event.pointerId) return;
+    studyMaskTap = null;
+    if (event.type !== "pointerup" || !studyMode) return;
+    const moved = Math.hypot(event.clientX - tap.x, event.clientY - tap.y);
+    const duration = Number(event.timeStamp || performance.now()) - tap.startedAt;
+    if (moved > 12 || duration > 800 || zoomController?.isPinchGestureActive) return;
+    revealedMaskIds.has(tap.key) ? revealedMaskIds.delete(tap.key) : revealedMaskIds.add(tap.key);
+    renderPage();
+  }
+
   function endPointer(event) {
+    finishStudyMaskTap(event);
     const ownsActiveGesture = activeGesture?.pointerId === event.pointerId;
     if (ownsActiveGesture) inputGuard.notePointerEnd(event);
     if (event.pointerType === "pen" && ownsActiveGesture) ui.editorView.classList.remove("pen-contact-active");
@@ -5263,9 +5312,9 @@ export function createStudyNotes(dependencies) {
     return { pixelWidth: Number(gesture?.pageRect?.width) || 0, pixelHeight: Number(gesture?.pageRect?.height) || 0 };
   }
 
-  function drawSelectionRect(start, end) {
+  function drawSelectionRect(start, end, className = "") {
     ui.stage.querySelectorAll("[data-note-draft]").forEach(node => node.remove());
-    const node = document.createElement("div"); node.dataset.noteDraft = "true"; node.className = "note-selection-rect";
+    const node = document.createElement("div"); node.dataset.noteDraft = "true"; node.className = `note-selection-rect ${className}`.trim();
     setBoundsStyle(node, normalizedBoundsFromPoints(start, end)); ui.stage.append(node);
   }
 
@@ -6793,21 +6842,50 @@ export function createStudyNotes(dependencies) {
     if (ui.adjacentPagePreview) ui.adjacentPagePreview.style.translate = `${offset}px 0px`;
   }
 
+  // Resolves once the current page's background image is shown, or after
+  // `timeoutMs`, so that a finished page replaces the swipe preview.
+  async function waitForPageBackground(timeoutMs) {
+    const image = ui.stage.querySelector(".note-background-image");
+    if (!image) return;
+    const deadline = performance.now() + timeoutMs;
+    while (image.isConnected && performance.now() < deadline) {
+      if (!image.classList.contains("hidden") && image.complete && image.naturalWidth > 0) {
+        await image.decode?.().catch(() => {});
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
+  }
+
   function settleSwipeVisual(direction, nextIndex) {
-    if (!direction || nextIndex < 0 || nextIndex >= pages.length) {
+    if (!direction || nextIndex < 0 || nextIndex >= pages.length || !ui.adjacentPagePreview) {
       clearSwipeVisual();
       return;
     }
-    const travel = (direction === "next" ? -1 : 1) * (ui.viewport.clientWidth + 18);
+    // The adjacent page's preview slides into the place of the page.
+    const travel = (direction === "next" ? -1 : 1) * (ui.stage.getBoundingClientRect().width + 18);
     ui.stage.classList.remove("note-swipe-tracking");
     ui.stage.classList.add("note-swipe-settling");
-    ui.adjacentPagePreview?.classList.remove("note-swipe-tracking");
-    ui.adjacentPagePreview?.classList.add("note-swipe-settling");
+    ui.adjacentPagePreview.classList.remove("note-swipe-tracking");
+    ui.adjacentPagePreview.classList.add("note-swipe-settling");
     ui.stage.style.translate = `${travel}px 0px`;
-    if (ui.adjacentPagePreview) ui.adjacentPagePreview.style.translate = `${travel}px 0px`;
-    setTimeout(() => {
-      clearSwipeVisual({ immediate: true });
-      void switchPage(nextIndex, { localOnly: true, direction }).catch(reportError);
+    ui.adjacentPagePreview.style.translate = `${travel}px 0px`;
+    swipeTransitionActive = true;
+    setTimeout(async () => {
+      // The preview stays in place while the page loads behind it, so the
+      // previous page is not shown again before the next one appears.
+      ui.stage.classList.remove("note-swipe-settling");
+      ui.stage.style.visibility = "hidden";
+      try {
+        await switchPage(nextIndex, { localOnly: true });
+        await waitForPageBackground(800);
+      } catch (error) {
+        reportError(error);
+      } finally {
+        ui.stage.style.visibility = "";
+        clearSwipeVisual({ immediate: true });
+        swipeTransitionActive = false;
+      }
     }, 210);
   }
 
@@ -7183,10 +7261,11 @@ export function createStudyNotes(dependencies) {
       // still navigate when Pencil is not active.
       if (inputGuard.isPalmCandidate(event) && inputGuard.isPenActive()) return;
       activeTouchPointerIds.add(event.pointerId);
+      if (activeTouchPointerIds.size > 1) studyMaskTap = null;
       if (swipeGesture) swipeGesture.blocked = true;
       if (
         activeTouchPointerIds.size !== 1 || toolSettings.pageNavigation !== "swipe" ||
-        !currentNote || !currentContent || pageSwitching || textEditorSession || cropSession ||
+        !currentNote || !currentContent || pageSwitching || swipeTransitionActive || textEditorSession || cropSession ||
         activeGesture || zoomController?.isPinchGestureActive || zoomController?.isPinching
       ) {
         return;
@@ -7202,7 +7281,9 @@ export function createStudyNotes(dependencies) {
         startedAtEdge: event.clientX - rect.left <= 36 || rect.right - event.clientX <= 36,
         directionLock: "pending",
         previewIndex: null,
-        blocked: false
+        blocked: false,
+        // Recent positions, for the speed of the finger when it lifts.
+        samples: [{ x: event.clientX, t: Number(event.timeStamp || performance.now()) }]
       };
     }, { capture: true });
     ui.viewport.addEventListener("pointermove", event => {
@@ -7212,6 +7293,8 @@ export function createStudyNotes(dependencies) {
       }
       swipeGesture.endX = event.clientX;
       swipeGesture.endY = event.clientY;
+      swipeGesture.samples.push({ x: event.clientX, t: Number(event.timeStamp || performance.now()) });
+      if (swipeGesture.samples.length > 16) swipeGesture.samples.shift();
       if (swipeGesture.directionLock === "pending") {
         let intent = resolvePageSwipeIntent({
           ...swipeGesture,
@@ -7238,9 +7321,11 @@ export function createStudyNotes(dependencies) {
       if (swipe) {
         swipe.endX = event.clientX;
         swipe.endY = event.clientY;
+        const endedAt = Number(event.timeStamp || performance.now());
         const direction = event.type === "pointercancel" ? null : resolvePageSwipe({
           ...swipe,
-          elapsedMs: Number(event.timeStamp || performance.now()) - swipe.startedAt,
+          elapsedMs: endedAt - swipe.startedAt,
+          releaseVelocityX: pageSwipeReleaseVelocity([...swipe.samples, { x: event.clientX, t: endedAt }]),
           zoom: zoomController?.zoom || 1,
           atLeftEdge: ui.viewport.scrollLeft <= 2,
           atRightEdge: ui.viewport.scrollLeft + ui.viewport.clientWidth >= ui.viewport.scrollWidth - 2,
@@ -7283,6 +7368,7 @@ export function createStudyNotes(dependencies) {
     });
     ui.stage.addEventListener("pointerleave", hidePixelEraserCursor);
     ui.viewport.addEventListener("pagezoomstart", () => {
+      studyMaskTap = null;
       if (swipeGesture) swipeGesture.blocked = true;
       dismissTransientForViewportChange();
     });

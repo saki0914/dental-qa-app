@@ -172,3 +172,84 @@ test("native gestureが所有中はpointer追跡でpinch状態を上書きしな
   assert.equal(controller.pinchSource, null);
   controller.destroy();
 });
+
+// A viewport whose content is laid out at (offsetLeft, offsetTop) of the scroll
+// area, as the note page is: centered, below the viewport padding. The content
+// rect follows the scroll offset and the zoom transform (origin top left).
+function offsetZoomFixture({ offsetLeft = 165, offsetTop = 96, width = 850, height = 1202 } = {}) {
+  const viewportRect = { left: 159, top: 62, width: 1035, height: 728 };
+  const viewport = new EventTarget();
+  const styles = new Map();
+  let zoom = 1;
+  let scrollLeft = 0;
+  let scrollTop = 0;
+  const maxScroll = () => ({
+    left: Math.max(0, offsetLeft + width * zoom + 30 - viewportRect.width),
+    top: Math.max(0, offsetTop + height * zoom + 30 - viewportRect.height)
+  });
+  Object.defineProperties(viewport, {
+    scrollLeft: { get: () => scrollLeft, set: value => { scrollLeft = Math.min(maxScroll().left, Math.max(0, value)); } },
+    scrollTop: { get: () => scrollTop, set: value => { scrollTop = Math.min(maxScroll().top, Math.max(0, value)); } }
+  });
+  Object.assign(viewport, {
+    clientWidth: viewportRect.width,
+    getBoundingClientRect: () => ({ ...viewportRect })
+  });
+  const content = {
+    style: {
+      transform: "",
+      transformOrigin: "",
+      setProperty: (name, value) => {
+        styles.set(name, value);
+        if (name === "--page-zoom") zoom = Number(value);
+      }
+    },
+    getBoundingClientRect: () => ({
+      left: viewportRect.left + offsetLeft - scrollLeft,
+      top: viewportRect.top + offsetTop - scrollTop,
+      width: width * zoom,
+      height: height * zoom
+    })
+  };
+  // The content point under a client point.
+  const contentPointAt = (clientX, clientY) => {
+    const rect = content.getBoundingClientRect();
+    return { x: (clientX - rect.left) / zoom, y: (clientY - rect.top) / zoom };
+  };
+  return { viewport, content, styles, contentPointAt };
+}
+
+test("ピンチの中心にあったページ上の点は、ページが中央寄せで余白の下にあっても指の中心に残る", () => {
+  const { viewport, content, contentPointAt } = offsetZoomFixture();
+  const controller = createPageZoomController({ viewport, content });
+  const focus = { x: 600, y: 400 };
+  const before = contentPointAt(focus.x, focus.y);
+  viewport.dispatchEvent(pointerEvent("pointerdown", { pointerId: 1, x: focus.x - 40, y: focus.y }));
+  viewport.dispatchEvent(pointerEvent("pointerdown", { pointerId: 2, x: focus.x + 40, y: focus.y }));
+  viewport.dispatchEvent(pointerEvent("pointermove", { pointerId: 1, x: focus.x - 110, y: focus.y }));
+  viewport.dispatchEvent(pointerEvent("pointermove", { pointerId: 2, x: focus.x + 110, y: focus.y }));
+  controller.flushScheduledZoom();
+  assert.equal(controller.zoom, 2.75);
+  const after = contentPointAt(focus.x, focus.y);
+  assert.ok(Math.abs(after.x - before.x) < 0.01 && Math.abs(after.y - before.y) < 0.01, JSON.stringify({ before, after }));
+
+  // Moving both fingers pans the page with them.
+  viewport.dispatchEvent(pointerEvent("pointermove", { pointerId: 1, x: focus.x - 150, y: focus.y - 30 }));
+  viewport.dispatchEvent(pointerEvent("pointermove", { pointerId: 2, x: focus.x + 70, y: focus.y - 30 }));
+  controller.flushScheduledZoom();
+  const panned = contentPointAt(focus.x - 40, focus.y - 30);
+  assert.ok(Math.abs(panned.x - before.x) < 0.01 && Math.abs(panned.y - before.y) < 0.01, JSON.stringify({ before, panned }));
+  viewport.dispatchEvent(pointerEvent("pointerup", { pointerId: 1, x: focus.x - 150, y: focus.y - 30 }));
+  viewport.dispatchEvent(pointerEvent("pointerup", { pointerId: 2, x: focus.x + 70, y: focus.y - 30 }));
+
+  // Ctrl + wheel (trackpad pinch) keeps the point under the pointer too.
+  const wheelPoint = { x: 500, y: 300 };
+  const wheelBefore = contentPointAt(wheelPoint.x, wheelPoint.y);
+  const wheel = new Event("wheel", { cancelable: true });
+  Object.assign(wheel, { ctrlKey: true, deltaY: 200, clientX: wheelPoint.x, clientY: wheelPoint.y });
+  viewport.dispatchEvent(wheel);
+  const wheelAfter = contentPointAt(wheelPoint.x, wheelPoint.y);
+  assert.ok(controller.zoom < 2.75);
+  assert.ok(Math.abs(wheelAfter.x - wheelBefore.x) < 0.01 && Math.abs(wheelAfter.y - wheelBefore.y) < 0.01, JSON.stringify({ wheelBefore, wheelAfter }));
+  controller.destroy();
+});

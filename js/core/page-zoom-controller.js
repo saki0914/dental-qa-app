@@ -58,21 +58,29 @@ export function createPageZoomController({
   const touches = new Map();
   const clampZoom = value => clampPageZoom(value, min, max);
 
+  // The content point under (clientX, clientY), in unzoomed content pixels,
+  // measured from where the content is drawn. The content does not start at
+  // the scroll origin (it is centered and below the viewport padding), so the
+  // point must not be derived from the scroll offset alone.
   function captureAnchor(clientX, clientY) {
-    const rect = viewport.getBoundingClientRect();
-    const x = clientX ?? rect.left + rect.width / 2;
-    const y = clientY ?? rect.top + rect.height / 2;
+    const viewportRect = viewport.getBoundingClientRect();
+    const x = clientX ?? viewportRect.left + viewportRect.width / 2;
+    const y = clientY ?? viewportRect.top + viewportRect.height / 2;
+    const contentRect = content.getBoundingClientRect();
     return {
-      x: (viewport.scrollLeft + x - rect.left) / zoom,
-      y: (viewport.scrollTop + y - rect.top) / zoom,
-      viewportX: x - rect.left,
-      viewportY: y - rect.top
+      x: (x - contentRect.left) / zoom,
+      y: (y - contentRect.top) / zoom,
+      clientX: x,
+      clientY: y
     };
   }
 
+  // Scrolls so that the anchored content point is back under its client point.
   function restoreAnchor(anchor) {
-    viewport.scrollLeft = anchor.x * zoom - anchor.viewportX;
-    viewport.scrollTop = anchor.y * zoom - anchor.viewportY;
+    if (!anchor) return;
+    const contentRect = content.getBoundingClientRect();
+    viewport.scrollLeft += contentRect.left + anchor.x * zoom - anchor.clientX;
+    viewport.scrollTop += contentRect.top + anchor.y * zoom - anchor.clientY;
   }
 
   function setZoom(value, anchor = captureAnchor()) {
@@ -198,12 +206,7 @@ export function createPageZoomController({
   }
 
   function reset() {
-    setZoom(1, {
-      x: 0,
-      y: 0,
-      viewportX: 0,
-      viewportY: 0
-    });
+    setZoom(1, null);
     viewport.scrollLeft = 0;
     viewport.scrollTop = 0;
     lastFitZoom = 1;

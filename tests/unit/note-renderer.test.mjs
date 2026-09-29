@@ -156,11 +156,11 @@ test("AI共有用ではマスクを除外し学習用では教材・ノートマ
   assert.equal(harness.fills.length, 1, "AI共有用は用紙背景だけを描画する");
   harness.fills.length = 0;
   await renderNotePageToCanvas({ ...base, maskMode: "all" });
-  assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#ef4444", "#111827"]);
+  assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#b91c1c", "#111827"], "暗記学習と同じ色（苦手は濃い赤）");
   harness.fills.length = 0;
   await renderNotePageToCanvas({ ...base, maskMode: "screen", revealedMaskIds: new Set(["material:same"]) });
-  assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#111827"], "同じ永続IDでも教材だけを除外し、ノートマスクは教材の後に描く");
-  assert.deepEqual(harness.strokes, ["rgba(185,28,28,.28)"], "画面どおりPDFでは表示済み教材マスクの薄い枠だけを残す");
+  assert.deepEqual(harness.fills.map(fill => fill.color), ["#ffffff", "#111827", "rgba(185,28,28,.18)"], "同じ永続IDでも教材だけを除外し、ノートマスクは教材の後に描く。表示済みの苦手マスクは暗記学習と同じ薄い赤");
+  assert.deepEqual(harness.strokes, ["#dc2626"], "画面どおりPDFでは表示済み教材マスクの破線の枠を残す");
 });
 
 test("日本語の明示改行・折り返しと中央・右寄せをCanvas PDF描画へ反映する", async t => {

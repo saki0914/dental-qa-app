@@ -641,3 +641,46 @@ body.note-editor-dedicated .local-environment-details{
   .note-editor>.note-editor-header #noteRedoBtn,
   .note-editor>.note-editor-header .note-editor-local-slot{display:none}
 }
+
+/* Masks look like the image memory screen's masks (.pdf-mask in app.css):
+   hidden masks are dark boxes with a thin white edge, shown masks keep only a
+   thin dashed outline. The page is zoomed with a CSS transform, so every line
+   width is divided by the zoom (--page-zoom) and stays as thin on screen as in
+   the image memory screen at any zoom. */
+.note-page-stage{--mask-px:calc(1px / var(--page-zoom, 1))}
+.note-mask{
+  border-radius:calc(var(--mask-px) * 6);
+  background:transparent;
+  border:calc(var(--mask-px) * 1) dashed rgba(37,99,235,.55);
+}
+.note-mask.weak{
+  background:rgba(185,28,28,.18);
+  border:calc(var(--mask-px) * 2) dashed #dc2626;
+}
+.note-page-stage.study-mode .note-mask{
+  background:#111827;
+  border:calc(var(--mask-px) * 2) solid rgba(255,255,255,.75);
+}
+.note-page-stage.study-mode .note-mask.weak{
+  background:#b91c1c;
+  border-color:#fecaca;
+}
+.note-page-stage.study-mode .note-mask.revealed{
+  opacity:1;
+  background:transparent;
+  border:calc(var(--mask-px) * 1) dashed rgba(37,99,235,.55);
+}
+.note-page-stage.study-mode .note-mask.weak.revealed{
+  background:rgba(185,28,28,.18);
+  border:calc(var(--mask-px) * 2) dashed #dc2626;
+}
+.note-mask.note-selected{
+  outline:calc(var(--mask-px) * 3) solid #f59e0b;
+  outline-offset:calc(var(--mask-px) * 2);
+  filter:none;
+}
+.note-selection-rect.note-mask-draft{
+  border:calc(var(--mask-px) * 2) dashed #fff;
+  border-radius:calc(var(--mask-px) * 6);
+  background:rgba(17,24,39,.55);
+}

@@ -259,18 +259,27 @@ export async function renderNotePageToCanvas({
     ...materialMasks.map(mask => ({ mask, source: "material" })),
     ...(content.noteMasks || []).map(mask => ({ mask, source: "note" }))
   ];
+  // The colors of the image memory screen's masks (.pdf-mask in app.css).
   masks.filter(({ mask, source }) => shouldDrawMask(mask, source, { maskMode, revealedMaskIds })).forEach(({ mask }) => {
-    context.fillStyle = mask.weak ? "#ef4444" : "#111827";
+    context.fillStyle = mask.weak ? "#b91c1c" : "#111827";
     context.fillRect(mask.x * canvas.width, mask.y * canvas.height, mask.width * canvas.width, mask.height * canvas.height);
   });
   if (maskMode === "screen") {
     masks.filter(({ mask, source }) => revealedMaskIds?.has(maskVisibilityKey(mask, source))).forEach(({ mask }) => {
+      const x = mask.x * canvas.width;
+      const y = mask.y * canvas.height;
+      const width = mask.width * canvas.width;
+      const height = mask.height * canvas.height;
       context.save();
-      context.strokeStyle = mask.weak ? "rgba(185,28,28,.28)" : "rgba(71,85,105,.24)";
-      context.lineWidth = Math.max(1, canvas.width * .001);
+      if (mask.weak) {
+        context.fillStyle = "rgba(185,28,28,.18)";
+        context.fillRect(x, y, width, height);
+      }
+      context.strokeStyle = mask.weak ? "#dc2626" : "rgba(37,99,235,.55)";
+      context.lineWidth = Math.max(1, canvas.width * (mask.weak ? .002 : .001));
       context.setLineDash([Math.max(3, canvas.width * .004), Math.max(3, canvas.width * .003)]);
       context.beginPath();
-      context.rect(mask.x * canvas.width, mask.y * canvas.height, mask.width * canvas.width, mask.height * canvas.height);
+      context.rect(x, y, width, height);
       context.stroke();
       context.restore();
     });
