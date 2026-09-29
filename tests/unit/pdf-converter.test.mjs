@@ -5,6 +5,7 @@ import {
   PDF_IMAGE_MAX_PIXELS,
   PDF_RENDER_MAX_PIXELS,
   PDF_RENDER_MAX_SCALE,
+  PDF_RANGE_CHUNK_SIZE,
   PDF_RENDER_RETRY_FACTORS,
   convertPdfToImageFiles,
   normalizePdfRotation,
@@ -35,10 +36,23 @@ function pdfFile(name = "scan.pdf") {
   return new File(["%PDF-1.4\n% test\n"], name, { type: "application/pdf" });
 }
 
+// pdf.js's PDFDataRangeTransport, reduced to what the converter uses.
+class FakeRangeTransport {
+  constructor(length, initialData) {
+    this.length = length;
+    this.initialData = initialData;
+    this.received = [];
+  }
+  onDataRange(begin, chunk) {
+    this.received.push({ begin, bytes: [...chunk] });
+  }
+}
+
 // A pdf.js stand-in. `failures` maps a page number to the outcomes of its
 // successive attempts ("render" rejects the render, "blob" makes toBlob yield
-// null); missing entries succeed.
-function fakePdf({ pageSizes = [[595, 842]], failures = {} } = {}) {
+// null); missing entries succeed. Without `ranges` it has no
+// PDFDataRangeTransport.
+function fakePdf({ pageSizes = [[595, 842]], failures = {}, ranges = true } = {}) {
   const state = { getDocumentOptions: null, cleanups: 0, attempts: [], destroyed: false };
   const remaining = Object.fromEntries(Object.entries(failures).map(([page, list]) => [page, [...list]]));
   let pendingBlobFailure = false;
@@ -67,6 +81,7 @@ function fakePdf({ pageSizes = [[595, 842]], failures = {} } = {}) {
   };
   const lib = {
     AnnotationMode: { ENABLE: 1 },
+    ...(ranges ? { PDFDataRangeTransport: FakeRangeTransport } : {}),
     getDocument(options) {
       state.getDocumentOptions = options;
       return { promise: Promise.resolve(pdfDoc), destroy: async () => { state.destroyed = true; } };
@@ -117,9 +132,61 @@ test("スキャンPDFの巨大な埋込み画像はpdf.jsのworkerで縮小さ�
   const pdf = fakePdf();
   await convertPdfToImageFiles(pdfFile(), null, { pdfjsLib: pdf.lib, createCanvas: pdf.createCanvas, wait: noWait, openScannedPages: noScans });
   assert.equal(pdf.state.getDocumentOptions.canvasMaxAreaInBytes, PDF_IMAGE_MAX_PIXELS * 4);
-  assert.ok(pdf.state.getDocumentOptions.data.byteLength > 0);
   assert.equal(pdf.state.destroyed, true);
   assert.ok(pdf.canvases.every(canvas => canvas.width === 1 && canvas.height === 1), "描画後のcanvasを解放する");
+});
+
+test("pdf.jsには必要な範囲だけをファイルから読ませ、PDF全体をメモリに持たせない", async () => {
+  const pdf = fakePdf();
+  const file = pdfFile();
+  await convertPdfToImageFiles(file, null, { pdfjsLib: pdf.lib, createCanvas: pdf.createCanvas, wait: noWait, openScannedPages: noScans });
+  const options = pdf.state.getDocumentOptions;
+  assert.equal(options.data, undefined);
+  assert.ok(options.range instanceof FakeRangeTransport);
+  assert.equal(options.range.length, file.size);
+  assert.equal(options.range.initialData, null);
+  assert.deepEqual([options.rangeChunkSize, options.disableAutoFetch, options.disableStream], [PDF_RANGE_CHUNK_SIZE, true, true]);
+  options.range.requestDataRange(1, 5);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(options.range.received, [{ begin: 1, bytes: [...new TextEncoder().encode("PDF-")] }]);
+
+  const legacy = fakePdf({ ranges: false });
+  await convertPdfToImageFiles(pdfFile(), null, { pdfjsLib: legacy.lib, createCanvas: legacy.createCanvas, wait: noWait, openScannedPages: noScans });
+  assert.equal(legacy.state.getDocumentOptions.data.byteLength, file.size, "範囲読込みがないpdf.jsにはファイル全体を渡す");
+});
+
+test("pdf.jsが求めた範囲をファイルから読めない場合は、読み込めなかったことを示して止める", async () => {
+  // Readable as a whole (the signature check and the scan planning), but not
+  // in the ranges pdf.js asks for, as when the file changes after it is chosen.
+  class UnreadableRanges extends File {
+    slice(start, end, type) {
+      const blob = super.slice(start, end, type);
+      if (start > 0) blob.arrayBuffer = () => Promise.reject(new DOMException("The file could not be read.", "NotReadableError"));
+      return blob;
+    }
+  }
+  let destroyed = false;
+  const lib = {
+    PDFDataRangeTransport: FakeRangeTransport,
+    getDocument(options) {
+      let reject;
+      const promise = new Promise((_, rejectPromise) => { reject = rejectPromise; });
+      options.range.requestDataRange(1, 5);
+      return {
+        promise,
+        destroy: async () => {
+          destroyed = true;
+          reject(new Error("Worker was destroyed"));
+        }
+      };
+    }
+  };
+  const file = new UnreadableRanges(["%PDF-1.4\n% test\n"], "moved.pdf", { type: "application/pdf" });
+  await assert.rejects(
+    convertPdfToImageFiles(file, null, { pdfjsLib: lib, createCanvas: fakePdf().createCanvas, wait: noWait, openScannedPages: noScans }),
+    /^Error: PDFファイルを読み込めませんでした。The file could not be read\.$/
+  );
+  assert.equal(destroyed, true);
 });
 
 test("JPEG化・描画に失敗したページは資源を解放して縮小再試行し、全ページを変換する", async t => {
@@ -191,21 +258,21 @@ test("スキャンページは埋込みJPEGを直接描画し、失敗したペ�
   t.mock.method(console, "warn", () => {});
   const pdf = fakePdf({ pageSizes: [[595, 842], [595, 842], [595, 842], [595, 842]] });
   const plan = {
-    jpeg: new Uint8Array([0xff, 0xd8]), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: [],
+    kind: "jpeg", data: new Blob([new Uint8Array([0xff, 0xd8])], { type: "image/jpeg" }),
+    imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: [],
     pageSize: { width: 595, height: 842 }
   };
   const otherPage = { ...plan, pageSize: { width: 612, height: 792 } };
   const openedWith = [];
-  let scanBytes = null;
   const decoded = [];
   const pages = [];
-  await convertPdfToImageFiles(pdfFile(), null, {
+  const file = pdfFile();
+  await convertPdfToImageFiles(file, null, {
     pdfjsLib: pdf.lib,
     createCanvas: pdf.createCanvas,
     wait: noWait,
     openScannedPages: async (bytes, options) => {
       openedWith.push({ size: bytes.byteLength, ...options });
-      scanBytes = bytes;
       return { pageCount: 4, planForPage: pageNumber => [plan, plan, null, otherPage][pageNumber - 1] };
     },
     decodeImage: async (blob, options) => {
@@ -215,19 +282,18 @@ test("スキャンページは埋込みJPEGを直接描画し、失敗したペ�
     },
     onPage: async page => { pages.push(page); }
   });
-  assert.deepEqual(openedWith, [{ size: pdfFile().size, expectedPageCount: 4 }]);
+  assert.deepEqual(openedWith, [{ size: file.size, source: file }], "計画はファイル全体から1回だけ作り、画像はファイルから読み出す");
   assert.deepEqual(pages.map(page => page.renderer), ["scan", "pdfjs", "pdfjs", "pdfjs"]);
   assert.deepEqual(pdf.state.attempts.map(attempt => attempt.pageNumber), [2, 3, 4], "pdf.jsは直接描画しなかったページだけ");
   assert.equal(decoded.length, 3, "pdf.jsとページ寸法が合わないページは直接描画しない");
   assert.deepEqual(decoded[0], { resizeWidth: 1904, resizeHeight: 2694, resizeQuality: "high" });
-  assert.notEqual(pdf.state.getDocumentOptions.data.buffer, scanBytes.buffer, "pdf.jsは渡された領域をworkerへ移すため複製を渡す");
-  assert.deepEqual([...pdf.state.getDocumentOptions.data], [...scanBytes]);
 });
 
 test("スキャンページは1ページずつデコードし、2ページ分のデコードを同時にメモリへ置かない", async () => {
   const pdf = fakePdf({ pageSizes: [[595, 842], [595, 842], [595, 842], [595, 842]] });
   const plan = {
-    jpeg: new Uint8Array([0xff, 0xd8]), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: [],
+    kind: "jpeg", data: new Blob([new Uint8Array([0xff, 0xd8])], { type: "image/jpeg" }),
+    imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: [],
     pageSize: { width: 595, height: 842 }
   };
   let decoding = 0;

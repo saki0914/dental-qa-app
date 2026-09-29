@@ -111,7 +111,7 @@ async function renderPdfPageToJpeg({ pdfDoc, pageNumber, pdfjsLib, createCanvas,
       let renderer = "pdfjs";
       if (drawScanNatively) {
         try {
-          await drawScannedPage(context, viewport, scan, decodeImage ? { decodeImage } : undefined);
+          await drawScannedPage(context, viewport, scan, { createCanvas, ...(decodeImage ? { decodeImage } : {}) });
           renderer = "scan";
         } catch (error) {
           drawScanNatively = false;
@@ -153,6 +153,24 @@ async function renderPdfPageToJpeg({ pdfDoc, pageNumber, pdfjsLib, createCanvas,
   );
 }
 
+// pdf.js reads the byte ranges it needs straight from the file, in chunks of
+// this size, instead of holding the whole PDF: a page drawn natively never
+// needs pdf.js to read its image.
+export const PDF_RANGE_CHUNK_SIZE = 1024 * 1024;
+
+function fileRangeTransport(pdfjsLib, file, onError) {
+  const Transport = pdfjsLib.PDFDataRangeTransport;
+  if (typeof Transport !== "function") return null;
+  const transport = new Transport(file.size, null);
+  transport.requestDataRange = (begin, end) => {
+    file.slice(begin, end).arrayBuffer().then(
+      buffer => transport.onDataRange(begin, new Uint8Array(buffer)),
+      onError
+    );
+  };
+  return transport;
+}
+
 // `options.onDocument({ pageCount })` runs once the page count is known, before
 // the first page is rendered.
 export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) {
@@ -162,18 +180,29 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
   // Load the library while the file is read.
   const pdfjsLibReady = Promise.resolve(options.pdfjsLib || getPdfJsLibForConvert());
   pdfjsLibReady.catch(() => {});
-  // The whole file. pdf.js and the scanned-page reader keep their own copies,
-  // so it is released before the pages are rendered (a 42 MB scan would
-  // otherwise stay in memory next to them).
-  let bytes = new Uint8Array(await pdfFile.arrayBuffer());
-  // Check the buffer itself; wrapping it in a Blob would copy the whole file.
-  if (!(bytes.byteLength > 0)) throw new Error("PDFファイルが0バイトです。保存を停止しました。");
+  // The whole file is read once, to plan the scanned pages. The plans refer
+  // to the page images by their place in the file, so the buffer is released
+  // before any page is drawn.
+  let scannedPages = null;
+  if (options.scannedPages !== false) {
+    let bytes = new Uint8Array(await pdfFile.arrayBuffer());
+    // Check the buffer itself; wrapping it in a Blob would copy the whole file.
+    if (!(bytes.byteLength > 0)) throw new Error("PDFファイルが0バイトです。保存を停止しました。");
+    scannedPages = await (options.openScannedPages || openScannedPdfPages)(bytes, { source: pdfFile });
+    bytes = null;
+  }
   const pdfjsLib = await pdfjsLibReady;
 
-  const loadingTask = pdfjsLib.getDocument({
-    // pdf.js transfers (detaches) the buffer it receives; the scanned-page
-    // reader keeps reading `bytes`.
-    data: bytes.slice(),
+  let readError = null;
+  let loadingTask = null;
+  const range = fileRangeTransport(pdfjsLib, pdfFile, error => {
+    readError ||= error;
+    void loadingTask?.destroy?.();
+  });
+  loadingTask = pdfjsLib.getDocument({
+    ...(range
+      ? { range, rangeChunkSize: PDF_RANGE_CHUNK_SIZE, disableAutoFetch: true, disableStream: true }
+      : { data: new Uint8Array(await pdfFile.arrayBuffer()) }),
     useSystemFonts: true,
     disableFontFace: false,
     cMapUrl: `${PDF_JS_BASE}/cmaps/`,
@@ -187,11 +216,9 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
     if (!Number.isInteger(pdfDoc.numPages) || pdfDoc.numPages < 1) {
       throw new Error("PDFのページ数を取得できませんでした。");
     }
+    // pdf-lib and pdf.js must see the same pages to draw any natively.
+    if (scannedPages && scannedPages.pageCount !== pdfDoc.numPages) scannedPages = null;
     await options.onDocument?.({ pageCount: pdfDoc.numPages });
-    const scannedPages = options.scannedPages === false
-      ? null
-      : await (options.openScannedPages || openScannedPdfPages)(bytes, { expectedPageCount: pdfDoc.numPages });
-    bytes = null;
 
     // One page at a time: iPad Safari has room for only one decoded
     // full-page scan (a 600 dpi A4 scan is about 138 MB decoded).
@@ -208,6 +235,7 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
         scan: scannedPages?.planForPage(pageNumber) || null,
         decodeImage: options.decodeImage
       });
+      if (readError) throw readError;
       const baseName = (pdfFile.name || "converted.pdf").replace(/\.pdf$/i, "");
       const file = new File(
         [rendered.blob],
@@ -228,6 +256,11 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
       onProgress?.(pageNumber, pdfDoc.numPages, "converted");
     }
     return options.onPage ? { pageCount: pdfDoc.numPages, files: [] } : files;
+  } catch (error) {
+    if (readError && error?.name !== "AbortError") {
+      throw new Error(`PDFファイルを読み込めませんでした。${readError.message || readError}`);
+    }
+    throw error;
   } finally {
     await loadingTask.destroy?.();
   }

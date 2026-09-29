@@ -1,4 +1,9 @@
 import { convertPdfToImageFiles, getPdfJsLibForConvert } from "../core/pdf-converter.js";
+import {
+  createPdfCreationProgress,
+  interruptedPdfCreationMessage,
+  takeInterruptedPdfCreation
+} from "../core/pdf-creation-progress.js";
 import { loadPdfLib } from "../core/pdf-lib-loader.js";
 import {
   MAX_NOTE_IMAGE_BYTES,
@@ -1420,6 +1425,25 @@ export function createStudyNotes(dependencies) {
     void loadPdfLib().catch(error => console.debug("PDFライブラリを先読みできませんでした。", error));
   }
 
+  // A notice above the PDF choice of the creation screen; "" hides it.
+  function showPdfCreationNotice(message) {
+    let notice = ui.createView.querySelector(".note-create-notice");
+    if (!message) {
+      if (notice) notice.hidden = true;
+      return;
+    }
+    if (!notice) {
+      notice = document.createElement("p");
+      notice.className = "note-create-notice";
+      notice.setAttribute("role", "alert");
+      const choices = ui.createView.querySelector(".note-create-grid");
+      if (choices) choices.before(notice);
+      else ui.createView.append(notice);
+    }
+    notice.textContent = message;
+    notice.hidden = false;
+  }
+
   function openPdfCreationSurface() {
     const url = pdfCreationUrl().toString();
     const opened = globalThis.open?.(url, "_blank");
@@ -1811,6 +1835,10 @@ export function createStudyNotes(dependencies) {
           routeOpened = true;
           ui.newTitle.value = "新しいPDFノート";
           show("create");
+          // This tab was reloaded while it created a note (iPad Safari
+          // reloads a tab that ran out of memory): say where it stopped.
+          const interrupted = takeInterruptedPdfCreation({ tabId: routeParams.get("creationSessionId"), uid: session.uid });
+          if (interrupted) showPdfCreationNotice(interruptedPdfCreationMessage(interrupted));
         }
         return;
       }
@@ -2263,6 +2291,7 @@ export function createStudyNotes(dependencies) {
     if (!file) return;
     const session = captureUserSession();
     assertUserSession(session);
+    showPdfCreationNotice("");
     const title = ui.newTitle.value.trim() || file.name.replace(/\.pdf$/i, "") || "PDFノート";
     const noteId = randomId();
     const notePages = [];
@@ -2285,11 +2314,18 @@ export function createStudyNotes(dependencies) {
     });
     let pageIds = [];
     let journal = null;
+    // Kept until the creation ends, so that this tab can tell, if it is
+    // reloaded after running out of memory, where the creation stopped.
+    const progress = createPdfCreationProgress({ tabId: routeParams.get("creationSessionId") });
+    const leaveTab = () => progress.finish();
     try {
+      progress.start({ uid: session.uid, fileName: file.name, fileSize: file.size });
+      globalThis.addEventListener?.("pagehide", leaveTab);
       await convertPdfToImageFiles(file, (current, total) => {
         const percent = Math.round(current / total * 100);
         ui.createProgressBar.value = percent;
         ui.createProgressLabel.textContent = `PDFを読み込んでいます ${current} / ${total}ページ（${percent}%）`;
+        progress.update({ phase: "converting", pageNumber: current, pageCount: total });
       }, {
         signal: creationSignal,
         onDocument: ({ pageCount }) => {
@@ -2319,6 +2355,7 @@ export function createStudyNotes(dependencies) {
           });
         }
       });
+      progress.update({ phase: "saving" });
       if (uploads.pending) ui.createProgressLabel.textContent = "ページ画像の保存を完了しています…";
       await uploads.drain();
       assertUserSession(session);
@@ -2349,6 +2386,8 @@ export function createStudyNotes(dependencies) {
       if (error?.name !== "AbortError") throw new Error(`PDFノートは作成されていません。${error.message || error}`);
       setListStatus("PDFノートの作成をキャンセルしました。");
     } finally {
+      globalThis.removeEventListener?.("pagehide", leaveTab);
+      progress.finish();
       createController = null;
       ui.createProgress.classList.add("hidden");
       ui.pdfInput.value = "";

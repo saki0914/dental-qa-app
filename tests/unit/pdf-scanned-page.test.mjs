@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { deflateSync } from "node:zlib";
 import * as pdfLib from "pdf-lib";
 
 import {
+  BILEVEL_CANVAS_MAX_PIXELS,
   composePdfMatrices,
   drawScannedPage,
   findScannedPageImage,
@@ -114,7 +116,11 @@ test("pdf-libで開いたスキャンPDFのページから埋込みJPEGをその
   const reader = await openScannedPdfPages(bytes, { pdfLib, expectedPageCount: 3 });
   assert.equal(reader.pageCount, 3);
   const plan = reader.planForPage(1);
-  assert.deepEqual([...plan.jpeg], [...jpeg]);
+  assert.equal(plan.kind, "jpeg");
+  assert.equal(plan.data.type, "image/jpeg");
+  assert.deepEqual([...new Uint8Array(await plan.data.arrayBuffer())], [...jpeg]);
+  const fromFile = (await openScannedPdfPages(bytes, { pdfLib, source: new Blob([bytes]) })).planForPage(1);
+  assert.deepEqual([...new Uint8Array(await fromFile.data.arrayBuffer())], [...jpeg], "ファイル内の位置から画像を読み出せる");
   assert.equal(plan.imageWidth, 1200);
   assert.equal(plan.imageHeight, 1700);
   assert.deepEqual(plan.ctm, [595, 0, 0, 842, 0, 0]);
@@ -156,14 +162,14 @@ test("スキャン画像はviewportと変換行列どおりの位置・向きへ
   // pdf.js PageViewport for view [0 0 595 842], rotation 0, scale 2.
   const viewport = { transform: [2, 0, 0, -2, 0, 1684] };
   const plan = {
-    jpeg: fakeJpeg(), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0],
+    kind: "jpeg", data: new Blob([fakeJpeg()], { type: "image/jpeg" }), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0],
     clips: [{ rect: [0, 0, 595, 842], ctm: [1, 0, 0, 1, 0, 0] }]
   };
   const result = await drawScannedPage(context, viewport, plan, { decodeImage });
   assert.deepEqual(result, { drawnWidth: 1190, drawnHeight: 1684, resized: true });
   assert.deepEqual(decodes, [{
     type: "image/jpeg",
-    size: plan.jpeg.length,
+    size: plan.data.size,
     options: { resizeWidth: 1190, resizeHeight: 1684, resizeQuality: "high" }
   }]);
   const transforms = calls.filter(call => call[0] === "setTransform").map(call => call.slice(1));
@@ -173,7 +179,7 @@ test("スキャン画像はviewportと変換行列どおりの位置・向きへ
   assert.equal(closed.length, 1, "ImageBitmapを閉じる");
 
   const upscale = await drawScannedPage(recordingContext().context, { transform: [4, 0, 0, -4, 0, 400] }, {
-    jpeg: fakeJpeg(), imageWidth: 100, imageHeight: 100, ctm: [100, 0, 0, 100, 0, 0], clips: []
+    kind: "jpeg", data: new Blob([fakeJpeg()], { type: "image/jpeg" }), imageWidth: 100, imageHeight: 100, ctm: [100, 0, 0, 100, 0, 0], clips: []
   }, { decodeImage });
   assert.equal(upscale.resized, false, "拡大時は元の解像度でデコードする");
   assert.equal(decodes.at(-1).options, undefined);
@@ -188,14 +194,14 @@ test("縮小デコードに対応しないブラウザでは元の解像度で�
     return { close() {} };
   };
   const result = await drawScannedPage(recordingContext().context, { transform: [1, 0, 0, -1, 0, 842] }, {
-    jpeg: fakeJpeg(), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: []
+    kind: "jpeg", data: new Blob([fakeJpeg()], { type: "image/jpeg" }), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: []
   }, { decodeImage });
   assert.equal(requests.length, 2);
   assert.equal(requests[1], undefined);
   assert.equal(result.resized, false);
   await assert.rejects(
     drawScannedPage(recordingContext().context, { transform: [1, 0, 0, -1, 0, 842] }, {
-      jpeg: fakeJpeg(), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: []
+      kind: "jpeg", data: new Blob([fakeJpeg()], { type: "image/jpeg" }), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: []
     }, { decodeImage: async () => { throw new Error("out of memory"); } }),
     /out of memory/
   );
@@ -219,4 +225,154 @@ test("pdf.jsと同じ規則でページ寸法（CropBox・回転・UserUnit）�
   assert.equal(scannedPageMatchesViewport(reader.planForPage(1), { width: 400.2, height: 299.8 }), true);
   assert.equal(scannedPageMatchesViewport(reader.planForPage(1), { width: 300, height: 400 }), false);
   assert.equal(scannedPageMatchesViewport({}, { width: 300, height: 400 }), false);
+});
+
+function packBilevelRows(rows, width) {
+  const rowBytes = Math.ceil(width / 8);
+  const packed = new Uint8Array(rowBytes * rows.length);
+  rows.forEach((row, y) => row.forEach((value, x) => {
+    if (value) packed[y * rowBytes + (x >> 3)] |= 0x80 >> (x & 7);
+  }));
+  return packed;
+}
+
+// A page like a ScanSnap black-and-white page: one 1-bit gray image,
+// FlateDecode, painted over the whole page. `compressed` replaces the
+// zlib data of the image.
+async function bilevelPdf({ width, height, rows, decode = null, pageSize = [120, 90], compressed = null }) {
+  return scannedPdf(async document => {
+    const dict = {
+      Type: "XObject", Subtype: "Image", Width: width, Height: height,
+      ColorSpace: "DeviceGray", BitsPerComponent: 1, ...(decode ? { Decode: decode } : {})
+    };
+    const image = document.context.register(compressed
+      ? document.context.stream(compressed, { ...dict, Filter: "FlateDecode" })
+      : document.context.flateStream(packBilevelRows(rows, width), dict));
+    const page = document.addPage(pageSize);
+    const name = page.node.newXObject("Im", image);
+    page.pushOperators(
+      pdfLib.pushGraphicsState(),
+      pdfLib.concatTransformationMatrix(pageSize[0], 0, 0, pageSize[1], 0, 0),
+      pdfLib.drawObject(name),
+      pdfLib.popGraphicsState()
+    );
+  });
+}
+
+// Records each putImageData as the rows it draws (the dirty rectangle always
+// spans the full width from the top of the ImageData).
+function fakeCanvas() {
+  const puts = [];
+  const created = [];
+  const sizes = [];
+  const canvas = {
+    width: 300,
+    height: 150,
+    getContext: () => {
+      sizes.push([canvas.width, canvas.height]);
+      return {
+        createImageData: (width, height) => {
+          const imageData = { width, height, data: new Uint8ClampedArray(width * height * 4) };
+          created.push(imageData);
+          return imageData;
+        },
+        putImageData: (imageData, x, y, dirtyX = 0, dirtyY = 0, dirtyWidth = imageData.width, dirtyHeight = imageData.height) => {
+          assert.deepEqual([dirtyX, dirtyY, dirtyWidth], [0, 0, imageData.width]);
+          puts.push({ x, y, width: dirtyWidth, height: dirtyHeight, data: imageData.data.slice(0, dirtyWidth * dirtyHeight * 4) });
+        }
+      };
+    }
+  };
+  return { canvas, puts, created, sizes };
+}
+
+function grayOf(puts) {
+  return puts.flatMap(put => [...put.data].filter((_, index) => index % 4 === 0));
+}
+
+test("白黒（1ビット・FlateDecode）のスキャンページも対象にし、描画サイズまで平均して描く", async () => {
+  // 16 x 8: left half black, right half white.
+  const rows = Array.from({ length: 8 }, () => Array.from({ length: 16 }, (_, x) => (x < 8 ? 0 : 1)));
+  const bytes = await bilevelPdf({ width: 16, height: 8, rows });
+  const source = new Blob([bytes]);
+  const reader = await openScannedPdfPages(bytes, { pdfLib, source });
+  const plan = reader.planForPage(1);
+  assert.equal(plan.kind, "bilevel");
+  assert.equal(plan.blackBit, 0);
+  assert.deepEqual([plan.imageWidth, plan.imageHeight], [16, 8]);
+  assert.deepEqual(plan.pageSize, { width: 120, height: 90 });
+
+  const { canvas, puts } = fakeCanvas();
+  const { context, calls } = recordingContext();
+  // Page drawn at 4 x 2 px: each output pixel averages a 4 x 4 block.
+  const result = await drawScannedPage(context, { transform: [4 / 120, 0, 0, -2 / 90, 0, 2] }, plan, { createCanvas: () => canvas });
+  assert.deepEqual(result, { drawnWidth: 4, drawnHeight: 2, resized: true });
+  assert.deepEqual(puts.map(put => [put.x, put.y, put.width, put.height]), [[0, 0, 4, 2]]);
+  assert.deepEqual(grayOf(puts), [0, 0, 255, 255, 0, 0, 255, 255]);
+  const drawn = calls.find(call => call[0] === "drawImage");
+  assert.equal(drawn[1], canvas, "縮小した画像を変換行列どおりに描く");
+  assert.deepEqual(drawn.slice(2), [0, 0, 1, 1]);
+  assert.deepEqual([canvas.width, canvas.height], [1, 1], "描いた後はCanvasを解放する");
+
+  const inverted = await openScannedPdfPages(await bilevelPdf({ width: 16, height: 8, rows, decode: [1, 0] }), { pdfLib });
+  assert.equal(inverted.planForPage(1).blackBit, 1);
+  assert.equal((await openScannedPdfPages(await bilevelPdf({ width: 16, height: 8, rows, decode: [0, 0.5] }), { pdfLib })).planForPage(1), null);
+});
+
+test("白黒ページは帯ごとに同じImageDataを使い回して描く", async () => {
+  // 8 x 200 px, drawn at full size: four strips of 64, 64, 64 and 8 rows.
+  const rows = Array.from({ length: 200 }, (_, y) => Array.from({ length: 8 }, () => y % 2));
+  const reader = await openScannedPdfPages(await bilevelPdf({ width: 8, height: 200, rows, pageSize: [8, 200] }), { pdfLib });
+  const { canvas, puts, created } = fakeCanvas();
+  await drawScannedPage(recordingContext().context, { transform: [1, 0, 0, -1, 0, 200] }, reader.planForPage(1), { createCanvas: () => canvas });
+  assert.deepEqual(puts.map(put => [put.y, put.height]), [[0, 64], [64, 64], [128, 64], [192, 8]]);
+  assert.equal(created.length, 1, "ImageDataは1つだけ作る");
+  assert.deepEqual(grayOf(puts), rows.flatMap(row => row.map(value => value * 255)));
+});
+
+test("ブラウザが展開できない白黒画像（DecompressionStreamなし・末尾のチェックサム不正）はpdf-libで展開して描く", async t => {
+  const warnings = t.mock.method(console, "warn", () => {});
+  const rows = Array.from({ length: 8 }, (_, y) => Array.from({ length: 16 }, (_, x) => ((x + y) % 3 === 0 ? 0 : 1)));
+  const expected = rows.flatMap(row => row.map(value => value * 255));
+  const reader = await openScannedPdfPages(await bilevelPdf({ width: 16, height: 8, rows, pageSize: [16, 8] }), { pdfLib });
+  const viewport = { transform: [1, 0, 0, -1, 0, 8] };
+
+  const original = globalThis.DecompressionStream;
+  globalThis.DecompressionStream = undefined;
+  try {
+    const { canvas, puts } = fakeCanvas();
+    await drawScannedPage(recordingContext().context, viewport, reader.planForPage(1), { createCanvas: () => canvas, pdfLib });
+    assert.deepEqual(grayOf(puts), expected);
+  } finally {
+    globalThis.DecompressionStream = original;
+  }
+  assert.equal(warnings.mock.callCount(), 1);
+
+  // The same rows with a wrong Adler-32 checksum at the end of the zlib data.
+  const compressed = deflateSync(packBilevelRows(rows, 16));
+  compressed[compressed.length - 1] ^= 0xff;
+  const damaged = await openScannedPdfPages(await bilevelPdf({ width: 16, height: 8, rows, pageSize: [16, 8], compressed }), { pdfLib });
+  const { canvas, puts } = fakeCanvas();
+  await drawScannedPage(recordingContext().context, viewport, damaged.planForPage(1), { createCanvas: () => canvas, pdfLib });
+  assert.deepEqual(grayOf(puts.slice(-1)), expected, "最後に描いた内容が正しい");
+});
+
+test("白黒画像の縮小用Canvasは、ページからはみ出して大きく描かれてもiPadの上限を超えない", async t => {
+  t.mock.method(console, "warn", () => {});
+  const rows = [[1, 0, 1, 0, 1, 0, 1, 0]];
+  const plan = {
+    ...(await openScannedPdfPages(await bilevelPdf({ width: 8, height: 1, rows, pageSize: [8, 1] }), { pdfLib })).planForPage(1),
+    // Pretend the image is 20,000 x 10,000 px (the data is never read past
+    // the first attempt's failure).
+    imageWidth: 20_000,
+    imageHeight: 10_000
+  };
+  const { canvas, sizes } = fakeCanvas();
+  // Drawn at 8,000 x 4,000 px (32M px), four times the area of the cap.
+  await assert.rejects(drawScannedPage(recordingContext().context, { transform: [1000, 0, 0, -4000, 0, 4000] }, plan, {
+    createCanvas: () => canvas,
+    pdfLib
+  }));
+  assert.ok(sizes[0][0] * sizes[0][1] <= BILEVEL_CANVAS_MAX_PIXELS, JSON.stringify(sizes));
+  assert.deepEqual(sizes[0], [5656, 2828]);
 });

@@ -1,3 +1,4 @@
+import { inflateWithDecompressionStream, rasterizeBilevelImage } from "./pdf-bilevel-image.js";
 import { loadPdfLib } from "./pdf-lib-loader.js";
 
 // Scanned PDF pages: a scanner (or its app, or macOS re-saving the file)
@@ -7,8 +8,10 @@ import { loadPdfLib } from "./pdf-lib-loader.js";
 // 35M px, which costs several hundred MB per page and exhausts iPad Safari's
 // memory, so a page canvas can no longer be allocated. Pages that paint
 // nothing but one such JPEG are therefore drawn from the embedded JPEG with the
-// browser's native decoder, at the size the page canvas needs. Every other page
-// (and any page whose check fails) still goes through pdf.js.
+// browser's native decoder, at the size the page canvas needs. Black-and-white
+// pages, which scanners store as a 1-bit image at up to 1200 dpi, are averaged
+// down to that size row by row (pdf-bilevel-image.js). Every other page (and
+// any page whose check fails) still goes through pdf.js.
 
 const IDENTITY = Object.freeze([1, 0, 0, 1, 0, 0]);
 const MAX_CONTENT_BYTES = 8 * 1024 * 1024;
@@ -307,27 +310,39 @@ function imageColorComponents(colorSpace, lookup, PDFArray, PDFName) {
   return null;
 }
 
-// The JPEG of a scanner-style image XObject, or null when the image needs
-// pdf.js (masks, decode arrays, other filters or color spaces, EXIF rotation).
-function scannedJpeg(stream, { PDFArray, PDFName, PDFRawStream, lookup }) {
+// A scanner-style image XObject: a JPEG ({ kind: "jpeg" }) or a 1-bit gray
+// image compressed with FlateDecode ({ kind: "bilevel", blackBit }). Returns
+// null when the image needs pdf.js (masks, other filters, predictors, decode
+// arrays or color spaces, EXIF rotation).
+function scannedImage(stream, { PDFArray, PDFName, PDFRawStream, lookup }) {
   if (!(stream instanceof PDFRawStream)) return null;
   const dict = stream.dict;
   const get = key => dict.get(PDFName.of(key));
   if (nameValue(lookup(get("Subtype"))) !== "Image") return null;
   if (lookup(get("ImageMask"))?.asBoolean?.() === true) return null;
-  if (get("Mask") || get("SMask") || get("Decode") || get("DecodeParms") || get("DP")) return null;
-  if (numberValue(lookup(get("BitsPerComponent"))) !== 8) return null;
+  if (get("Mask") || get("SMask") || get("DecodeParms") || get("DP")) return null;
   const filter = lookup(get("Filter"));
   const filters = filter instanceof PDFArray ? filter.asArray().map(item => nameValue(lookup(item))) : [nameValue(filter)];
-  if (filters.length !== 1 || filters[0] !== "DCTDecode") return null;
+  if (filters.length !== 1) return null;
   const components = imageColorComponents(get("ColorSpace"), lookup, PDFArray, PDFName);
+  const bits = numberValue(lookup(get("BitsPerComponent")));
   const width = numberValue(lookup(get("Width")));
   const height = numberValue(lookup(get("Height")));
-  const jpeg = stream.contents;
-  const header = inspectJpegHeader(jpeg);
-  if (!components || !header || header.precision !== 8 || header.orientation !== 1) return null;
-  if (header.components !== components || header.width !== width || header.height !== height) return null;
-  return { jpeg, width, height };
+  const contents = stream.contents;
+  if (!components || !(width > 0) || !(height > 0)) return null;
+  if (filters[0] === "DCTDecode" && bits === 8 && !get("Decode")) {
+    const header = inspectJpegHeader(contents);
+    if (!header || header.precision !== 8 || header.orientation !== 1) return null;
+    if (header.components !== components || header.width !== width || header.height !== height) return null;
+    return { kind: "jpeg", contents, width, height };
+  }
+  if (filters[0] === "FlateDecode" && bits === 1 && components === 1) {
+    const decode = lookup(get("Decode"));
+    const range = decode instanceof PDFArray ? decode.asArray().map(item => numberValue(lookup(item))) : [0, 1];
+    if (range.length !== 2 || !((range[0] === 0 && range[1] === 1) || (range[0] === 1 && range[1] === 0))) return null;
+    return { kind: "bilevel", contents, width, height, blackBit: range[0] === 0 ? 0 : 1 };
+  }
+  return null;
 }
 
 const LETTER_SIZE_MEDIABOX = Object.freeze([0, 0, 612, 792]);
@@ -387,20 +402,34 @@ function concatenate(parts) {
   return joined;
 }
 
-// Opens the PDF with pdf-lib and returns a function that describes page
-// `pageNumber` (1-based) as { jpeg, imageWidth, imageHeight, ctm } when it can
-// be drawn natively, or null. Returns null when pdf-lib cannot read the file,
-// the file is encrypted, or its page count differs from pdf.js's.
-export async function openScannedPdfPages(bytes, { expectedPageCount, pdfLib } = {}) {
+const PDF_LIB_LOAD_OPTIONS = Object.freeze({ ignoreEncryption: true, updateMetadata: false, throwOnInvalidObject: false });
+
+// pdf-lib copies every stream while parsing, a second copy of a scanned PDF.
+// Parsing with the stream contents as views of `bytes` keeps a single copy
+// and tells where each page image lies in the file.
+async function loadDocumentSharingBytes(lib, bytes) {
+  const parser = lib.PDFParser?.forBytesWithOptions?.(bytes, 100, false, false);
+  const stream = parser?.bytes;
+  if (typeof stream?.slice !== "function" || stream.bytes !== bytes || typeof lib.PDFDocument !== "function") {
+    return lib.PDFDocument.load(bytes, PDF_LIB_LOAD_OPTIONS);
+  }
+  stream.slice = (start, end) => stream.bytes.subarray(start, end);
+  return new lib.PDFDocument(await parser.parseDocument(), true, false);
+}
+
+// Reads the PDF once with pdf-lib and describes every page that can be drawn
+// natively as { kind, data, imageWidth, imageHeight, blackBit, ctm, clips,
+// pageSize }, where `data` is a Blob of the page image's stream: a slice of
+// `source` (the PDF file) when given, so no page image stays in memory. The
+// result keeps no reference to `bytes`. Returns null when pdf-lib cannot read
+// the file, the file is encrypted, or its page count differs from
+// `expectedPageCount`.
+export async function openScannedPdfPages(bytes, { expectedPageCount, pdfLib, source } = {}) {
   let lib = pdfLib;
   let document;
   try {
     lib ||= await loadPdfLib();
-    document = await lib.PDFDocument.load(bytes, {
-      ignoreEncryption: true,
-      updateMetadata: false,
-      throwOnInvalidObject: false
-    });
+    document = await loadDocumentSharingBytes(lib, bytes);
   } catch (error) {
     console.debug("スキャンPDFの直接描画を使わず、pdf.jsで変換します。", error);
     return null;
@@ -410,68 +439,94 @@ export async function openScannedPdfPages(bytes, { expectedPageCount, pdfLib } =
   if (Number.isInteger(expectedPageCount) && pages.length !== expectedPageCount) return null;
   const { PDFArray, PDFDict, PDFName, PDFRawStream, PDFRef, decodePDFRawStream } = lib;
   const lookup = object => (object instanceof PDFRef ? document.context.lookup(object) : object);
-  return {
-    pageCount: pages.length,
-    planForPage(pageNumber) {
-      try {
-        const node = pages[pageNumber - 1]?.node;
-        if (!node) return null;
-        const annotations = lookup(node.get(PDFName.of("Annots")));
-        if (annotations instanceof PDFArray && annotations.size() > 0) return null;
-        const contents = lookup(node.get(PDFName.of("Contents")));
-        const streams = contents instanceof PDFArray ? contents.asArray().map(lookup) : [contents];
-        if (!streams.length || streams.some(stream => !(stream instanceof PDFRawStream))) return null;
-        const content = concatenate(streams.map(stream => decodePDFRawStream(stream).decode()));
-        const painted = findScannedPageImage(content);
-        if (!painted) return null;
-        const resources = node.Resources();
-        const xobjects = resources instanceof PDFDict ? lookup(resources.get(PDFName.of("XObject"))) : null;
-        if (!(xobjects instanceof PDFDict)) return null;
-        const image = scannedJpeg(lookup(xobjects.get(PDFName.of(painted.name))), { PDFArray, PDFName, PDFRawStream, lookup });
-        if (!image) return null;
-        return {
-          jpeg: image.jpeg,
-          imageWidth: image.width,
-          imageHeight: image.height,
-          ctm: painted.ctm,
-          clips: painted.clips,
-          pageSize: pdfJsPageSize(node, lookup, PDFName)
-        };
-      } catch (error) {
-        console.debug(`PDF ${pageNumber}ページ目はpdf.jsで変換します。`, error);
-        return null;
-      }
+  const imageBlob = (contents, type) => {
+    if (source && contents.buffer === bytes.buffer) {
+      const offset = contents.byteOffset - bytes.byteOffset;
+      return source.slice(offset, offset + contents.byteLength, type);
     }
+    return new Blob([contents], { type });
+  };
+  const plan = (node, pageNumber) => {
+    try {
+      const annotations = lookup(node.get(PDFName.of("Annots")));
+      if (annotations instanceof PDFArray && annotations.size() > 0) return null;
+      const contents = lookup(node.get(PDFName.of("Contents")));
+      const streams = contents instanceof PDFArray ? contents.asArray().map(lookup) : [contents];
+      if (!streams.length || streams.some(stream => !(stream instanceof PDFRawStream))) return null;
+      const content = concatenate(streams.map(stream => decodePDFRawStream(stream).decode()));
+      const painted = findScannedPageImage(content);
+      if (!painted) return null;
+      const resources = node.Resources();
+      const xobjects = resources instanceof PDFDict ? lookup(resources.get(PDFName.of("XObject"))) : null;
+      if (!(xobjects instanceof PDFDict)) return null;
+      const image = scannedImage(lookup(xobjects.get(PDFName.of(painted.name))), { PDFArray, PDFName, PDFRawStream, lookup });
+      if (!image) return null;
+      return {
+        kind: image.kind,
+        data: imageBlob(image.contents, image.kind === "jpeg" ? "image/jpeg" : "application/octet-stream"),
+        imageWidth: image.width,
+        imageHeight: image.height,
+        ...(image.kind === "bilevel" ? { blackBit: image.blackBit } : {}),
+        ctm: painted.ctm,
+        clips: painted.clips,
+        pageSize: pdfJsPageSize(node, lookup, PDFName)
+      };
+    } catch (error) {
+      console.debug(`PDF ${pageNumber}ページ目はpdf.jsで変換します。`, error);
+      return null;
+    }
+  };
+  // Every page is planned now, so that nothing refers to the parsed file
+  // afterwards and its memory can be released before the pages are drawn.
+  const plans = pages.map((page, index) => plan(page.node, index + 1));
+  return {
+    pageCount: plans.length,
+    planForPage: pageNumber => plans[pageNumber - 1] || null
   };
 }
 
 // Draws a planned scanned page onto `context`, whose canvas matches `viewport`
 // (a pdf.js PageViewport for the page), on top of the white page background.
+// A JPEG is decoded by the browser at the drawn size; a 1-bit image is
+// averaged down to the drawn size on a canvas from `createCanvas`. `pdfLib`
+// (loaded when omitted) inflates a 1-bit image the browser cannot.
 export async function drawScannedPage(context, viewport, plan, {
-  decodeImage = (blob, options) => globalThis.createImageBitmap(blob, options)
+  decodeImage = (blob, options) => globalThis.createImageBitmap(blob, options),
+  createCanvas = () => globalThis.document.createElement("canvas"),
+  pdfLib = null
 } = {}) {
-  // Image space: unit square, first JPEG row at the top (y = 1 in PDF terms).
+  // Image space: unit square, first image row at the top (y = 1 in PDF terms).
   const matrix = composePdfMatrices(
     composePdfMatrices(viewport.transform, plan.ctm),
     [1, 0, 0, -1, 0, 1]
   );
   const drawnWidth = Math.max(1, Math.round(Math.hypot(matrix[0], matrix[1])));
   const drawnHeight = Math.max(1, Math.round(Math.hypot(matrix[2], matrix[3])));
-  // Decode at the drawn size when that is smaller than the scan, which lets
-  // the browser skip most of the full-resolution work and memory.
-  const resize = drawnWidth < plan.imageWidth && drawnHeight < plan.imageHeight
-    ? { resizeWidth: drawnWidth, resizeHeight: drawnHeight, resizeQuality: "high" }
-    : undefined;
-  const blob = new Blob([plan.jpeg], { type: "image/jpeg" });
-  let bitmap;
-  let resized = Boolean(resize);
-  try {
-    bitmap = await decodeImage(blob, resize);
-  } catch (error) {
-    // A browser without ImageBitmap resize options decodes at full size.
-    if (!resize) throw error;
-    bitmap = await decodeImage(blob, undefined);
-    resized = false;
+  let image;
+  let release;
+  let resized;
+  if (plan.kind === "bilevel") {
+    ({ image, release } = await rasterizeScannedBilevel(plan, drawnWidth, drawnHeight, { createCanvas, pdfLib }));
+    resized = image.width < plan.imageWidth || image.height < plan.imageHeight;
+  } else {
+    // Decode at the drawn size when that is smaller than the scan, which lets
+    // the browser skip most of the full-resolution work and memory.
+    const resize = drawnWidth < plan.imageWidth && drawnHeight < plan.imageHeight
+      ? { resizeWidth: drawnWidth, resizeHeight: drawnHeight, resizeQuality: "high" }
+      : undefined;
+    const blob = plan.data instanceof Blob && plan.data.type === "image/jpeg"
+      ? plan.data
+      : new Blob([plan.data], { type: "image/jpeg" });
+    resized = Boolean(resize);
+    try {
+      image = await decodeImage(blob, resize);
+    } catch (error) {
+      // A browser without ImageBitmap resize options decodes at full size.
+      if (!resize) throw error;
+      image = await decodeImage(blob, undefined);
+      resized = false;
+    }
+    release = () => image.close?.();
   }
   context.save();
   try {
@@ -485,10 +540,85 @@ export async function drawScannedPage(context, viewport, plan, {
     context.setTransform(matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5]);
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = "high";
-    context.drawImage(bitmap, 0, 0, 1, 1);
+    context.drawImage(image, 0, 0, 1, 1);
   } finally {
     context.restore();
-    bitmap.close?.();
+    release();
   }
   return { drawnWidth, drawnHeight, resized };
+}
+
+// iPad Safari allocates no canvas above 16,777,216 px. The 1-bit image is
+// averaged down to at most this size even when a page draws it larger (only
+// possible when most of it lies outside the page).
+export const BILEVEL_CANVAS_MAX_PIXELS = 16_000_000;
+const PDF_LIB_INFLATE_CHUNK_BYTES = 1024 * 1024;
+
+// pdf-lib's inflater, for browsers without DecompressionStream (Safari before
+// 16.4) and for streams the browser rejects, such as one whose final checksum
+// is wrong (PDF readers ignore it). It keeps the inflated image in memory
+// (17 MB for a 1200 dpi A4 page) instead of streaming it.
+async function* inflateWithPdfLib(data, lib) {
+  const compressed = new Uint8Array(await data.arrayBuffer());
+  const stream = lib.decodePDFRawStream(
+    lib.PDFRawStream.of(lib.PDFContext.create().obj({ Filter: "FlateDecode" }), compressed)
+  );
+  for (;;) {
+    const chunk = stream.getBytes(PDF_LIB_INFLATE_CHUNK_BYTES);
+    if (!chunk.length) return;
+    yield chunk;
+  }
+}
+
+// A canvas holding the 1-bit page image averaged down to the drawn size (or
+// kept at its own size when drawn larger), filled strip by strip.
+async function rasterizeScannedBilevel(plan, drawnWidth, drawnHeight, { createCanvas, pdfLib }) {
+  let width = Math.min(drawnWidth, plan.imageWidth);
+  let height = Math.min(drawnHeight, plan.imageHeight);
+  const excess = Math.sqrt(width * height / BILEVEL_CANVAS_MAX_PIXELS);
+  if (excess > 1) {
+    width = Math.max(1, Math.floor(width / excess));
+    height = Math.max(1, Math.floor(height / excess));
+  }
+  const canvas = createCanvas();
+  const release = () => {
+    canvas.width = 1;
+    canvas.height = 1;
+  };
+  try {
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) throw new Error("白黒ページの描画用Canvasを作成できませんでした。");
+    const data = plan.data instanceof Blob ? plan.data : new Blob([plan.data]);
+    let strip = null;
+    const rasterize = inflate => rasterizeBilevelImage({
+      data,
+      sourceWidth: plan.imageWidth,
+      sourceHeight: plan.imageHeight,
+      blackBit: plan.blackBit,
+      width,
+      height,
+      inflate,
+      onStrip: (rgba, y, rows) => {
+        // The first strip is the tallest; every strip reuses its ImageData.
+        strip ||= context.createImageData(width, rows);
+        strip.data.set(rgba.subarray(0, width * rows * 4));
+        context.putImageData(strip, 0, y, 0, 0, width, rows);
+      }
+    });
+    try {
+      await rasterize(inflateWithDecompressionStream);
+    } catch (error) {
+      if (error instanceof RangeError) throw error;
+      console.warn("白黒ページの画像をブラウザで展開できないため、pdf-libで展開します。", error);
+      const lib = pdfLib || await loadPdfLib();
+      // Every strip is drawn again, over the rows the first attempt drew.
+      await rasterize(source => inflateWithPdfLib(source, lib));
+    }
+    return { image: canvas, release };
+  } catch (error) {
+    release();
+    throw error;
+  }
 }

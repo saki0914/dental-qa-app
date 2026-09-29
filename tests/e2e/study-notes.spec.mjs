@@ -7,9 +7,13 @@ import {
   StandardFonts,
   TextRenderingMode,
   beginText,
+  concatTransformationMatrix,
   degrees,
+  drawObject,
   endText,
   moveText,
+  popGraphicsState,
+  pushGraphicsState,
   setFontAndSize,
   setTextRenderingMode,
   showText
@@ -3454,7 +3458,10 @@ async function backgroundQuadrantColors(page) {
     const context = canvas.getContext("2d");
     context.drawImage(node, 0, 0);
     const name = ([r, g, b]) => {
-      const palette = { red: [220, 38, 38], green: [22, 163, 74], blue: [37, 99, 235], amber: [245, 158, 11] };
+      const palette = {
+        red: [220, 38, 38], green: [22, 163, 74], blue: [37, 99, 235], amber: [245, 158, 11],
+        black: [0, 0, 0], white: [255, 255, 255]
+      };
       return Object.entries(palette)
         .map(([label, color]) => [label, Math.hypot(r - color[0], g - color[1], b - color[2])])
         .sort((left, right) => left[1] - right[1])[0][0];
@@ -3464,13 +3471,29 @@ async function backgroundQuadrantColors(page) {
   });
 }
 
-test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文字・回転ページ）は埋込みJPEGを直接描画して向きどおりにノート化する", async ({ page }) => {
+test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・白黒1ビット画像・不可視OCR文字・回転ページ）は埋込み画像を直接描画して向きどおりにノート化する", async ({ page }) => {
   test.setTimeout(120_000);
   const blockedRequests = await guardProductionFirebase(page);
   const pageErrors = [];
   const onPageError = error => recordUnexpectedPageError(pageErrors, error);
   page.on("pageerror", onPageError);
+  const fallbackWarnings = [];
+  const onConsole = message => {
+    if (/pdf\.jsで変換します|pdf-libで展開します/.test(message.text())) fallbackWarnings.push(message.text());
+  };
+  page.on("console", onConsole);
   await page.context().addInitScript(() => {
+    // 1-bit pages are inflated on the page by DecompressionStream; pdf.js
+    // would inflate them in its worker instead.
+    const OriginalDecompressionStream = window.DecompressionStream;
+    if (OriginalDecompressionStream) {
+      window.DecompressionStream = class extends OriginalDecompressionStream {
+        constructor(...args) {
+          super(...args);
+          sessionStorage.setItem("bilevelInflates", String(Number(sessionStorage.getItem("bilevelInflates") || 0) + 1));
+        }
+      };
+    }
     const original = window.createImageBitmap?.bind(window);
     if (!original) return;
     let decoding = 0;
@@ -3512,6 +3535,17 @@ test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文
   const rotatedBack = scan.addPage([400, 550]);
   rotatedBack.setRotation(degrees(270));
   rotatedBack.drawImage(image, { x: 0, y: 0, width: 400, height: 550 });
+  // A black-and-white page as a scanner stores it: a 1-bit gray image with
+  // FlateDecode, 800 x 1100 px, black only in the top-left quarter.
+  const bilevelRowBytes = 800 / 8;
+  const bilevelBits = new Uint8Array(bilevelRowBytes * 1100).fill(0xff);
+  for (let y = 0; y < 550; y += 1) bilevelBits.fill(0, y * bilevelRowBytes, y * bilevelRowBytes + bilevelRowBytes / 2);
+  const bilevelImage = scan.context.register(scan.context.flateStream(bilevelBits, {
+    Type: "XObject", Subtype: "Image", Width: 800, Height: 1100, ColorSpace: "DeviceGray", BitsPerComponent: 1
+  }));
+  const bilevel = scan.addPage([400, 550]);
+  const bilevelName = bilevel.node.newXObject("Im", bilevelImage);
+  bilevel.pushOperators(pushGraphicsState(), concatTransformationMatrix(400, 0, 0, 550, 0, 0), drawObject(bilevelName), popGraphicsState());
   const fixture = Buffer.from(await scan.save());
 
   await page.locator("#newNoteBtn").click();
@@ -3520,6 +3554,7 @@ test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文
   page = await popupPromise;
   await guardProductionFirebase(page, blockedRequests);
   page.on("pageerror", onPageError);
+  page.on("console", onConsole);
   await expect(page.locator("#noteCreateView")).toBeVisible();
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
   const fileChooserPromise = page.waitForEvent("filechooser");
@@ -3528,25 +3563,34 @@ test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文
   await page.waitForURL(url => url.searchParams.get("noteEditor") === "1" && Boolean(url.searchParams.get("noteId")), { timeout: 120_000 });
   const decodes = await page.evaluate(() => ({
     pages: Number(sessionStorage.getItem("scanJpegDecodes") || 0),
-    atOnce: Number(sessionStorage.getItem("scanJpegPeak") || 0)
+    atOnce: Number(sessionStorage.getItem("scanJpegPeak") || 0),
+    bilevelInflates: Number(sessionStorage.getItem("bilevelInflates") || 0),
+    progressRecords: Object.keys(localStorage).filter(key => key.startsWith("dentalQaPdfCreationProgress:"))
   }));
-  expect(decodes, "全ページを埋込みJPEGから、1ページずつ描画する").toEqual({ pages: 3, atOnce: 1 });
+  expect(decodes, "カラーの3ページを埋込みJPEGから1ページずつ、白黒ページを1ビット画像から描画し、作成後は途中経過の記録を残さない")
+    .toEqual({ pages: 3, atOnce: 1, bilevelInflates: 1, progressRecords: [] });
+  expect(fallbackWarnings, "どのページもpdf.jsやpdf-libの代替処理へ回さない").toEqual([]);
 
-  await expect(page.locator("#notePageCounter")).toHaveText("1 / 3", { timeout: 60_000 });
+  await expect(page.locator("#notePageCounter")).toHaveText("1 / 4", { timeout: 60_000 });
   const first = await backgroundQuadrantColors(page);
   expect(first).toMatchObject({ topLeft: "red", topRight: "green", bottomLeft: "blue", bottomRight: "amber" });
   expect(first.size[0] / first.size[1]).toBeCloseTo(400 / 550, 2);
   await openPageSidebar(page);
   await page.locator('#notePageList [aria-label="2ページを開く"]').click();
-  await expect(page.locator("#notePageCounter")).toHaveText("2 / 3");
+  await expect(page.locator("#notePageCounter")).toHaveText("2 / 4");
   const second = await backgroundQuadrantColors(page);
   expect(second, "90度回転ページは時計回りに回した向き").toMatchObject({ topLeft: "blue", topRight: "red", bottomLeft: "amber", bottomRight: "green" });
   expect(second.size[0] / second.size[1]).toBeCloseTo(550 / 400, 2);
   await page.locator('#notePageList [aria-label="3ページを開く"]').click();
-  await expect(page.locator("#notePageCounter")).toHaveText("3 / 3");
+  await expect(page.locator("#notePageCounter")).toHaveText("3 / 4");
   const third = await backgroundQuadrantColors(page);
   expect(third, "270度回転ページは反時計回りに回した向き").toMatchObject({ topLeft: "green", topRight: "amber", bottomLeft: "red", bottomRight: "blue" });
   expect(third.size[0] / third.size[1]).toBeCloseTo(550 / 400, 2);
+  await page.locator('#notePageList [aria-label="4ページを開く"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("4 / 4");
+  const fourth = await backgroundQuadrantColors(page);
+  expect(fourth, "白黒ページは左上だけ黒い向きのまま").toMatchObject({ topLeft: "black", topRight: "white", bottomLeft: "white", bottomRight: "white" });
+  expect(fourth.size[0] / fourth.size[1]).toBeCloseTo(400 / 550, 2);
   expect(blockedRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
 });
@@ -3719,6 +3763,25 @@ test("@authenticated @ipad-v-next PDF作成タブが拒否されても同じタ�
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
   await expect(page.getByText("クラウド読込の完了後に画像暗記が使えます。")).toHaveCount(0);
   await expect(page.locator("#notePdfInput")).toBeAttached();
+  await expect(page.locator(".note-create-notice")).toHaveCount(0);
+
+  // A tab that ended during a creation (iPad Safari reloads a tab that ran
+  // out of memory) tells where the previous attempt stopped, once.
+  const progressKey = `dentalQaPdfCreationProgress:${new URL(page.url()).searchParams.get("creationSessionId")}`;
+  await page.evaluate(({ key, uid }) => localStorage.setItem(key, JSON.stringify({
+    uid, fileName: "20260801_Z章微生物学.pdf", fileSize: 56_300_000, phase: "converting",
+    pageNumber: 18, pageCount: 41, startedAt: Date.now() - 60_000, updatedAt: Date.now()
+  })), { key: progressKey, uid: user.uid });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator(".note-create-notice")).toContainText(
+    "「20260801_Z章微生物学.pdf」の41ページ中18ページ目の変換中に終了しました",
+    { timeout: 20_000 }
+  );
+  await expect(page.locator('[data-create-note="pdf"]')).toBeVisible();
+  expect(await page.evaluate(key => localStorage.getItem(key), progressKey)).toBeNull();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#newNoteTitle")).toHaveValue("新しいPDFノート", { timeout: 20_000 });
+  await expect(page.locator(".note-create-notice"), "案内は一度だけ出す").toHaveCount(0);
   expect(blockedRequests).toEqual([]);
 });
 
