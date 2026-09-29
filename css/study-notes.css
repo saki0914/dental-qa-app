@@ -82,6 +82,8 @@ body.note-editor-dedicated .note-viewport{height:calc(100dvh - 62px);background:
 body.note-editor-create #noteListView,
 body.note-editor-create #noteEditorView{display:none!important}
 body.note-editor-create #noteCreateView{display:block!important;min-height:100dvh;padding:clamp(16px,4vw,40px);background:#eef2f7;box-sizing:border-box}
+.note-create-choice[hidden]{display:none!important}
+.note-create-grid.single-choice{grid-template-columns:minmax(0,480px)}
 .note-page-stage.study-mode .note-mask.revealed{opacity:1;background:transparent;border:1.5px dashed rgba(71,85,105,.25);pointer-events:auto}
 .note-page-stage.study-mode .note-mask.weak.revealed{background:transparent;border-color:rgba(185,28,28,.28)}
 .note-pixel-eraser-cursor{position:absolute;z-index:96;translate:-50% -50%;border:1px solid rgba(15,23,42,.68);border-radius:50%;background:rgba(148,163,184,.16);pointer-events:none;box-sizing:border-box;will-change:left,top,width,height}

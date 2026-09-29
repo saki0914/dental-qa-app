@@ -169,7 +169,6 @@ const el = {
   studyLockBanner: document.getElementById("studyLockBanner"),
   manageLockBanner: document.getElementById("manageLockBanner"),
   progressLockBanner: document.getElementById("progressLockBanner"),
-  pdfLockBanner: document.getElementById("pdfLockBanner"),
   tabBtnPdf: document.getElementById("tabBtnPdf"),
   noteModeBtn: document.getElementById("noteModeBtn"),
   noteView: document.getElementById("noteView"),
@@ -1356,20 +1355,17 @@ function updateLoginLockedUI() {
     ? {
         study: "他の端末で更新されました。再読み込みするまで学習操作を停止しています。",
         manage: "他の端末で更新されました。再読み込みするまで問題管理を停止しています。",
-        progress: "他の端末で更新されました。再読み込みするまで進捗操作を停止しています。",
-        pdf: "他の端末で更新されました。再読み込みするまで画像暗記を停止しています。"
+        progress: "他の端末で更新されました。再読み込みするまで進捗操作を停止しています。"
       }
     : {
         study: loggedIn ? "クラウド読込の完了後に学習が使えます。" : "ログインすると学習が使えます。",
         manage: loggedIn ? "クラウド読込の完了後に問題管理が使えます。" : "ログインすると問題管理が使えます。",
-        progress: loggedIn ? "クラウド読込の完了後に進捗が使えます。" : "ログインすると進捗が使えます。",
-        pdf: loggedIn ? "クラウド読込の完了後に画像暗記が使えます。" : "ログインすると画像暗記が使えます。"
+        progress: loggedIn ? "クラウド読込の完了後に進捗が使えます。" : "ログインすると進捗が使えます。"
       };
 
   el.studyLockBanner.textContent = lockMessages.study;
   el.manageLockBanner.textContent = lockMessages.manage;
   el.progressLockBanner.textContent = lockMessages.progress;
-  el.pdfLockBanner.textContent = lockMessages.pdf;
 
   document.querySelectorAll('.tab').forEach(tab => {
     const isAuth = tab.dataset.tab === "auth";
@@ -1385,7 +1381,6 @@ function updateLoginLockedUI() {
   el.studyLockBanner.classList.toggle("hidden", canInteract);
   el.manageLockBanner.classList.toggle("hidden", canInteract);
   el.progressLockBanner.classList.toggle("hidden", canInteract);
-  el.pdfLockBanner.classList.toggle("hidden", canInteract);
 
   setInteractiveDisabled([
     "chooseIphone","chooseIpad","subjectFilter","primarySubcategorySelect","orderMode","applyStudyBtn","shuffleBtn","forceResetStudyFiltersBtn","addConditionGroupBtn","clearCurrentConditionBtn",

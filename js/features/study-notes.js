@@ -144,7 +144,8 @@ const TOOL_LABELS = {
   text: "テキスト", image: "画像", mask: "暗記マスク", study: "暗記モード"
 };
 const NOTE_COPY_CONCURRENCY = 3;
-const PDF_UPLOAD_CONCURRENCY = 2;
+// Page images waiting for or in upload while the next page converts.
+const PDF_UPLOAD_QUEUE_LIMIT = 2;
 const TOUCH_PREEMPT_POLICY = Object.freeze({
   pan: "preserve-viewport",
   lasso: "rollback",
@@ -1375,6 +1376,23 @@ export function createStudyNotes(dependencies) {
     return url;
   }
 
+  // The PDF creation tab offers only what was chosen on the note list: the
+  // other ways to create a note stay on the list screen.
+  function preparePdfCreationSurface() {
+    const heading = byId("noteCreateTitle");
+    if (heading) heading.textContent = "PDFからノートを作成";
+    ui.createView.querySelectorAll("[data-create-note]").forEach(button => {
+      button.hidden = button.dataset.createNote !== "pdf";
+    });
+    ui.createView.querySelector(".note-create-grid")?.classList.add("single-choice");
+    const pdfChoice = ui.createView.querySelector('[data-create-note="pdf"]');
+    const label = pdfChoice?.querySelector("strong");
+    const description = pdfChoice?.querySelector("span");
+    if (label) label.textContent = "PDFファイルを選択";
+    if (description) description.textContent = "選んだPDFの全ページをノートの背景として読み込みます";
+    ui.materialPicker.classList.add("hidden");
+  }
+
   function openPdfCreationSurface() {
     const url = pdfCreationUrl().toString();
     const opened = globalThis.open?.(url, "_blank");
@@ -2223,11 +2241,13 @@ export function createStudyNotes(dependencies) {
     const uploaded = [];
     const notePages = [];
     createController = new AbortController();
+    const creationSignal = createController.signal;
     ui.createProgress.classList.remove("hidden");
     ui.createProgressBar.value = 0;
     await noteStore.createCreatingNote(noteId, { title, type: "pdf-imported", defaultBackground: { ...DEFAULT_BACKGROUND } }, session.uid);
     assertUserSession(session);
     const inFlightUploads = new Set();
+    let uploadChain = Promise.resolve();
     let uploadFailure = null;
     const settleUploads = () => Promise.allSettled([...inFlightUploads]);
     try {
@@ -2236,7 +2256,7 @@ export function createStudyNotes(dependencies) {
         ui.createProgressBar.value = percent;
         ui.createProgressLabel.textContent = `PDFを読み込んでいます ${current} / ${total}ページ（${percent}%）`;
       }, {
-        signal: createController.signal,
+        signal: creationSignal,
         onPage: async ({ file: pageFile, pageNumber, width, height, pdfRotation }) => {
           if (uploadFailure) throw uploadFailure;
           assertUserSession(session);
@@ -2246,9 +2266,14 @@ export function createStudyNotes(dependencies) {
             background: { type: "pdf-source-page", imagePath: "", sourcePageNumber: pageNumber, pdfRotation }
           };
           notePages.push(page);
-          // Upload this page while the next one renders, with a small bound
-          // on in-flight uploads (each holds one page JPEG in memory).
-          const upload = noteStore.uploadSourcePage(noteId, pageId, pageFile, session.uid)
+          // Pages upload one at a time, in page order, while the next page
+          // converts. At most PDF_UPLOAD_QUEUE_LIMIT page JPEGs wait in memory.
+          const upload = uploadChain
+            .then(() => {
+              if (uploadFailure) throw uploadFailure;
+              if (creationSignal.aborted) throw new DOMException("PDF読み込みをキャンセルしました。", "AbortError");
+              return noteStore.uploadSourcePage(noteId, pageId, pageFile, session.uid);
+            })
             .then(imagePath => {
               uploaded.push(imagePath);
               page.background.imagePath = imagePath;
@@ -2257,9 +2282,10 @@ export function createStudyNotes(dependencies) {
               uploadFailure ||= error;
               throw error;
             });
+          uploadChain = upload.catch(() => {});
           inFlightUploads.add(upload);
           upload.then(() => inFlightUploads.delete(upload), () => inFlightUploads.delete(upload));
-          while (inFlightUploads.size >= PDF_UPLOAD_CONCURRENCY && !uploadFailure) {
+          while (inFlightUploads.size >= PDF_UPLOAD_QUEUE_LIMIT && !uploadFailure) {
             await Promise.race([...inFlightUploads]).catch(() => {});
           }
           if (uploadFailure) throw uploadFailure;
@@ -7348,6 +7374,7 @@ export function createStudyNotes(dependencies) {
   bindEvents();
   setSaveState("saved");
   closeTransientUi();
+  if (dedicatedEditorCreateMode === "pdf") preparePdfCreationSurface();
   show(dedicatedEditorCreateMode ? "create" : dedicatedEditor ? "editor" : "list");
   if (dedicatedEditor && !dedicatedEditorCreateMode) setEditorStartupState("initializing");
 

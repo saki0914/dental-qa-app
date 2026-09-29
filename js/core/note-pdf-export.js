@@ -1,5 +1,6 @@
 import { assertNonEmptyBlob, sanitizeDownloadFilename } from "./file-validator.js";
 import { noteCanvasToJpeg, renderNotePageToCanvas } from "./note-renderer.js";
+import { loadPdfLib } from "./pdf-lib-loader.js";
 
 export const PDF_EXPORT_PRESETS = Object.freeze({
   compact: { label: "軽量", maxLongEdge: 1600, quality: 0.83 },
@@ -46,22 +47,8 @@ export function sanitizePdfFilename(value, fallback = "学習ノート.pdf") {
   return `${stem}.pdf`;
 }
 
-let pdfLibLoadPromise = null;
-
-async function getPdfLib() {
-  if (globalThis.PDFLib?.PDFDocument) return globalThis.PDFLib;
-  if (!pdfLibLoadPromise) {
-    pdfLibLoadPromise = import("../../vendor/pdf-lib/pdf-lib.min.js")
-      .then(() => globalThis.PDFLib)
-      .catch(error => {
-        pdfLibLoadPromise = null;
-        throw error;
-      });
-  }
-  const pdfLib = await pdfLibLoadPromise;
-  if (pdfLib?.PDFDocument) return pdfLib;
-  pdfLibLoadPromise = null;
-  throw new Error("PDF出力ライブラリを読み込めませんでした。ネットワーク接続を確認して再試行してください。");
+function getPdfLib() {
+  return loadPdfLib("PDF出力ライブラリを読み込めませんでした。ネットワーク接続を確認して再試行してください。");
 }
 
 export function getPdfPageLayout(width, height, pageNumbers = false) {
