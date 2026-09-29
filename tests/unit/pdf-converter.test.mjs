@@ -3,12 +3,10 @@ import test from "node:test";
 
 import {
   PDF_IMAGE_MAX_PIXELS,
-  PDF_RENDER_JPEG_QUALITY,
   PDF_RENDER_MAX_PIXELS,
   PDF_RENDER_MAX_SCALE,
   PDF_RENDER_RETRY_FACTORS,
   convertPdfToImageFiles,
-  createScanWorkerPool,
   normalizePdfRotation,
   pdfRenderScale
 } from "../../js/core/pdf-converter.js";
@@ -226,174 +224,30 @@ test("スキャンページは埋込みJPEGを直接描画し、失敗したペ�
   assert.deepEqual([...pdf.state.getDocumentOptions.data], [...scanBytes]);
 });
 
-// Stand-in for pdf-scan-page-worker.js. `respond(message)` returns (or
-// resolves to) the reply data for a page.
-function fakeScanWorkers(respond) {
-  const state = { created: [], messages: [], active: 0, peak: 0 };
-  const createScanWorker = () => {
-    const listeners = { message: [], error: [], messageerror: [] };
-    // `state.active` counts pages a live worker is still converting; a
-    // terminated worker stops at once, like a real one.
-    const worker = {
-      terminated: false,
-      inFlight: 0,
-      addEventListener(type, listener) { listeners[type].push(listener); },
-      postMessage(message) {
-        state.messages.push(message);
-        worker.inFlight += 1;
-        state.active += 1;
-        state.peak = Math.max(state.peak, state.active);
-        Promise.resolve(respond(message)).then(data => {
-          if (worker.terminated) return;
-          worker.inFlight -= 1;
-          state.active -= 1;
-          listeners.message.forEach(listener => listener({ data: { id: message.id, ...data } }));
-        });
-      },
-      terminate() {
-        if (worker.terminated) return;
-        worker.terminated = true;
-        state.active -= worker.inFlight;
-        worker.inFlight = 0;
-      },
-      fire(type, event) { listeners[type].forEach(listener => listener(event)); }
-    };
-    state.created.push(worker);
-    return worker;
-  };
-  return { state, createScanWorker };
-}
-
-function scanPlan(pageSize = { width: 595, height: 842 }) {
-  return {
-    jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), imageWidth: 4928, imageHeight: 7002,
-    ctm: [595, 0, 0, 842, 0, 0], clips: [], pageSize
-  };
-}
-
-const jpegReply = async () => ({ blob: new Blob(["jpeg"], { type: "image/jpeg" }) });
-
-test("スキャンページはworkerで2ページずつ並行して変換し、ページ順に渡す", async () => {
+test("スキャンページは1ページずつデコードし、2ページ分のデコードを同時にメモリへ置かない", async () => {
   const pdf = fakePdf({ pageSizes: [[595, 842], [595, 842], [595, 842], [595, 842]] });
-  const workers = fakeScanWorkers(async message => {
-    // Page 1 finishes after page 2.
-    await new Promise(resolve => setTimeout(resolve, message.pageNumber === 1 ? 20 : 1));
-    return jpegReply();
-  });
+  const plan = {
+    jpeg: new Uint8Array([0xff, 0xd8]), imageWidth: 4928, imageHeight: 7002, ctm: [595, 0, 0, 842, 0, 0], clips: [],
+    pageSize: { width: 595, height: 842 }
+  };
+  let decoding = 0;
+  let peak = 0;
   const pages = [];
   await convertPdfToImageFiles(pdfFile(), null, {
     pdfjsLib: pdf.lib,
     createCanvas: pdf.createCanvas,
     wait: noWait,
-    openScannedPages: async () => ({ pageCount: 4, planForPage: () => scanPlan() }),
-    createScanWorker: workers.createScanWorker,
-    onPage: async page => { pages.push(page); }
-  });
-  assert.deepEqual(pages.map(page => page.pageNumber), [1, 2, 3, 4], "ページ順に渡す");
-  assert.ok(pages.every(page => page.worker && page.renderer === "scan"));
-  assert.deepEqual(pages.map(page => [page.width, page.height]), pages.map(() => [1904, 2694]), "本体と同じ寸法");
-  assert.equal(pdf.state.attempts.length, 0, "本体ではpdf.jsで描かない");
-  assert.equal(workers.state.created.length, 2);
-  assert.equal(workers.state.peak, 2, "同時に変換するのはworker数まで");
-  const [first] = workers.state.messages;
-  assert.ok(first.plan.jpeg instanceof Blob, "ページのJPEGだけを送る");
-  assert.equal(first.plan.jpeg.size, 4);
-  assert.equal(first.quality, PDF_RENDER_JPEG_QUALITY);
-  assert.deepEqual([first.width, first.height], [1904, 2694]);
-  assert.ok(workers.state.created.every(worker => worker.terminated), "変換後にworkerを終了する");
-});
-
-test("workerで変換できないページは本体で描き直し、以降は1ページずつ本体で変換する", async t => {
-  t.mock.method(console, "warn", () => {});
-  const pdf = fakePdf({ pageSizes: [[595, 842], [595, 842], [595, 842], [595, 842]] });
-  let mainDraws = 0;
-  let overlapped = false;
-  const workers = fakeScanWorkers(async message => {
-    // Page 1 succeeds; page 2 fails while page 3 is still converting.
-    await new Promise(resolve => setTimeout(resolve, { 1: 1, 2: 10 }[message.pageNumber] ?? 30));
-    return message.pageNumber === 2 ? { error: "decode failed" } : jpegReply();
-  });
-  const pages = [];
-  await convertPdfToImageFiles(pdfFile(), null, {
-    pdfjsLib: pdf.lib,
-    createCanvas: pdf.createCanvas,
-    wait: noWait,
-    openScannedPages: async () => ({ pageCount: 4, planForPage: () => scanPlan() }),
-    createScanWorker: workers.createScanWorker,
+    openScannedPages: async () => ({ pageCount: 4, planForPage: () => plan }),
     decodeImage: async () => {
-      if (workers.state.active) overlapped = true;
-      mainDraws += 1;
-      return { close() {} };
+      decoding += 1;
+      peak = Math.max(peak, decoding);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      return { close() { decoding -= 1; } };
     },
-    onPage: async page => { pages.push(page); }
+    // Pages are handed over faster than they upload: conversion must still
+    // not start the next decode before the previous one is released.
+    onPage: async page => { pages.push(page.pageNumber); }
   });
-  assert.deepEqual(pages.map(page => page.pageNumber), [1, 2, 3, 4]);
-  assert.deepEqual(pages.map(page => page.worker), [true, false, false, false]);
-  assert.ok(pages.every(page => page.renderer === "scan"), "本体でも埋込みJPEGから描く");
-  assert.equal(mainDraws, 3);
-  assert.equal(overlapped, false, "本体の描画はworkerの変換と重ねない");
-});
-
-test("2ページ以下のPDFはworkerを起動せず本体で変換する", async () => {
-  const pdf = fakePdf({ pageSizes: [[595, 842], [595, 842]] });
-  const workers = fakeScanWorkers(jpegReply);
-  const pages = [];
-  await convertPdfToImageFiles(pdfFile(), null, {
-    pdfjsLib: pdf.lib,
-    createCanvas: pdf.createCanvas,
-    wait: noWait,
-    openScannedPages: async () => ({ pageCount: 2, planForPage: () => scanPlan() }),
-    createScanWorker: workers.createScanWorker,
-    decodeImage: async () => ({ close() {} }),
-    onPage: async page => { pages.push(page); }
-  });
-  assert.equal(workers.state.created.length, 0);
-  assert.deepEqual(pages.map(page => [page.renderer, page.worker]), [["scan", false], ["scan", false]]);
-});
-
-test("pdf-libとpdf.jsで寸法が合わないページとスキャンでないページは本体のpdf.jsで描く", async () => {
-  const pdf = fakePdf({ pageSizes: [[595, 842], [612, 792], [595, 842]] });
-  const workers = fakeScanWorkers(jpegReply);
-  const pages = [];
-  await convertPdfToImageFiles(pdfFile(), null, {
-    pdfjsLib: pdf.lib,
-    createCanvas: pdf.createCanvas,
-    wait: noWait,
-    openScannedPages: async () => ({ pageCount: 3, planForPage: pageNumber => [scanPlan(), scanPlan(), null][pageNumber - 1] }),
-    createScanWorker: workers.createScanWorker,
-    onPage: async page => { pages.push(page); }
-  });
-  assert.deepEqual(pages.map(page => [page.pageNumber, page.worker, page.renderer]), [
-    [1, true, "scan"], [2, false, "pdfjs"], [3, false, "pdfjs"]
-  ]);
-  assert.deepEqual(pdf.state.attempts.map(attempt => attempt.pageNumber), [2, 3]);
-});
-
-test("応答しない・起動できないworkerは失敗として扱い、待っているページも返す", async () => {
-  const timers = [];
-  const hung = fakeScanWorkers(() => new Promise(() => {}));
-  const pool = createScanWorkerPool({
-    size: 1,
-    createWorker: hung.createScanWorker,
-    timeoutMs: 1000,
-    setTimer: (callback, ms) => { timers.push({ callback, ms }); return timers.length; },
-    clearTimer: () => {}
-  });
-  const first = pool.render({ pageNumber: 1 });
-  const second = pool.render({ pageNumber: 2 });
-  assert.equal(timers.length, 1, "送ったページだけ時間を計る");
-  timers[0].callback();
-  await assert.rejects(first, /時間内に終わりませんでした/);
-  await assert.rejects(second, /時間内に終わりませんでした/);
-  assert.equal(pool.failed, true);
-  await assert.rejects(pool.render({ pageNumber: 3 }), /時間内に終わりませんでした/);
-  pool.close();
-  assert.equal(hung.state.created[0].terminated, true);
-
-  const broken = fakeScanWorkers(() => new Promise(() => {}));
-  const brokenPool = createScanWorkerPool({ size: 2, createWorker: broken.createScanWorker });
-  const pending = brokenPool.render({ pageNumber: 1 });
-  broken.state.created[1].fire("error", { message: "module failed", preventDefault() {} });
-  await assert.rejects(pending, /module failed/);
-  brokenPool.close();
+  assert.deepEqual(pages, [1, 2, 3, 4]);
+  assert.equal(peak, 1);
 });

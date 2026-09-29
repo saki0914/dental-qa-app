@@ -3464,32 +3464,34 @@ async function backgroundQuadrantColors(page) {
   });
 }
 
-async function createNoteFromScanPdf(page, { workerAvailable }) {
+test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文字・回転ページ）は埋込みJPEGを直接描画して向きどおりにノート化する", async ({ page }) => {
+  test.setTimeout(120_000);
   const blockedRequests = await guardProductionFirebase(page);
   const pageErrors = [];
   const onPageError = error => recordUnexpectedPageError(pageErrors, error);
   page.on("pageerror", onPageError);
   await page.context().addInitScript(() => {
-    const count = key => sessionStorage.setItem(key, String(Number(sessionStorage.getItem(key) || 0) + 1));
     const original = window.createImageBitmap?.bind(window);
-    if (original) {
-      window.createImageBitmap = (source, ...rest) => {
-        if (source instanceof Blob && source.type === "image/jpeg") count("scanJpegDecodes");
-        return original(source, ...rest);
-      };
-    }
-    // Scanned pages normally convert in pdf-scan-page-worker.js.
-    const OriginalWorker = window.Worker;
-    if (OriginalWorker) {
-      window.Worker = class extends OriginalWorker {
-        constructor(...args) {
-          super(...args);
-          if (String(args[0]).includes("pdf-scan-page-worker")) {
-            this.addEventListener("message", event => { if (event.data?.blob) count("scanWorkerPages"); });
-          }
-        }
-      };
-    }
+    if (!original) return;
+    let decoding = 0;
+    window.createImageBitmap = async (source, ...rest) => {
+      if (!(source instanceof Blob && source.type === "image/jpeg")) return original(source, ...rest);
+      sessionStorage.setItem("scanJpegDecodes", String(Number(sessionStorage.getItem("scanJpegDecodes") || 0) + 1));
+      decoding += 1;
+      sessionStorage.setItem("scanJpegPeak", String(Math.max(decoding, Number(sessionStorage.getItem("scanJpegPeak") || 0))));
+      try {
+        const bitmap = await original(source, ...rest);
+        const close = bitmap.close.bind(bitmap);
+        bitmap.close = () => {
+          decoding -= 1;
+          close();
+        };
+        return bitmap;
+      } catch (error) {
+        decoding -= 1;
+        throw error;
+      }
+    };
   });
   const user = await createUser();
   await login(page, user);
@@ -3507,7 +3509,6 @@ async function createNoteFromScanPdf(page, { workerAvailable }) {
   const rotated = scan.addPage([400, 550]);
   rotated.setRotation(degrees(90));
   rotated.drawImage(image, { x: 0, y: 0, width: 400, height: 550 });
-  // Three pages: shorter documents are converted without the workers.
   const rotatedBack = scan.addPage([400, 550]);
   rotatedBack.setRotation(degrees(270));
   rotatedBack.drawImage(image, { x: 0, y: 0, width: 400, height: 550 });
@@ -3518,11 +3519,6 @@ async function createNoteFromScanPdf(page, { workerAvailable }) {
   await page.locator('[data-create-note="pdf"]').click();
   page = await popupPromise;
   await guardProductionFirebase(page, blockedRequests);
-  if (!workerAvailable) {
-    // A missing worker script (for example a partly updated deploy) must
-    // leave the main-thread conversion working.
-    await page.route("**/js/workers/pdf-scan-page-worker.js", route => route.fulfill({ status: 404, body: "not found" }));
-  }
   page.on("pageerror", onPageError);
   await expect(page.locator("#noteCreateView")).toBeVisible();
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
@@ -3530,11 +3526,11 @@ async function createNoteFromScanPdf(page, { workerAvailable }) {
   await page.locator('[data-create-note="pdf"]').click();
   await (await fileChooserPromise).setFiles({ name: "scan.pdf", mimeType: "application/pdf", buffer: fixture });
   await page.waitForURL(url => url.searchParams.get("noteEditor") === "1" && Boolean(url.searchParams.get("noteId")), { timeout: 120_000 });
-  const drawnFromScan = await page.evaluate(() => ({
-    worker: Number(sessionStorage.getItem("scanWorkerPages") || 0),
-    mainThread: Number(sessionStorage.getItem("scanJpegDecodes") || 0)
+  const decodes = await page.evaluate(() => ({
+    pages: Number(sessionStorage.getItem("scanJpegDecodes") || 0),
+    atOnce: Number(sessionStorage.getItem("scanJpegPeak") || 0)
   }));
-  expect(drawnFromScan, "全ページを埋込みJPEGから描画する").toEqual(workerAvailable ? { worker: 3, mainThread: 0 } : { worker: 0, mainThread: 3 });
+  expect(decodes, "全ページを埋込みJPEGから、1ページずつ描画する").toEqual({ pages: 3, atOnce: 1 });
 
   await expect(page.locator("#notePageCounter")).toHaveText("1 / 3", { timeout: 60_000 });
   const first = await backgroundQuadrantColors(page);
@@ -3553,16 +3549,6 @@ async function createNoteFromScanPdf(page, { workerAvailable }) {
   expect(third.size[0] / third.size[1]).toBeCloseTo(550 / 400, 2);
   expect(blockedRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
-}
-
-test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文字・回転ページ）は埋込みJPEGを直接描画して向きどおりにノート化する", async ({ page }) => {
-  test.setTimeout(120_000);
-  await createNoteFromScanPdf(page, { workerAvailable: true });
-});
-
-test("@authenticated スキャンPDFの変換用workerを読み込めなくても本体で同じ向きどおりにノート化する", async ({ page }) => {
-  test.setTimeout(120_000);
-  await createNoteFromScanPdf(page, { workerAvailable: false });
 });
 
 test("@authenticated @ipad-page-coordinates 縦横・16:9・回転混在PDFは全レイヤーと9地点を同じページ座標へ投影する", async ({ page }) => {
