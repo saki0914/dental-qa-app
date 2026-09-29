@@ -422,6 +422,7 @@ studyNotes = createStudyNotes({
   }),
   getDb: () => db,
   getStorage: () => storage,
+  usesFirebaseEmulator: () => useFirebaseEmulators,
   getMaterials: () => imageMemory.getMaterials(),
   startupMetrics: noteEditorStartupMetrics,
   prepareNoteResources: async note => {

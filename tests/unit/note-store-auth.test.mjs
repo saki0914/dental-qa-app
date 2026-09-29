@@ -25,6 +25,7 @@ test("全NoteStore APIはexpectedUidなしでFirebase SDKへ到達しない", as
     abortCreatingNote: () => store.abortCreatingNote("note"),
     cleanupStuckCreatingNotes: () => store.cleanupStuckCreatingNotes(),
     markCreationFailed: () => store.markCreationFailed("note"),
+    journalSourcePages: () => store.journalSourcePages("note", ["page"]),
     uploadSourcePage: () => store.uploadSourcePage("note", "page", blob),
     deleteStoragePaths: () => store.deleteStoragePaths([]),
     loadPageContent: () => store.loadPageContent("note", { pageId: "page", contentPath: "" }),

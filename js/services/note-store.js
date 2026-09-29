@@ -128,9 +128,15 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
   const assetRef = (db, uid, noteId, assetId) => doc(db, "users", uid, "notes", noteId, "assets", assetId);
   const materialsRef = (db, uid) => doc(db, "users", uid, "app", "pdfMaterials");
 
-  async function journalStoragePath(noteId, path, expectedUid) {
+  function journalStoragePath(noteId, path, expectedUid) {
+    return journalStoragePaths(noteId, [path], expectedUid);
+  }
+
+  async function journalStoragePaths(noteId, paths, expectedUid) {
     const { uid, db } = writeContext(expectedUid);
     const reference = noteRef(db, uid, noteId);
+    const requested = [...new Set(paths.filter(path => typeof path === "string" && path))];
+    if (!requested.length) throw new Error("記録するStorageパスがありません。");
     // A plain read followed by an atomic arrayUnion keeps every check of the
     // former read-modify-write transaction (missing, deleted or failed notes
     // and a full journal are rejected before anything is uploaded) without
@@ -150,12 +156,13 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     if (currentPaths.size > MAX_PENDING_STORAGE_PATHS) {
       throw new Error("未確認のStorageパスが上限を超えているため、クリーンアップ完了までアップロードできません。");
     }
-    if (!currentPaths.has(path) && currentPaths.size >= MAX_PENDING_STORAGE_PATHS) {
+    const added = requested.filter(path => !currentPaths.has(path));
+    if (currentPaths.size + added.length > MAX_PENDING_STORAGE_PATHS) {
       throw new Error("未確認のStorageパスが上限に達したため、新しいアップロードを開始できません。");
     }
     context(expectedUid);
     await updateDoc(reference, {
-      pendingStoragePaths: arrayUnion(path),
+      pendingStoragePaths: arrayUnion(...requested),
       updatedAt: serverTimestamp()
     });
   }
@@ -588,18 +595,33 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     return results;
   }
 
-  async function uploadSourcePage(noteId, pageId, blob, expectedUid) {
+  const sourcePagePath = (uid, noteId, pageId) => `users/${uid}/notes/${noteId}/sourcePages/${pageId}/background.jpg`;
+
+  // Records the page image paths of a note being created in one write, before
+  // any of them is uploaded, so that the uploads need no Firestore round trip
+  // each. Returns the paths in `pageIds` order.
+  async function journalSourcePages(noteId, pageIds, expectedUid) {
+    const { uid } = writeContext(expectedUid);
+    const paths = pageIds.map(pageId => sourcePagePath(uid, noteId, pageId));
+    await journalStoragePaths(noteId, paths, expectedUid);
+    return paths;
+  }
+
+  // `journaled`: the path is already recorded by journalSourcePages. It stays
+  // recorded when the upload fails, because a failed request may still have
+  // stored the object; the caller deletes it with the creation compensation.
+  async function uploadSourcePage(noteId, pageId, blob, expectedUid, { journaled = false } = {}) {
     requireExpectedUid(expectedUid);
     validateImageBlob(blob, { label: "PDFページ画像", allowedTypes: ["image/jpeg"] });
     const { uid, storage } = context(expectedUid);
-    const path = `users/${uid}/notes/${noteId}/sourcePages/${pageId}/background.jpg`;
+    const path = sourcePagePath(uid, noteId, pageId);
     context(expectedUid);
-    await journalStoragePath(noteId, path, expectedUid);
+    if (!journaled) await journalStoragePath(noteId, path, expectedUid);
     try {
       context(expectedUid);
       await uploadBytes(storageRef(storage, path), blob, { contentType: "image/jpeg" });
     } catch (error) {
-      await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
+      if (!journaled) await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
       throw error;
     }
     return path;
@@ -1124,7 +1146,7 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
   return {
     listNoteDocuments, listNotes, getNote, listNotesByMaterial, listPages, createNote, createCreatingNote, finalizeCreatingNote,
     finalizeNoteCreation, abortCreatingNote, cleanupStuckCreatingNotes, markCreationFailed,
-    uploadSourcePage, uploadRecoveredBackground, deleteStoragePaths, loadPageContent, savePageContent, enqueuePageContentSave, uploadAsset, getAsset,
+    journalSourcePages, uploadSourcePage, uploadRecoveredBackground, deleteStoragePaths, loadPageContent, savePageContent, enqueuePageContentSave, uploadAsset, getAsset,
     getStorageBlob, cleanupStoragePath, updatePageOrder, createPage, deletePage, updatePage, updatePages, updateNote,
     deleteMaterialLinkedNotes, restoreNote, deleteNote
   };

@@ -1,4 +1,5 @@
-import { convertPdfToImageFiles } from "../core/pdf-converter.js";
+import { convertPdfToImageFiles, getPdfJsLibForConvert } from "../core/pdf-converter.js";
+import { loadPdfLib } from "../core/pdf-lib-loader.js";
 import {
   MAX_NOTE_IMAGE_BYTES,
   MAX_NOTE_IMAGE_HEIGHT,
@@ -29,7 +30,7 @@ import {
   translateElement
 } from "../core/note-geometry.js";
 import { randomId } from "../core/id.js";
-import { runWithConcurrency } from "../core/bounded-concurrency.js";
+import { createTaskQueue, runWithConcurrency } from "../core/bounded-concurrency.js";
 import { chooseClipboardImage, imageFileFromPasteEvent, isTextEditingTarget, readClipboardImage } from "../core/note-clipboard.js";
 import { createNoteBackgroundSignature } from "../core/note-background.js";
 import { resolveNoteConflicts } from "../core/note-conflict-resolution.js";
@@ -144,8 +145,10 @@ const TOOL_LABELS = {
   text: "テキスト", image: "画像", mask: "暗記マスク", study: "暗記モード"
 };
 const NOTE_COPY_CONCURRENCY = 3;
-// Page images waiting for or in upload while the next page converts.
-const PDF_UPLOAD_QUEUE_LIMIT = 2;
+// PDF page images upload while later pages convert: at most this many at
+// once, with at most PDF_UPLOAD_QUEUE_CAPACITY more converted pages waiting.
+const PDF_UPLOAD_CONCURRENCY = 3;
+const PDF_UPLOAD_QUEUE_CAPACITY = 2;
 // Dedicated editor startup actions (see updateStartupActions).
 const SLOW_STARTUP_ACTIONS = new Set(["reload", "list", "copy-diagnostics"]);
 const SESSION_STARTUP_ACTIONS = new Set(["local", "cloud", "readonly"]);
@@ -222,6 +225,7 @@ export function createStudyNotes(dependencies) {
     prepareNoteResources = async () => {},
     ensureMaterialDefaultNoteId = null,
     activateSection = () => {},
+    usesFirebaseEmulator = () => false,
     startupMetrics = {
       enabled: false,
       mark: () => null,
@@ -1410,6 +1414,10 @@ export function createStudyNotes(dependencies) {
     if (label) label.textContent = "PDFファイルを選択";
     if (description) description.textContent = "選んだPDFの全ページをノートの背景として読み込みます";
     ui.materialPicker.classList.add("hidden");
+    // Load the PDF libraries while the file is being chosen. A failure here
+    // is retried when the conversion itself loads them.
+    void getPdfJsLibForConvert().catch(error => console.debug("PDF変換ライブラリを先読みできませんでした。", error));
+    void loadPdfLib().catch(error => console.debug("PDFライブラリを先読みできませんでした。", error));
   }
 
   function openPdfCreationSurface() {
@@ -2257,18 +2265,26 @@ export function createStudyNotes(dependencies) {
     assertUserSession(session);
     const title = ui.newTitle.value.trim() || file.name.replace(/\.pdf$/i, "") || "PDFノート";
     const noteId = randomId();
-    const uploaded = [];
     const notePages = [];
+    // Every page image path whose upload started. A failed request may still
+    // have stored its object, so the compensation deletes all of them.
+    const startedPaths = [];
     createController = new AbortController();
     const creationSignal = createController.signal;
     ui.createProgress.classList.remove("hidden");
     ui.createProgressBar.value = 0;
     await noteStore.createCreatingNote(noteId, { title, type: "pdf-imported", defaultBackground: { ...DEFAULT_BACKGROUND } }, session.uid);
     assertUserSession(session);
-    const inFlightUploads = new Set();
-    let uploadChain = Promise.resolve();
-    let uploadFailure = null;
-    const settleUploads = () => Promise.allSettled([...inFlightUploads]);
+    // The Storage Emulator (firebase-tools 15.24) sometimes never answers
+    // uploads made at the same moment: its rules runtime reads two replies
+    // that arrive together as one malformed message and drops both. Uploads
+    // to it therefore go one at a time.
+    const uploads = createTaskQueue({
+      concurrency: usesFirebaseEmulator() ? 1 : PDF_UPLOAD_CONCURRENCY,
+      capacity: PDF_UPLOAD_QUEUE_CAPACITY
+    });
+    let pageIds = [];
+    let journal = null;
     try {
       await convertPdfToImageFiles(file, (current, total) => {
         const percent = Math.round(current / total * 100);
@@ -2276,43 +2292,35 @@ export function createStudyNotes(dependencies) {
         ui.createProgressLabel.textContent = `PDFを読み込んでいます ${current} / ${total}ページ（${percent}%）`;
       }, {
         signal: creationSignal,
+        onDocument: ({ pageCount }) => {
+          pageIds = Array.from({ length: pageCount }, () => randomId());
+          // One journal write for every page image, made while the first
+          // page converts, instead of a read and a write before each upload.
+          journal = noteStore.journalSourcePages(noteId, pageIds, session.uid);
+          journal.catch(() => {});
+        },
         onPage: async ({ file: pageFile, pageNumber, width, height, pdfRotation }) => {
-          if (uploadFailure) throw uploadFailure;
           assertUserSession(session);
-          const pageId = randomId();
+          const pageId = pageIds[pageNumber - 1];
+          if (!pageId || !journal) throw new Error("PDFのページ情報を準備できませんでした。");
           const page = {
             pageId, order: pageNumber, pageType: "pdf-source-page", size: { width, height },
             background: { type: "pdf-source-page", imagePath: "", sourcePageNumber: pageNumber, pdfRotation }
           };
           notePages.push(page);
-          // Pages upload one at a time, in page order, while the next page
-          // converts. At most PDF_UPLOAD_QUEUE_LIMIT page JPEGs wait in memory.
-          const upload = uploadChain
-            .then(() => {
-              if (uploadFailure) throw uploadFailure;
-              if (creationSignal.aborted) throw new DOMException("PDF読み込みをキャンセルしました。", "AbortError");
-              return noteStore.uploadSourcePage(noteId, pageId, pageFile, session.uid);
-            })
-            .then(imagePath => {
-              uploaded.push(imagePath);
-              page.background.imagePath = imagePath;
-            })
-            .catch(error => {
-              uploadFailure ||= error;
-              throw error;
-            });
-          uploadChain = upload.catch(() => {});
-          inFlightUploads.add(upload);
-          upload.then(() => inFlightUploads.delete(upload), () => inFlightUploads.delete(upload));
-          while (inFlightUploads.size >= PDF_UPLOAD_QUEUE_LIMIT && !uploadFailure) {
-            await Promise.race([...inFlightUploads]).catch(() => {});
-          }
-          if (uploadFailure) throw uploadFailure;
+          // Resolves once the upload has started or is queued; waits while
+          // the queue is full, so few converted pages wait in memory.
+          await uploads.add(async () => {
+            const paths = await journal;
+            if (creationSignal.aborted) throw new DOMException("PDF読み込みをキャンセルしました。", "AbortError");
+            assertUserSession(session);
+            startedPaths.push(paths[pageNumber - 1]);
+            page.background.imagePath = await noteStore.uploadSourcePage(noteId, pageId, pageFile, session.uid, { journaled: true });
+          });
         }
       });
-      if (inFlightUploads.size) ui.createProgressLabel.textContent = "ページ画像の保存を完了しています…";
-      await settleUploads();
-      if (uploadFailure) throw uploadFailure;
+      if (uploads.pending) ui.createProgressLabel.textContent = "ページ画像の保存を完了しています…";
+      await uploads.drain();
       assertUserSession(session);
       if (!notePages.length) throw new Error("PDFにページがありません。");
       await noteStore.finalizeCreatingNote(noteId, notePages, session.uid);
@@ -2326,12 +2334,14 @@ export function createStudyNotes(dependencies) {
         });
       }
     } catch (error) {
-      // Every started upload must settle first so its path is either in
-      // `uploaded` (and deleted below) or already removed from the journal.
-      await settleUploads();
+      // Let the journal write and every started upload settle first: the
+      // compensation then deletes every path that may have been stored, and
+      // its failure record replaces the journal instead of being overtaken.
+      await journal?.catch(() => {});
+      await uploads.settle();
       await compensateCreationFailure(noteId, {
         pageIds: notePages.map(page => page.pageId),
-        storagePaths: uploaded,
+        storagePaths: startedPaths,
         phase: error?.name === "AbortError" ? "cancelled" : "pdf-import",
         expectedUid: session.uid
       }, error);

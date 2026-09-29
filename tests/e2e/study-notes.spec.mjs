@@ -3351,6 +3351,81 @@ test("@authenticated @ipad-v-next PDFを教材へ追加せずノート専用Stor
   expect(pageErrors).toEqual([]);
 });
 
+test("@authenticated PDFノート作成中にページ画像の保存が失敗したら開始済みの画像を全て消して失敗を記録する", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  const onPageError = error => recordUnexpectedPageError(pageErrors, error);
+  page.on("pageerror", onPageError);
+  const user = await createUser();
+  await login(page, user);
+  const fixture = await createPdfFixture({ pageCount: 5 });
+
+  await page.locator("#newNoteBtn").click();
+  const createPopupPromise = page.waitForEvent("popup", { timeout: 120_000 });
+  await page.locator('[data-create-note="pdf"]').click();
+  page = await createPopupPromise;
+  await guardProductionFirebase(page, blockedRequests);
+  page.on("pageerror", onPageError);
+  const dialogs = [];
+  page.on("dialog", async dialog => {
+    dialogs.push(dialog.message());
+    await dialog.dismiss();
+  });
+  await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
+  const uploadPaths = [];
+  const deletedPaths = [];
+  await page.route(/127\.0\.0\.1:9199\/v0\/b\/[^/]+\/o/, async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() === "POST" && url.searchParams.get("name")?.includes("/sourcePages/")) {
+      uploadPaths.push(url.searchParams.get("name"));
+      if (uploadPaths.length === 2) {
+        await route.fulfill({
+          status: 403,
+          contentType: "application/json",
+          body: JSON.stringify({ error: { code: 403, message: "forced second-page failure" } })
+        });
+        return;
+      }
+    } else if (request.method() === "DELETE") {
+      deletedPaths.push(decodeURIComponent(url.pathname.split("/o/")[1] || ""));
+    }
+    await route.fallback();
+  });
+  await page.locator("#newNoteTitle").fill("保存失敗E2E PDFノート");
+  const fileChooserPromise = page.waitForEvent("filechooser");
+  await page.locator('[data-create-note="pdf"]').click();
+  await (await fileChooserPromise).setFiles({ name: "five-pages.pdf", mimeType: "application/pdf", buffer: fixture });
+
+  await expect.poll(() => dialogs.length, { timeout: 90_000 }).toBe(1);
+  expect(dialogs[0]).toContain("PDFノートは作成されていません。");
+  const stored = await readNotes(user.uid);
+  expect(stored.notes).toHaveLength(1);
+  const [note] = stored.notes;
+  expect(note).toMatchObject({ title: "保存失敗E2E PDFノート", status: "failed", errorPhase: "pdf-import" });
+  expect(note.pendingStoragePaths || [], "消し残しがないので記録も残らない").toEqual([]);
+  expect(note.pages).toEqual([]);
+  expect(uploadPaths.length).toBeGreaterThanOrEqual(2);
+  expect(new Set(uploadPaths).size).toBe(uploadPaths.length);
+  for (const path of uploadPaths) {
+    expect(path).toContain(`users/${user.uid}/notes/${note.id}/sourcePages/`);
+    expect(deletedPaths, "失敗した要求の画像も含め、開始した画像はすべて削除する").toContain(path);
+  }
+  const token = await (await fetch("http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=demo-api-key", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: user.email, password: user.password, returnSecureToken: true })
+  }).then(response => response.json())).idToken;
+  for (const path of uploadPaths) {
+    const response = await fetch(`http://127.0.0.1:9199/v0/b/demo-dental-qa.firebasestorage.app/o/${encodeURIComponent(path)}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    expect(response.status, path).toBe(404);
+  }
+  expect(blockedRequests).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
 // Four-color scan image made by the browser: red top-left, green top-right,
 // blue bottom-left, amber bottom-right.
 async function createScanJpeg(page) {
@@ -3389,21 +3464,32 @@ async function backgroundQuadrantColors(page) {
   });
 }
 
-test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文字・回転ページ）は埋込みJPEGを直接描画して向きどおりにノート化する", async ({ page }) => {
-  test.setTimeout(120_000);
+async function createNoteFromScanPdf(page, { workerAvailable }) {
   const blockedRequests = await guardProductionFirebase(page);
   const pageErrors = [];
   const onPageError = error => recordUnexpectedPageError(pageErrors, error);
   page.on("pageerror", onPageError);
   await page.context().addInitScript(() => {
+    const count = key => sessionStorage.setItem(key, String(Number(sessionStorage.getItem(key) || 0) + 1));
     const original = window.createImageBitmap?.bind(window);
-    if (!original) return;
-    window.createImageBitmap = (source, ...rest) => {
-      if (source instanceof Blob && source.type === "image/jpeg") {
-        sessionStorage.setItem("scanJpegDecodes", String(Number(sessionStorage.getItem("scanJpegDecodes") || 0) + 1));
-      }
-      return original(source, ...rest);
-    };
+    if (original) {
+      window.createImageBitmap = (source, ...rest) => {
+        if (source instanceof Blob && source.type === "image/jpeg") count("scanJpegDecodes");
+        return original(source, ...rest);
+      };
+    }
+    // Scanned pages normally convert in pdf-scan-page-worker.js.
+    const OriginalWorker = window.Worker;
+    if (OriginalWorker) {
+      window.Worker = class extends OriginalWorker {
+        constructor(...args) {
+          super(...args);
+          if (String(args[0]).includes("pdf-scan-page-worker")) {
+            this.addEventListener("message", event => { if (event.data?.blob) count("scanWorkerPages"); });
+          }
+        }
+      };
+    }
   });
   const user = await createUser();
   await login(page, user);
@@ -3421,6 +3507,10 @@ test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文
   const rotated = scan.addPage([400, 550]);
   rotated.setRotation(degrees(90));
   rotated.drawImage(image, { x: 0, y: 0, width: 400, height: 550 });
+  // Three pages: shorter documents are converted without the workers.
+  const rotatedBack = scan.addPage([400, 550]);
+  rotatedBack.setRotation(degrees(270));
+  rotatedBack.drawImage(image, { x: 0, y: 0, width: 400, height: 550 });
   const fixture = Buffer.from(await scan.save());
 
   await page.locator("#newNoteBtn").click();
@@ -3428,6 +3518,11 @@ test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文
   await page.locator('[data-create-note="pdf"]').click();
   page = await popupPromise;
   await guardProductionFirebase(page, blockedRequests);
+  if (!workerAvailable) {
+    // A missing worker script (for example a partly updated deploy) must
+    // leave the main-thread conversion working.
+    await page.route("**/js/workers/pdf-scan-page-worker.js", route => route.fulfill({ status: 404, body: "not found" }));
+  }
   page.on("pageerror", onPageError);
   await expect(page.locator("#noteCreateView")).toBeVisible();
   await expect(page.locator("#authStatus")).toContainText(user.email, { timeout: 20_000 });
@@ -3435,20 +3530,39 @@ test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文
   await page.locator('[data-create-note="pdf"]').click();
   await (await fileChooserPromise).setFiles({ name: "scan.pdf", mimeType: "application/pdf", buffer: fixture });
   await page.waitForURL(url => url.searchParams.get("noteEditor") === "1" && Boolean(url.searchParams.get("noteId")), { timeout: 120_000 });
-  expect(await page.evaluate(() => Number(sessionStorage.getItem("scanJpegDecodes") || 0)), "両ページを埋込みJPEGから描画する").toBe(2);
+  const drawnFromScan = await page.evaluate(() => ({
+    worker: Number(sessionStorage.getItem("scanWorkerPages") || 0),
+    mainThread: Number(sessionStorage.getItem("scanJpegDecodes") || 0)
+  }));
+  expect(drawnFromScan, "全ページを埋込みJPEGから描画する").toEqual(workerAvailable ? { worker: 3, mainThread: 0 } : { worker: 0, mainThread: 3 });
 
-  await expect(page.locator("#notePageCounter")).toHaveText("1 / 2", { timeout: 60_000 });
+  await expect(page.locator("#notePageCounter")).toHaveText("1 / 3", { timeout: 60_000 });
   const first = await backgroundQuadrantColors(page);
   expect(first).toMatchObject({ topLeft: "red", topRight: "green", bottomLeft: "blue", bottomRight: "amber" });
   expect(first.size[0] / first.size[1]).toBeCloseTo(400 / 550, 2);
   await openPageSidebar(page);
   await page.locator('#notePageList [aria-label="2ページを開く"]').click();
-  await expect(page.locator("#notePageCounter")).toHaveText("2 / 2");
+  await expect(page.locator("#notePageCounter")).toHaveText("2 / 3");
   const second = await backgroundQuadrantColors(page);
   expect(second, "90度回転ページは時計回りに回した向き").toMatchObject({ topLeft: "blue", topRight: "red", bottomLeft: "amber", bottomRight: "green" });
   expect(second.size[0] / second.size[1]).toBeCloseTo(550 / 400, 2);
+  await page.locator('#notePageList [aria-label="3ページを開く"]').click();
+  await expect(page.locator("#notePageCounter")).toHaveText("3 / 3");
+  const third = await backgroundQuadrantColors(page);
+  expect(third, "270度回転ページは反時計回りに回した向き").toMatchObject({ topLeft: "green", topRight: "amber", bottomLeft: "red", bottomRight: "blue" });
+  expect(third.size[0] / third.size[1]).toBeCloseTo(550 / 400, 2);
   expect(blockedRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
+}
+
+test("@authenticated @ipad-v-next スキャンPDF（全面JPEG・不可視OCR文字・回転ページ）は埋込みJPEGを直接描画して向きどおりにノート化する", async ({ page }) => {
+  test.setTimeout(120_000);
+  await createNoteFromScanPdf(page, { workerAvailable: true });
+});
+
+test("@authenticated スキャンPDFの変換用workerを読み込めなくても本体で同じ向きどおりにノート化する", async ({ page }) => {
+  test.setTimeout(120_000);
+  await createNoteFromScanPdf(page, { workerAvailable: false });
 });
 
 test("@authenticated @ipad-page-coordinates 縦横・16:9・回転混在PDFは全レイヤーと9地点を同じページ座標へ投影する", async ({ page }) => {
