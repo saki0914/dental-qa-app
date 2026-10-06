@@ -108,6 +108,8 @@ import {
   textLineBaselines
 } from "../core/note-text-layout.js";
 import { pageSwipeReleaseVelocity, pageSwipeVisualOffset, resolvePageSwipe, resolvePageSwipeIntent } from "../core/note-page-swipe.js";
+import { createPanMomentum, panReleaseVelocity } from "../core/note-pan-momentum.js";
+import { createTwoFingerTapRecognizer } from "../core/note-two-finger-tap.js";
 import { createNoteThumbnailSignature } from "../core/note-thumbnail.js";
 import {
   cancelledStrokeCanBeCommitted,
@@ -120,7 +122,7 @@ import {
   transientUiCanTransition,
   transientUiIsSettings
 } from "../core/note-transient-ui.js";
-import { noteCanvasToJpeg, renderNotePageToCanvas } from "../core/note-renderer.js";
+import { noteCanvasToJpeg, renderNotePageToCanvas, scaleImageBlobToCanvas } from "../core/note-renderer.js";
 import { createPageZoomController } from "../core/page-zoom-controller.js";
 import {
   PDF_EXPORT_PRESETS,
@@ -150,6 +152,19 @@ const TOOL_LABELS = {
   text: "テキスト", image: "画像", mask: "暗記マスク", study: "暗記モード"
 };
 const NOTE_COPY_CONCURRENCY = 3;
+// Leaving a note waits this long for a title or page structure write before
+// asking whether to wait more (offline, such a write waits for the network).
+const NOTE_OPERATION_WAIT_MS = 10_000;
+// In study mode a finger or Pencil moves this far before the page follows
+// it, so that tapping a mask does not nudge the page.
+const STUDY_PAN_SLOP_PX = 8;
+// An edited page's thumbnail is redrawn this long after the last edit.
+const PAGE_THUMBNAIL_REFRESH_DELAY_MS = 900;
+// Page backgrounds kept scaled down for redrawing thumbnails.
+const THUMBNAIL_BACKGROUND_CACHE_SIZE = 6;
+// Full-size page backgrounds kept in memory (the current page, its
+// neighbours and recently drawn thumbnails).
+const BACKGROUND_BLOB_MEMORY_LIMIT = 8;
 // PDF page images upload while later pages convert: at most this many at
 // once, with at most PDF_UPLOAD_QUEUE_CAPACITY more converted pages waiting.
 const PDF_UPLOAD_CONCURRENCY = 3;
@@ -177,6 +192,29 @@ const TOUCH_PREEMPT_POLICY = Object.freeze({
 });
 
 const clone = value => structuredClone(value);
+
+// A Map that keeps only its `limit` most recently used entries.
+class RecentMap extends Map {
+  constructor(limit) {
+    super();
+    this.limit = limit;
+  }
+
+  get(key) {
+    if (!super.has(key)) return undefined;
+    const value = super.get(key);
+    super.delete(key);
+    super.set(key, value);
+    return value;
+  }
+
+  set(key, value) {
+    super.delete(key);
+    super.set(key, value);
+    while (this.size > this.limit) super.delete(this.keys().next().value);
+    return this;
+  }
+}
 const stableLegacyMutationId = value => {
   let hash = 2166136261;
   for (const character of String(value || "")) {
@@ -293,6 +331,7 @@ export function createStudyNotes(dependencies) {
     eraserMode: byId("noteEraserMode"), shapeType: byId("noteShapeType"), fingerDraw: byId("noteFingerDraw"),
     eraserSize: byId("noteEraserSize"), pencilMode: byId("notePencilMode"), straightenEnabled: byId("noteStraightenEnabled"),
     toolbarDock: byId("noteToolbarDock"), quickSwitchAction: byId("noteQuickSwitchAction"),
+    twoFingerTap: byId("noteTwoFingerTap"),
     pageNavigation: byId("notePageNavigation"),
     quickSwitch: byId("noteQuickSwitchBtn"), toolbarDrag: byId("noteToolbarDragHandle"), toolbarCollapse: byId("noteToolbarCollapseBtn"),
     eraserBadge: byId("noteEraserBadge"), settingsTitle: byId("noteToolSettingsTitle"),
@@ -342,6 +381,9 @@ export function createStudyNotes(dependencies) {
 
   let notes = [];
   let orphanedDrafts = [];
+  // Set when a note tab reported a change that the list does not show yet.
+  let noteListStale = false;
+  let noteListRefreshTimer = 0;
   let currentNote = null;
   let pages = [];
   let currentPageIndex = 0;
@@ -354,6 +396,13 @@ export function createStudyNotes(dependencies) {
   let pendingThumbnailTimer = 0;
   let lastDrawingActivityAt = 0;
   let swipeGesture = null;
+  // 1 while the pages are read forward, -1 backward (see preloadAdjacentPages).
+  let pageReadingDirection = 1;
+  // The last touch's page swipe direction lock, read when its pan ends.
+  let lastTouchSwipe = null;
+  // The page keeps moving after a finger (or Pencil) pan, as the image memory
+  // screen's native scrolling does.
+  const panMomentum = createPanMomentum({ viewport: ui.viewport });
   // A pointer that went down on a mask in study mode: { pointerId, key, x, y, startedAt }.
   let studyMaskTap = null;
   let pageSwitching = false;
@@ -380,7 +429,10 @@ export function createStudyNotes(dependencies) {
   let assetCache = new Map();
   let contentCache = new Map();
   let contentLoadPromises = new Map();
-  let backgroundBlobCache = new Map();
+  // Page background images of this note held in memory; others are read
+  // again from the device cache. Holding every page's image of a long note
+  // took a large share of an iPad's memory.
+  let backgroundBlobCache = new RecentMap(BACKGROUND_BLOB_MEMORY_LIMIT);
   let backgroundBlobPromises = new Map();
   let hasSeenPen = false;
   let toolSettingsStore = null;
@@ -413,6 +465,13 @@ export function createStudyNotes(dependencies) {
   let activePageThumbnails = 0;
   let pageThumbnailIdleHandle = 0;
   let pageThumbnailIdleKind = "";
+  // Thumbnails are made for the page list items on screen (see
+  // schedulePageThumbnails), and an edited page's thumbnail once edits pause.
+  let pageThumbnailObserver = null;
+  let pageThumbnailRefreshTimer = 0;
+  const pageThumbnailRefreshPageIds = new Set();
+  // Page backgrounds already scaled to thumbnail size (newest last).
+  const thumbnailBackgrounds = new Map();
   const noteCardThumbnailConcurrency = 2;
   let noteCardThumbnailGeneration = 0;
   let noteCardThumbnailQueue = [];
@@ -619,8 +678,50 @@ export function createStudyNotes(dependencies) {
 
   function noteListUrl() {
     const url = new URL(globalThis.location.href);
-    ["noteEditor", "noteId", "editorTabId", "study", "create", "creationSessionId", "noteStartupAt"].forEach(name => url.searchParams.delete(name));
+    ["noteEditor", "noteId", "editorTabId", "study", "material", "create", "creationSessionId", "noteStartupAt"].forEach(name => url.searchParams.delete(name));
     return url;
+  }
+
+  // Note tabs tell the note list tab that a note changed, so that the list is
+  // current when it shows again.
+  const NOTE_EVENTS_CHANNEL = "dental-qa-notes";
+  let noteEventsChannel;
+  function noteEvents() {
+    if (noteEventsChannel === undefined) {
+      try {
+        noteEventsChannel = typeof BroadcastChannel === "function" ? new BroadcastChannel(NOTE_EVENTS_CHANNEL) : null;
+      } catch {
+        noteEventsChannel = null;
+      }
+    }
+    return noteEventsChannel;
+  }
+
+  function announceNoteChanged(noteId) {
+    const uid = getCurrentUser()?.uid;
+    if (!uid || !noteId) return;
+    try {
+      noteEvents()?.postMessage({ type: "note-changed", uid, noteId });
+    } catch (error) {
+      console.debug("ノート一覧へ変更を通知できませんでした。", error);
+    }
+  }
+
+  // A note tab (editor or PDF creation) is opened from the note list, so
+  // closing it returns to that list. A tab the browser does not let a page
+  // close (opened from a bookmark, for example) shows the note list instead.
+  function closeNoteTab({ replace = false } = {}) {
+    try {
+      globalThis.close?.();
+    } catch (error) {
+      console.debug("ノートのタブを閉じられませんでした。", error);
+    }
+    setTimeout(() => {
+      if (globalThis.closed) return;
+      const url = noteListUrl().toString();
+      if (replace) globalThis.location.replace(url);
+      else globalThis.location.assign(url);
+    }, 300);
   }
 
   // The client rect of a displayed node, or null for a node that is not
@@ -1094,7 +1195,7 @@ export function createStudyNotes(dependencies) {
     }
   }
 
-  function showEditorNotice(message) {
+  function showEditorNotice(message, { durationMs = 4_000 } = {}) {
     if (!ui.editorNotice) return;
     clearTimeout(editorNoticeTimer);
     ui.editorNotice.textContent = String(message || "");
@@ -1102,7 +1203,7 @@ export function createStudyNotes(dependencies) {
     editorNoticeTimer = setTimeout(() => {
       ui.editorNotice.classList.add("hidden");
       ui.editorNotice.textContent = "";
-    }, 4_000);
+    }, durationMs);
   }
 
   function setTransientUi(type = "closed", options = {}) {
@@ -1285,6 +1386,7 @@ export function createStudyNotes(dependencies) {
     if (ui.fingerDraw) ui.fingerDraw.checked = toolSettings.fingerDraw;
     if (ui.straightenEnabled) ui.straightenEnabled.checked = toolSettings.straightenEnabled;
     if (ui.quickSwitchAction) ui.quickSwitchAction.value = toolSettings.quickSwitchAction;
+    if (ui.twoFingerTap) ui.twoFingerTap.checked = toolSettings.twoFingerTapQuickSwitch;
     if (ui.pageNavigation) ui.pageNavigation.value = toolSettings.pageNavigation;
     if (ui.toolbarAutoHide) ui.toolbarAutoHide.checked = toolSettings.toolbarAutoHide;
     if (ui.eraserBadge) ui.eraserBadge.textContent = toolSettings.eraserMode === "pixel" ? "P" : "O";
@@ -1411,7 +1513,9 @@ export function createStudyNotes(dependencies) {
     };
   }
 
-  function editorUrl(noteId, { study = false, startupAt = Date.now() } = {}) {
+  // `material`: the note is known to be linked to an image material, so its
+  // tab loads the material while it reads the note (see openNote).
+  function editorUrl(noteId, { study = false, material = false, startupAt = Date.now() } = {}) {
     const url = new URL(globalThis.location.href);
     url.searchParams.set("noteEditor", "1");
     url.searchParams.set("noteId", noteId);
@@ -1420,6 +1524,7 @@ export function createStudyNotes(dependencies) {
     url.searchParams.delete("create");
     url.searchParams.delete("creationSessionId");
     if (study) url.searchParams.set("study", "1"); else url.searchParams.delete("study");
+    if (material) url.searchParams.set("material", "1"); else url.searchParams.delete("material");
     return url;
   }
 
@@ -1428,7 +1533,7 @@ export function createStudyNotes(dependencies) {
     url.searchParams.set("noteEditor", "1");
     url.searchParams.set("create", "pdf");
     url.searchParams.set("creationSessionId", randomId());
-    ["noteId", "editorTabId", "study", "noteStartupAt"].forEach(name => url.searchParams.delete(name));
+    ["noteId", "editorTabId", "study", "material", "noteStartupAt"].forEach(name => url.searchParams.delete(name));
     return url;
   }
 
@@ -1477,6 +1582,9 @@ export function createStudyNotes(dependencies) {
     const opened = globalThis.open?.(url, "_blank");
     if (opened) {
       try { opened.opener = null; } catch {}
+      // The PDF is chosen and converted in that tab; this tab shows the list
+      // that the new note appears in.
+      show("list");
       return opened;
     }
     showEditorNotice("新しいタブを開けませんでした。この画面でPDFノート作成を続けます。");
@@ -1501,6 +1609,9 @@ export function createStudyNotes(dependencies) {
     if (!opened) throw new Error("ノート編集タブを開けませんでした。ポップアップを許可して再試行してください。");
     if (reservedWindow) opened.location.replace(url);
     try { opened.opener = null; } catch {}
+    // Without BroadcastChannel (Safari before 15.4) the note tab cannot tell
+    // this list about its changes: the list loads again when it shows next.
+    if (!dedicatedEditor && !noteEvents()) noteListStale = true;
     return opened;
   }
 
@@ -1783,8 +1894,43 @@ export function createStudyNotes(dependencies) {
     }
   }
 
+  // Note and page structure writes (the title, page order, added or deleted
+  // pages, backgrounds) in flight. Leaving the note waits for them, so that a
+  // tab closed right after such an edit does not drop the write.
+  const pendingNoteOperations = new Set();
+  function trackNoteOperation(operation) {
+    pendingNoteOperations.add(operation);
+    const forget = () => pendingNoteOperations.delete(operation);
+    operation.then(forget, forget);
+    return operation;
+  }
+
+  async function settleNoteOperations(timeoutMs = NOTE_OPERATION_WAIT_MS) {
+    if (!pendingNoteOperations.size) return true;
+    let timer = 0;
+    try {
+      return await Promise.race([
+        Promise.allSettled([...pendingNoteOperations]).then(() => true),
+        new Promise(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function flushAllWithDecision(actionLabel = "操作") {
+    let waitForNoteOperations = true;
     while (true) {
+      if (waitForNoteOperations && !await settleNoteOperations()) {
+        const choice = prompt(
+          `${actionLabel}の前に、ノート名やページ構成の変更をクラウドへ保存し終えていません。\n` +
+          "retry（保存を待つ）/ continue（待たずに続行）/ cancel（操作をキャンセル）",
+          "retry"
+        )?.trim().toLowerCase();
+        if (choice === "retry") continue;
+        if (choice !== "continue") return false;
+        waitForNoteOperations = false;
+      }
       if (pendingStrokeWork) {
         try {
           await flushPendingStrokeWork({ render: false, throwOnError: true });
@@ -1839,13 +1985,50 @@ export function createStudyNotes(dependencies) {
     ui.listView.classList.toggle("hidden", view !== "list");
     ui.createView.classList.toggle("hidden", view !== "create");
     ui.editorView.classList.toggle("hidden", view !== "editor");
+    if (view === "list") scheduleNoteListRefresh();
   }
 
   function setListStatus(message) {
     ui.listStatus.textContent = message;
   }
 
-  async function refreshNotes() {
+  // The note list tab reloads the list when a note tab reports a change (it
+  // saved and closed, or created, renamed, copied or deleted a note). A list
+  // that is hidden (another tab or section shows) reloads once it shows.
+  function markNoteListStale() {
+    if (dedicatedEditor) return;
+    noteListStale = true;
+    scheduleNoteListRefresh();
+  }
+
+  function scheduleNoteListRefresh() {
+    if (!noteListStale || noteListRefreshTimer || document.visibilityState !== "visible") return;
+    noteListRefreshTimer = setTimeout(() => {
+      noteListRefreshTimer = 0;
+      if (!noteListStale || document.visibilityState !== "visible" || currentNote) return;
+      if (ui.listView.classList.contains("hidden") || ui.listView.getClientRects().length === 0) return;
+      void refreshNotes().catch(error => {
+        if (error?.name !== "NoteSessionChangedError") console.warn("ノート一覧を更新できませんでした。", error);
+      });
+    }, 120);
+  }
+
+  // Calls made at the same moment share one load of the note list (opening
+  // the note section asked for two). A later call starts its own load at
+  // once, as before, so that it never waits for an older one.
+  let startingNoteListLoad = null;
+  function refreshNotes() {
+    if (dedicatedEditor) return loadNotes();
+    if (!startingNoteListLoad) {
+      startingNoteListLoad = Promise.resolve().then(() => {
+        startingNoteListLoad = null;
+        return loadNotes();
+      });
+    }
+    return startingNoteListLoad;
+  }
+
+  async function loadNotes() {
     const session = captureUserSession();
     if (!session) {
       if (dedicatedEditor) setEditorStartupState("authenticating", { detail: "現在の処理：ログイン状態を確認中" });
@@ -1878,6 +2061,7 @@ export function createStudyNotes(dependencies) {
         return;
       }
 
+      noteListStale = false;
       // One collection read serves the visible list and the stale-creation
       // cleanup; the local scans run in parallel with it.
       const [noteDocuments, conflicts, pendingSaves, pendingAssets, pageDrafts] = await Promise.all([
@@ -2000,8 +2184,8 @@ export function createStudyNotes(dependencies) {
       meta.textContent = `${noteTypeLabel(note)} / ${note.pageCount || 0}ページ / ノートマスク ${note.noteMaskCount || 0}件${note.type === "material-linked" ? ` / 教材マスク ${materialMaskCount}件` : ""} / 最終編集 ${updatedLabel} / ${saveState}${note.pendingSaveCount ? ` / 下書き再送待ち ${note.pendingSaveCount}件` : ""}${note.pendingAssetCount ? ` / 画像再送待ち ${note.pendingAssetCount}件` : ""}`;
       const actions = document.createElement("div"); actions.className = "note-card-actions";
       [
-        ["編集", () => openEditorTab(note.id)],
-        ["暗記", () => openEditorTab(note.id, { study: true })],
+        ["編集", () => openEditorTab(note.id, { material: note.type === "material-linked" })],
+        ["暗記", () => openEditorTab(note.id, { study: true, material: note.type === "material-linked" })],
         ["PDF", () => openExportFromList(note.id)],
         ["名前変更", () => renameNote(note)],
         ["複製", () => duplicateNote(note.id)],
@@ -2015,9 +2199,10 @@ export function createStudyNotes(dependencies) {
       preview.tabIndex = 0;
       preview.setAttribute("role", "button");
       preview.setAttribute("aria-label", `${note.title || "無題ノート"}を編集`);
-      preview.addEventListener("click", () => openEditorTab(note.id));
+      const materialNote = note.type === "material-linked";
+      preview.addEventListener("click", () => openEditorTab(note.id, { material: materialNote }));
       preview.addEventListener("keydown", event => {
-        if (["Enter", " "].includes(event.key)) { event.preventDefault(); openEditorTab(note.id); }
+        if (["Enter", " "].includes(event.key)) { event.preventDefault(); openEditorTab(note.id, { material: materialNote }); }
       });
       enqueueNoteCardThumbnail(note, preview);
     });
@@ -2034,6 +2219,9 @@ export function createStudyNotes(dependencies) {
   }
 
   function pumpNoteCardThumbnailQueue() {
+    // A hidden list tab (a note tab is in front) waits: the note tab may run
+    // on the same thread, and the cards are drawn when the list shows again.
+    if (document.visibilityState === "hidden") return;
     while (activeNoteCardThumbnails < noteCardThumbnailConcurrency && noteCardThumbnailQueue.length) {
       const task = noteCardThumbnailQueue.shift();
       if (task.generation !== noteCardThumbnailGeneration || !task.preview.isConnected) continue;
@@ -2213,11 +2401,11 @@ export function createStudyNotes(dependencies) {
     });
     assertUserSession(session);
     openEditorTab(noteId, {}, reservedWindow);
-    // The newly created note is already ready. Do not keep its reserved editor
-    // tab waiting for the main window to rebuild the complete note list.
-    void refreshNotes().catch(error => {
-      if (error?.name !== "NoteSessionChangedError") console.warn("ノート一覧を更新できませんでした。", error);
-    });
+    // The note opened in its own tab; this tab shows the list it returns to,
+    // which loads again once it is in front (the note tab starts first: on
+    // iPad both tabs can run on one thread).
+    if (!dedicatedEditor) show("list");
+    markNoteListStale();
   }
 
   function renderMaterialPicker() {
@@ -2251,26 +2439,28 @@ export function createStudyNotes(dependencies) {
     if (isMaterialArchiving(material)) {
       throw new Error("教材の差し替え・削除処理中のため、連携ノートを開けません。");
     }
-    await refreshNotes();
-    assertUserSession(session);
-    const legacyActiveNote = notes.find(item =>
-      item.type === "material-linked" && item.sourceMaterialId === materialId && !item.deletedAt
-    );
     let defaultNoteId = getMaterialDefaultNoteId(material);
     if (!defaultNoteId) {
+      // A material from before default notes had ids: its note is looked up
+      // in the note list.
+      await refreshNotes();
+      assertUserSession(session);
+      const legacyActiveNote = notes.find(item =>
+        item.type === "material-linked" && item.sourceMaterialId === materialId && !item.deletedAt
+      );
       defaultNoteId = ensureMaterialDefaultNoteId
         ? await ensureMaterialDefaultNoteId(materialId, legacyActiveNote?.id)
         : legacyActiveNote?.id || randomId();
     }
-    let note = notes.find(item => item.id === defaultNoteId && !item.deletedAt);
-    if (!note) {
-      const existingDefault = await noteStore.getNote(defaultNoteId, { expectedUid: session.uid });
+    // One read of the default note. Reloading the whole note list (every
+    // note, the device's drafts and the cards) first kept the new tab waiting.
+    let note = null;
+    const existingDefault = await noteStore.getNote(defaultNoteId, { expectedUid: session.uid });
+    assertUserSession(session);
+    if (existingDefault && (!existingDefault.status || existingDefault.status === "ready")) {
+      if (existingDefault.deletedAt) await noteStore.restoreNote(defaultNoteId, session.uid);
       assertUserSession(session);
-      if (existingDefault && (!existingDefault.status || existingDefault.status === "ready")) {
-        if (existingDefault.deletedAt) await noteStore.restoreNote(defaultNoteId, session.uid);
-        assertUserSession(session);
-        note = { id: defaultNoteId };
-      }
+      note = { id: defaultNoteId };
     }
     if (!note) {
       const noteId = defaultNoteId;
@@ -2309,10 +2499,12 @@ export function createStudyNotes(dependencies) {
       });
       assertUserSession(session);
       note = { id: noteId };
-      await refreshNotes();
     }
-    activateSection("note");
-    openEditorTab(note.id, {}, reservedWindow);
+    openEditorTab(note.id, { material: true }, reservedWindow);
+    // This tab shows the note list, which loads again once it is in front.
+    activateSection("note", { refresh: false });
+    if (!dedicatedEditor) show("list");
+    markNoteListStale();
   }
 
   async function createPdfNote(file, reservedWindow = null) {
@@ -2391,12 +2583,12 @@ export function createStudyNotes(dependencies) {
       await noteStore.finalizeCreatingNote(noteId, notePages, session.uid);
       assertUserSession(session);
       if (dedicatedEditorCreateMode === "pdf") {
+        announceNoteChanged(noteId);
         globalThis.location.replace(editorUrl(noteId).toString());
       } else {
         openEditorTab(noteId, {}, reservedWindow);
-        void refreshNotes().catch(refreshError => {
-          if (refreshError?.name !== "NoteSessionChangedError") console.warn("ノート一覧を更新できませんでした。", refreshError);
-        });
+        show("list");
+        markNoteListStale();
       }
     } catch (error) {
       // Let the journal write and every started upload settle first: the
@@ -2449,8 +2641,12 @@ export function createStudyNotes(dependencies) {
     return clone(await loading);
   }
 
+  // The page behind and two pages ahead in the direction of reading, so that
+  // flipping on finds the next pages ready (their images are no longer
+  // fetched for every page's thumbnail when the note opens).
   function preloadAdjacentPages() {
-    [currentPageIndex - 1, currentPageIndex + 1]
+    const ahead = pageReadingDirection;
+    [currentPageIndex + ahead, currentPageIndex - ahead, currentPageIndex + 2 * ahead]
       .filter(index => index >= 0 && index < pages.length)
       .forEach(index => {
         const page = pages[index];
@@ -2495,7 +2691,7 @@ export function createStudyNotes(dependencies) {
       explicitReadOnlyMode = forceReadOnly === true;
       assertUserSession(session);
       contentCache = new Map(); contentLoadPromises = new Map(); pageSaveStates.clear();
-      assetCache = new Map(); backgroundBlobCache = new Map(); backgroundBlobPromises = new Map(); selectedIds = [];
+      assetCache = new Map(); backgroundBlobCache = new RecentMap(BACKGROUND_BLOB_MEMORY_LIMIT); backgroundBlobPromises = new Map(); selectedIds = [];
       revealedMaskIds = new Set(); editingHiddenMaskIds = new Set();
       // The note document, its page list, the editor lease and the local
       // record scan are independent. Starting them together removes one full
@@ -2536,18 +2732,25 @@ export function createStudyNotes(dependencies) {
           pageDrafts: records.pageDrafts.length
         })
       );
+      // A tab opened for a note that the list knows is linked to an image
+      // material loads the material together with the note, instead of after
+      // the note document has said so.
+      const materialHinted = dedicatedEditor && noteId === dedicatedEditorNoteId && routeParams.get("material") === "1";
+      const hintedResourcePromise = materialHinted
+        ? measureStartupPhase("note-resource-preparation", () => prepareNoteResources({ id: noteId, type: "material-linked" }))
+        : null;
       // Observe the parallel branches now so a missing note does not surface
       // their later rejections as unhandled.
-      [pageMetadataPromise, editorLeasePromise, localRecordsPromise].forEach(promise => promise.catch(() => {}));
+      [pageMetadataPromise, editorLeasePromise, localRecordsPromise, hintedResourcePromise]
+        .forEach(promise => promise?.catch(() => {}));
       currentNote = await noteMetadataPromise;
       assertUserSession(session);
       if (!currentNote || currentNote.deletedAt) throw new Error("ノートが見つかりません。");
-      startupMetrics.setContext({ noteType: currentNote.type || "" });
+      startupMetrics.setContext({ noteType: currentNote.type || "", materialHinted });
       setEditorStartupState("loading-pages");
-      const resourcePreparationPromise = measureStartupPhase(
-        "note-resource-preparation",
-        () => prepareNoteResources(currentNote)
-      );
+      const resourcePreparationPromise = hintedResourcePromise && currentNote.type === "material-linked"
+        ? hintedResourcePromise
+        : measureStartupPhase("note-resource-preparation", () => prepareNoteResources(currentNote));
       const [leaseResult, localRecords, , loadedPages] = await Promise.all([
         editorLeasePromise,
         localRecordsPromise,
@@ -2668,6 +2871,7 @@ export function createStudyNotes(dependencies) {
   async function loadCurrentPage(options = {}) {
     const page = pages[currentPageIndex];
     if (!page) return;
+    panMomentum.stop();
     const measureInitialLoad = startupState === "loading-content";
     selectedIds = [];
     cancelActiveInteraction("page-change");
@@ -2761,6 +2965,9 @@ export function createStudyNotes(dependencies) {
       item.append(open, actions); ui.pageList.append(item);
     });
     ui.pageCounter.textContent = `${currentPageIndex + 1} / ${pages.length}`;
+    // A list made again (page order, a copied or removed page, undo) gets its
+    // thumbnails from the cache or anew; before, they stayed blank.
+    if (startupState === "ready") schedulePageThumbnails();
   }
 
   function cancelPageThumbnailQueue() {
@@ -2774,12 +2981,20 @@ export function createStudyNotes(dependencies) {
     }
     pageThumbnailGeneration += 1;
     pageThumbnailQueue = [];
+    pageThumbnailObserver?.disconnect();
     if (pageThumbnailIdleHandle) {
       if (pageThumbnailIdleKind === "idle") globalThis.cancelIdleCallback?.(pageThumbnailIdleHandle);
       else clearTimeout(pageThumbnailIdleHandle);
     }
     pageThumbnailIdleHandle = 0;
     pageThumbnailIdleKind = "";
+  }
+
+  function finishStartupThumbnailDrainIfDone() {
+    const drain = startupThumbnailDrain;
+    if (!drain || !drain.observed || drain.completed.size < drain.expected.size) return;
+    drain.finish({ completed: drain.completed.size, failed: drain.failed, expected: drain.expected.size });
+    startupThumbnailDrain = null;
   }
 
   function enqueuePageThumbnail(page, button, { force = false, front = false } = {}) {
@@ -2816,37 +3031,42 @@ export function createStudyNotes(dependencies) {
         })
         .finally(() => {
           activePageThumbnails -= 1;
-          if (startupThumbnailDrain?.generation === task.generation) {
-            startupThumbnailDrain.completed.add(task.page.pageId);
-            if (startupThumbnailDrain.completed.size >= startupThumbnailDrain.expected.size) {
-              startupThumbnailDrain.finish({
-                completed: startupThumbnailDrain.completed.size,
-                failed: startupThumbnailDrain.failed,
-                expected: startupThumbnailDrain.expected.size
-              });
-              startupThumbnailDrain = null;
-            }
+          const drain = startupThumbnailDrain;
+          if (drain?.generation === task.generation && drain.expected.has(task.page.pageId)) {
+            drain.completed.add(task.page.pageId);
+            finishStartupThumbnailDrainIfDone();
           }
           pumpPageThumbnailQueue();
         });
     }
   }
 
+  // Each page list item gets its thumbnail when it comes on screen. Making
+  // every page's thumbnail at once downloaded and decoded every background
+  // of a long note right after it opened, while the user started working.
   function schedulePageThumbnails() {
     if (!currentNote || !pages.length) return;
-    const ordered = pages
-      .map((page, index) => ({ page, index, distance: Math.abs(index - currentPageIndex) }))
-      .sort((a, b) => a.distance - b.distance || a.index - b.index);
+    const lazy = typeof globalThis.IntersectionObserver === "function";
     if (startupState === "ready" && !startupThumbnailDrainStarted) {
       startupThumbnailDrainStarted = true;
       startupThumbnailDrain = {
         generation: pageThumbnailGeneration,
-        expected: new Set(ordered.map(item => item.page.pageId)),
+        // The items on screen when the list is first observed.
+        expected: new Set(lazy ? [] : pages.map(page => page.pageId)),
         completed: new Set(),
         failed: 0,
-        finish: startupMetrics.startSpan("thumbnail-queue-drain", { concurrency: pageThumbnailConcurrency })
+        observed: !lazy,
+        finish: startupMetrics.startSpan("thumbnail-queue-drain", { concurrency: pageThumbnailConcurrency, lazy })
       };
     }
+    if (lazy) {
+      pageThumbnailObserver ||= new IntersectionObserver(showVisiblePageThumbnails, { rootMargin: "200px 0px" });
+      ui.pageList.querySelectorAll(".note-page-thumbnail[data-page-id]").forEach(button => pageThumbnailObserver.observe(button));
+      return;
+    }
+    const ordered = pages
+      .map((page, index) => ({ page, index, distance: Math.abs(index - currentPageIndex) }))
+      .sort((a, b) => a.distance - b.distance || a.index - b.index);
     const enqueue = ({ page }) => {
       const button = ui.pageList.querySelector(`[data-page-id="${CSS.escape(page.pageId)}"]`);
       enqueuePageThumbnail(page, button);
@@ -2867,6 +3087,26 @@ export function createStudyNotes(dependencies) {
     } else {
       pageThumbnailIdleKind = "timeout";
       pageThumbnailIdleHandle = setTimeout(enqueueDeferred, 120);
+    }
+  }
+
+  function showVisiblePageThumbnails(entries) {
+    const drain = startupThumbnailDrain?.generation === pageThumbnailGeneration ? startupThumbnailDrain : null;
+    const pageIndex = pageId => pages.findIndex(page => page.pageId === pageId);
+    entries
+      .filter(entry => entry.isIntersecting && entry.target.isConnected)
+      .map(entry => entry.target)
+      .sort((a, b) => Math.abs(pageIndex(a.dataset.pageId) - currentPageIndex) - Math.abs(pageIndex(b.dataset.pageId) - currentPageIndex))
+      .forEach(button => {
+        pageThumbnailObserver?.unobserve(button);
+        const page = pages[pageIndex(button.dataset.pageId)];
+        if (!page) return;
+        if (drain && !drain.observed) drain.expected.add(page.pageId);
+        enqueuePageThumbnail(page, button);
+      });
+    if (drain && !drain.observed) {
+      drain.observed = true;
+      finishStartupThumbnailDrainIfDone();
     }
   }
 
@@ -2932,6 +3172,7 @@ export function createStudyNotes(dependencies) {
       content,
       materialMasks,
       resolveBackgroundBlob,
+      resolveBackgroundImage: (backgroundPage, canvasWidth, canvasHeight) => thumbnailBackground(backgroundPage, canvasWidth, canvasHeight),
       resolveAssetBlob: (assetId, sourceNoteId) => resolveAssetBlob(assetId, sourceNoteId || noteId),
       width,
       height,
@@ -2948,16 +3189,60 @@ export function createStudyNotes(dependencies) {
     }
   }
 
-  function refreshCurrentPageThumbnail() {
+  // The edited page's thumbnail is redrawn once the edits pause, not after
+  // every mask or shape. Strokes have already waited for a pause in writing
+  // (scheduleCurrentPageThumbnailRefresh) and pass 0.
+  function refreshCurrentPageThumbnail({ delayMs = PAGE_THUMBNAIL_REFRESH_DELAY_MS } = {}) {
     const page = pages[currentPageIndex];
-    const button = page && [...ui.pageList.querySelectorAll("[data-page-id]")]
-      .find(candidate => candidate.dataset.pageId === page.pageId);
-    if (page && button) {
-      // Invalidate an in-flight result immediately, then put the edited page at
-      // the front without exceeding the shared thumbnail concurrency limit.
-      thumbnailTokens.set(page.pageId, Number(thumbnailTokens.get(page.pageId) || 0) + 1);
-      enqueuePageThumbnail(page, button, { force: true, front: true });
+    if (!page) return;
+    // An in-flight result for the page is stale from now on.
+    thumbnailTokens.set(page.pageId, Number(thumbnailTokens.get(page.pageId) || 0) + 1);
+    pageThumbnailRefreshPageIds.add(page.pageId);
+    clearTimeout(pageThumbnailRefreshTimer);
+    pageThumbnailRefreshTimer = setTimeout(refreshEditedPageThumbnails, delayMs);
+  }
+
+  function refreshEditedPageThumbnails() {
+    pageThumbnailRefreshTimer = 0;
+    const pageIds = [...pageThumbnailRefreshPageIds];
+    pageThumbnailRefreshPageIds.clear();
+    pageIds.forEach(pageId => {
+      const page = pages.find(item => item.pageId === pageId);
+      const button = page && [...ui.pageList.querySelectorAll("[data-page-id]")]
+        .find(candidate => candidate.dataset.pageId === pageId);
+      if (!page || !button) return;
+      // A thumbnail off screen is redrawn when it comes on screen.
+      if (pageThumbnailObserver) pageThumbnailObserver.observe(button);
+      else enqueuePageThumbnail(page, button, { force: true, front: true });
+    });
+  }
+
+  // The page background scaled to twice the thumbnail size, kept for the
+  // pages drawn last, so that redrawing an edited page's thumbnail does not
+  // decode its full-size image again.
+  async function thumbnailBackground(page, width, height) {
+    const key = [
+      currentNote?.id || "",
+      page.pageId,
+      createNoteBackgroundSignature(page, currentNote?.id, materialSourceCacheIdentity(materialSourcePage(page))),
+      width,
+      height
+    ].join("|");
+    const cached = thumbnailBackgrounds.get(key);
+    if (cached) {
+      thumbnailBackgrounds.delete(key);
+      thumbnailBackgrounds.set(key, cached);
+      return cached;
     }
+    const scaled = await scaleImageBlobToCanvas(await resolveBackgroundBlob(page), width * 2, height * 2);
+    thumbnailBackgrounds.set(key, scaled);
+    while (thumbnailBackgrounds.size > THUMBNAIL_BACKGROUND_CACHE_SIZE) {
+      const [oldestKey, oldest] = thumbnailBackgrounds.entries().next().value;
+      thumbnailBackgrounds.delete(oldestKey);
+      oldest.width = 1;
+      oldest.height = 1;
+    }
+    return scaled;
   }
 
   // Page changes only wait for the IndexedDB draft of the page being left
@@ -2983,6 +3268,7 @@ export function createStudyNotes(dependencies) {
       }
     } else if (!await flushWithDecision(sourcePage, "ページ切替")) return;
     contentCache.set(sourcePage.pageId, clone(currentContent));
+    pageReadingDirection = index < currentPageIndex ? -1 : 1;
     currentPageIndex = index;
     history.clear();
     await loadCurrentPage();
@@ -4257,6 +4543,57 @@ export function createStudyNotes(dependencies) {
     }
   }
 
+  // A finger (or a Pencil in study mode) that moves the page. `slop`: the
+  // distance the pointer moves before the page follows, so that a tap on a
+  // mask does not nudge the page. `viewportLevel`: the gesture's events are
+  // handled by the viewport (it began around the page, or a finger stayed
+  // down after a pinch).
+  function startPanGesture(event, { slop = 0, viewportLevel = false } = {}) {
+    panMomentum.stop();
+    activeGesture = {
+      type: "pan",
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      scrollLeft: ui.viewport.scrollLeft,
+      scrollTop: ui.viewport.scrollTop,
+      slop,
+      moving: slop <= 0,
+      viewportLevel,
+      samples: [{ x: event.clientX, y: event.clientY, t: Number(event.timeStamp || performance.now()) }]
+    };
+    return activeGesture;
+  }
+
+  function movePanGesture(gesture, event) {
+    gesture.samples.push({ x: event.clientX, y: event.clientY, t: Number(event.timeStamp || performance.now()) });
+    if (gesture.samples.length > 12) gesture.samples.shift();
+    if (!gesture.moving) {
+      const dx = event.clientX - gesture.clientX;
+      const dy = event.clientY - gesture.clientY;
+      const distance = Math.hypot(dx, dy);
+      if (distance < gesture.slop) return;
+      // The page follows from the end of the slop: it trails the pointer by
+      // the slop and does not jump.
+      gesture.moving = true;
+      gesture.clientX += dx * gesture.slop / distance;
+      gesture.clientY += dy * gesture.slop / distance;
+    }
+    ui.viewport.scrollLeft = gesture.scrollLeft - (event.clientX - gesture.clientX);
+    ui.viewport.scrollTop = gesture.scrollTop - (event.clientY - gesture.clientY);
+  }
+
+  // A pan released while the pointer still moves lets the page glide on. A
+  // mouse drag, a pan that turned the page and a pan cut by a pinch stop.
+  function finishPanGesture(gesture, event) {
+    if (gesture.pointerType === "mouse" || !gesture.moving || event.type !== "pointerup") return;
+    if (lastTouchSwipe?.pointerId === gesture.pointerId && lastTouchSwipe.directionLock === "swipe") return;
+    if (zoomController?.isPinching || pageSwitching || swipeTransitionActive) return;
+    const samples = [...gesture.samples, { x: event.clientX, y: event.clientY, t: Number(event.timeStamp || performance.now()) }];
+    panMomentum.start(panReleaseVelocity(samples));
+  }
+
   function captureActivePointer(event) {
     if (!activeGesture) return;
     // The full-page drawing layer owns capture only for Pencil. Touch must keep
@@ -4439,7 +4776,7 @@ export function createStudyNotes(dependencies) {
         scheduleCurrentPageThumbnailRefresh(noteId, pageId, remaining);
         return;
       }
-      refreshCurrentPageThumbnail();
+      refreshCurrentPageThumbnail({ delayMs: 0 });
     }, Math.max(16, delay ?? nextDelay()));
   }
 
@@ -4773,6 +5110,11 @@ export function createStudyNotes(dependencies) {
       studyMaskTap = maskVisibilityId
         ? { pointerId: event.pointerId, key: maskVisibilityId, x: event.clientX, y: event.clientY, startedAt: Number(event.timeStamp || performance.now()) }
         : null;
+      // A finger or Pencil moves the page, as on the image memory screen.
+      if (event.pointerType === "touch" || event.pointerType === "pen") {
+        startPanGesture(event, { slop: STUDY_PAN_SLOP_PX });
+        captureActivePointer(event);
+      }
       return;
     }
     if (transformHandle) {
@@ -4818,9 +5160,9 @@ export function createStudyNotes(dependencies) {
       (!toolSettings.fingerDraw || swipeGesture.startedAtEdge);
     const drawWithTouch = event.pointerType !== "touch" || (!reservedForPageSwipe && !guardedTouch && (toolSettings.fingerDraw || !hasSeenPen));
     if (["pen", "highlighter", "shape", "text", "mask", "eraser-object", "eraser-pixel"].includes(currentTool) && !drawWithTouch) {
-      activeGesture = { type: "pan", pointerId: event.pointerId, pointerType: event.pointerType, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
+      startPanGesture(event);
     } else if (currentTool === "pan") {
-      activeGesture = { type: "pan", pointerId: event.pointerId, pointerType: event.pointerType, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.viewport.scrollLeft, scrollTop: ui.viewport.scrollTop };
+      startPanGesture(event);
     } else if (currentTool === "text" && textEditorSession) {
       // A tap outside the open text box only finishes it. Creating another
       // empty box here would keep the iPad keyboard open after "done".
@@ -4938,8 +5280,7 @@ export function createStudyNotes(dependencies) {
         event.preventDefault();
         return;
       }
-      ui.viewport.scrollLeft = activeGesture.scrollLeft - (event.clientX - activeGesture.clientX);
-      ui.viewport.scrollTop = activeGesture.scrollTop - (event.clientY - activeGesture.clientY);
+      movePanGesture(activeGesture, event);
       return;
     }
     const point = gesturePoint(event, activeGesture.pageRect);
@@ -5177,7 +5518,20 @@ export function createStudyNotes(dependencies) {
     const duration = Number(event.timeStamp || performance.now()) - tap.startedAt;
     if (moved > 12 || duration > 800 || zoomController?.isPinchGestureActive) return;
     revealedMaskIds.has(tap.key) ? revealedMaskIds.delete(tap.key) : revealedMaskIds.add(tap.key);
-    renderPage();
+    showMaskRevealState();
+  }
+
+  // Study mode shows or hides masks by their class: drawing the whole page
+  // again (every stroke of the page) for each tap made a written page slow.
+  function showMaskRevealState() {
+    const layer = ui.stage.querySelector('[data-layer="masks"]');
+    if (!layer || renderedElementState?.pageId !== pages[currentPageIndex]?.pageId) {
+      renderPage();
+      return;
+    }
+    layer.querySelectorAll(".note-mask[data-mask-visibility-key]").forEach(node => {
+      node.classList.toggle("revealed", studyMode && revealedMaskIds.has(node.dataset.maskVisibilityKey));
+    });
   }
 
   function endPointer(event) {
@@ -5204,7 +5558,10 @@ export function createStudyNotes(dependencies) {
     activeGesture = null;
     releaseActivePointer(gesture.pointerId, gesture.captureTarget);
     removeGesturePreview(gesture);
-    if (gesture.type === "pan") return;
+    if (gesture.type === "pan") {
+      finishPanGesture(gesture, event);
+      return;
+    }
     if (["resize-selection", "rotate-selection", "line-endpoint"].includes(gesture.type)) {
       showSelectionContext();
       commitChange(gesture.before, gesture.type === "line-endpoint" ? "直線端点移動" : gesture.type === "rotate-selection" ? "選択回転" : "選択サイズ変更");
@@ -5649,7 +6006,11 @@ export function createStudyNotes(dependencies) {
     }
   }
 
-  async function pageAction(action, index) {
+  function pageAction(action, index) {
+    return trackNoteOperation(runPageAction(action, index));
+  }
+
+  async function runPageAction(action, index) {
     if (!currentNote) return;
     if (!prepareEditorAction("ページ操作")) return;
     const actionPage = pages[index] || pages[currentPageIndex];
@@ -5718,7 +6079,11 @@ export function createStudyNotes(dependencies) {
     }
   }
 
-  async function addPage(kind) {
+  function addPage(kind) {
+    return trackNoteOperation(runAddPage(kind));
+  }
+
+  async function runAddPage(kind) {
     if (!prepareEditorAction("ページ追加")) return;
     if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
     const session = captureUserSession();
@@ -5751,7 +6116,11 @@ export function createStudyNotes(dependencies) {
     return true;
   }
 
-  async function changeBackground() {
+  function changeBackground() {
+    return trackNoteOperation(runChangeBackground());
+  }
+
+  async function runChangeBackground() {
     if (!canMutateCurrentNote(currentNote, { page: pages[currentPageIndex], allowConflict: false })) return;
     if (!prepareEditorAction("背景変更")) return;
     if (!closeTransientUi()) return;
@@ -6004,7 +6373,11 @@ export function createStudyNotes(dependencies) {
     ui.toolbar.classList.toggle("hidden", studyMode || !markupMode);
   }
 
-  async function renameNote(note = currentNote) {
+  function renameNote(note = currentNote) {
+    return trackNoteOperation(runRenameNote(note));
+  }
+
+  async function runRenameNote(note) {
     if (!canMutateCurrentNote(note)) return;
     const session = captureUserSession();
     assertUserSession(session);
@@ -6022,6 +6395,7 @@ export function createStudyNotes(dependencies) {
     const listed = notes.find(item => item.id === note.id);
     if (listed) listed.title = title;
     if (!dedicatedEditor) renderNoteList();
+    else announceNoteChanged(note.id);
   }
 
   async function deleteNote(note = currentNote) {
@@ -6043,7 +6417,8 @@ export function createStudyNotes(dependencies) {
       // instead of leaving an empty list inside the editor.
       editorLease?.release();
       currentNote = null; pages = []; currentContent = null;
-      globalThis.location.assign(noteListUrl().toString());
+      announceNoteChanged(note.id);
+      closeNoteTab();
       return;
     }
     if (currentNote?.id === note.id) { currentNote = null; pages = []; currentContent = null; show("list"); }
@@ -6099,6 +6474,7 @@ export function createStudyNotes(dependencies) {
       throw error;
     }
     if (dedicatedEditor) {
+      announceNoteChanged(newId);
       showEditorNotice(`「${sourceNote.title || "無題ノート"} のコピー」を作成しました。ノート一覧から開けます。`);
     } else {
       await refreshNotes();
@@ -6599,7 +6975,9 @@ export function createStudyNotes(dependencies) {
     if (currentNote && !await flushAllWithDecision("ノート一覧へ戻る操作")) return;
     editorLease?.release();
     if (dedicatedEditor) {
-      globalThis.location.assign(noteListUrl().toString());
+      // Everything is saved: close the tab, which returns to the note list.
+      announceNoteChanged(currentNote?.id || dedicatedEditorNoteId);
+      closeNoteTab();
       return;
     }
     await closeEditor();
@@ -6616,7 +6994,8 @@ export function createStudyNotes(dependencies) {
     contentLoadPromises.clear(); backgroundBlobCache.clear(); backgroundBlobPromises.clear();
     resetPageRender(); cancelPageThumbnailQueue(); cancelNoteCardThumbnailQueue(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
     if (dedicatedEditor) {
-      globalThis.location.assign(noteListUrl().toString());
+      announceNoteChanged(dedicatedEditorNoteId);
+      closeNoteTab();
       return;
     }
     show("list"); await refreshNotes();
@@ -6920,7 +7299,7 @@ export function createStudyNotes(dependencies) {
     ui.noteModeBtn.addEventListener("click", () => { activateSection("note"); show(currentNote ? "editor" : "list"); void refreshNotes(); });
     ui.newNoteBtn.addEventListener("click", () => { show("create"); ui.materialPicker.classList.add("hidden"); });
     ui.cancelCreate.addEventListener("click", () => {
-      if (dedicatedEditorCreateMode) globalThis.location.replace(noteListUrl().toString());
+      if (dedicatedEditorCreateMode) closeNoteTab({ replace: true });
       else show("list");
     });
     ui.createView.querySelectorAll("[data-create-note]").forEach(button => button.addEventListener("click", () => {
@@ -6974,7 +7353,7 @@ export function createStudyNotes(dependencies) {
       if (action === "cloud") resolveCurrentPageConflict(false).catch(reportError);
       else if (action === "copy") resolveCurrentPageConflict(true).catch(reportError);
       else if (action === "compare") recoverPendingSaves(currentNote.id, pages).then(loadCurrentPage).catch(reportError);
-      else if (action === "list") dedicatedEditor ? globalThis.close?.() : closeEditor().catch(reportError);
+      else if (action === "list") dedicatedEditor ? closeNoteTab() : closeEditor().catch(reportError);
     }));
     ui.pagesButton.addEventListener("click", () => persistToolSettings({ sidebarVisible: !toolSettings.sidebarVisible }));
     ui.saveStatus.addEventListener("click", () => toggleSavePopover());
@@ -6989,12 +7368,17 @@ export function createStudyNotes(dependencies) {
     ui.saveDiagnostics.addEventListener("click", () => downloadDiagnostics().catch(reportError));
     ui.saveList.addEventListener("click", () => returnToNoteList().catch(reportError));
     ui.markupDone.addEventListener("click", () => finishMarkup().catch(reportError));
-    ui.title.addEventListener("change", async () => {
+    ui.title.addEventListener("change", () => {
       const title = ui.title.value.trim(); if (!title || !currentNote || title === currentNote.title) return;
       if (!canMutateCurrentNote(currentNote)) { ui.title.value = currentNote.title || "無題ノート"; return; }
-      const session = captureUserSession(); assertUserSession(session);
-      if (!canMutateCurrentNote(currentNote)) { ui.title.value = currentNote.title || "無題ノート"; return; }
-      await noteStore.updateNote(currentNote.id, { title }, session.uid); assertUserSession(session); currentNote.title = title;
+      const note = currentNote;
+      // Tapping "back to the list" right after typing a title fires this
+      // change first; leaving waits for the write (trackNoteOperation).
+      trackNoteOperation((async () => {
+        const session = captureUserSession(); assertUserSession(session);
+        await noteStore.updateNote(note.id, { title }, session.uid); assertUserSession(session); note.title = title;
+        if (dedicatedEditor) announceNoteChanged(note.id);
+      })()).catch(reportError);
     });
     ui.undo.addEventListener("click", undo); ui.redo.addEventListener("click", redo);
     ui.retrySave.addEventListener("click", () => {
@@ -7154,6 +7538,7 @@ export function createStudyNotes(dependencies) {
     ui.toolbarAutoHide.addEventListener("change", () => persistToolSettings({ toolbarAutoHide: ui.toolbarAutoHide.checked }));
     ui.toolbarDock.addEventListener("change", () => persistToolSettings({ toolbarDock: ui.toolbarDock.value }));
     ui.quickSwitchAction.addEventListener("change", () => persistToolSettings({ quickSwitchAction: ui.quickSwitchAction.value }));
+    ui.twoFingerTap?.addEventListener("change", () => persistToolSettings({ twoFingerTapQuickSwitch: ui.twoFingerTap.checked }));
     ui.pageNavigation?.addEventListener("change", () => persistToolSettings({ pageNavigation: ui.pageNavigation.value }));
     ui.quickSwitch.addEventListener("click", quickSwitchTool);
     ui.toolbarCollapse.addEventListener("click", () => ui.toolbar.classList.toggle("collapsed"));
@@ -7271,6 +7656,10 @@ export function createStudyNotes(dependencies) {
         return;
       }
       const rect = ui.stage.getBoundingClientRect();
+      // Within 36 px of the page's left or right edge, on the page (a finger
+      // beside the page goes by its direction).
+      const fromLeft = event.clientX - rect.left;
+      const fromRight = rect.right - event.clientX;
       swipeGesture = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -7278,7 +7667,7 @@ export function createStudyNotes(dependencies) {
         endX: event.clientX,
         endY: event.clientY,
         startedAt: Number(event.timeStamp || performance.now()),
-        startedAtEdge: event.clientX - rect.left <= 36 || rect.right - event.clientX <= 36,
+        startedAtEdge: (fromLeft >= 0 && fromLeft <= 36) || (fromRight >= 0 && fromRight <= 36),
         directionLock: "pending",
         previewIndex: null,
         blocked: false,
@@ -7340,13 +7729,90 @@ export function createStudyNotes(dependencies) {
           settleSwipeVisual(direction, nextIndex);
         } else clearSwipeVisual();
       }
+      lastTouchSwipe = swipe ? { pointerId: swipe.pointerId, directionLock: swipe.directionLock } : null;
       swipeGesture = null;
       activeTouchPointerIds.delete(event.pointerId);
     };
     ui.viewport.addEventListener("pointerup", finishTrackedTouch, { capture: true });
     ui.viewport.addEventListener("pointercancel", finishTrackedTouch, { capture: true });
-    ui.stage.addEventListener("pointerdown", beginPointer); ui.stage.addEventListener("pointermove", movePointer);
-    ui.stage.addEventListener("pointerup", endPointer); ui.stage.addEventListener("pointercancel", endPointer);
+    // Any new contact, wheel or pinch stops a page that is still gliding.
+    ui.viewport.addEventListener("pointerdown", () => panMomentum.stop(), { capture: true });
+    ui.viewport.addEventListener("wheel", () => panMomentum.stop(), { passive: true });
+    // Two fingers tapped together run the quick switch (pen ⇄ eraser unless
+    // set otherwise), standing in for the Apple Pencil double tap, which
+    // Safari does not report to web pages. The slight pinch of the tap is
+    // undone.
+    const twoFingerTap = createTwoFingerTapRecognizer();
+    let viewBeforeTwoFingerTap = null;
+    ui.viewport.addEventListener("pointerdown", event => {
+      // A palm, or the hand while (and just after) the Pencil writes, is not
+      // a tap.
+      if (event.pointerType === "touch" && inputGuard.shouldIgnoreTouch(event, { touchCount: 1 })) {
+        twoFingerTap.cancel();
+        return;
+      }
+      const starting = !twoFingerTap.tracking;
+      twoFingerTap.down(event);
+      if (starting && twoFingerTap.tracking) {
+        viewBeforeTwoFingerTap = { zoom: zoomController?.zoom || 1, left: ui.viewport.scrollLeft, top: ui.viewport.scrollTop };
+      }
+    }, { capture: true });
+    ui.viewport.addEventListener("pointermove", event => twoFingerTap.move(event), { capture: true });
+    ["pointerup", "pointercancel"].forEach(type => ui.viewport.addEventListener(type, event => {
+      if (!twoFingerTap.up(event)) return;
+      const view = viewBeforeTwoFingerTap;
+      viewBeforeTwoFingerTap = null;
+      const quickSwitch = toolSettings.twoFingerTapQuickSwitch && !studyMode && markupMode && currentContent &&
+        !textEditorSession && !cropSession;
+      // Once the pinch handling of this lift is over.
+      setTimeout(() => {
+        if (view && zoomController) {
+          zoomController.flushScheduledZoom();
+          zoomController.setZoom(view.zoom, null);
+          ui.viewport.scrollLeft = view.left;
+          ui.viewport.scrollTop = view.top;
+        }
+        panMomentum.stop();
+        if (!quickSwitch) return;
+        const action = toolSettings.quickSwitchAction;
+        quickSwitchTool();
+        if (["eraser", "previous", "select"].includes(action)) {
+          showEditorNotice(`${TOOL_LABELS[currentTool] || "ツール"}に切り替えました（2本指タップ）`, { durationMs: 1_500 });
+        }
+      }, 0);
+    }, { capture: true }));
+    // A finger on the area around the page moves the page too, as anywhere on
+    // the image memory screen.
+    ui.viewport.addEventListener("pointerdown", event => {
+      if (event.pointerType !== "touch" || activeGesture || !currentContent) return;
+      if (event.target !== ui.viewport && !ui.adjacentPagePreview?.contains(event.target)) return;
+      if (activeTouchPointerIds.size > 1 || zoomController?.isPinchGestureActive || zoomController?.isPinching) return;
+      if (textEditorSession || cropSession || pageSwitching || swipeTransitionActive) return;
+      // While the Pencil writes (and just after), a touch beside the page is
+      // the hand.
+      if (inputGuard.shouldIgnoreTouch(event, { touchCount: 1 })) return;
+      startPanGesture(event, { slop: studyMode ? STUDY_PAN_SLOP_PX : 0, viewportLevel: true });
+      captureActivePointer(event);
+    });
+    // A finger left down after a pinch moves the page on, as native scrolling does.
+    ui.viewport.addEventListener("pointermove", event => {
+      if (event.pointerType !== "touch" || activeGesture || !currentContent || !zoomController) return;
+      if (!zoomController.isPinchGestureActive || zoomController.isPinching || zoomController.touchCount !== 1) return;
+      if (!activeTouchPointerIds.has(event.pointerId) || textEditorSession || cropSession) return;
+      startPanGesture(event, { viewportLevel: true });
+    }, { capture: true });
+    // Gestures handled by the viewport (see startPanGesture).
+    const ownsViewportGesture = event => activeGesture?.viewportLevel === true && activeGesture.pointerId === event.pointerId;
+    ui.viewport.addEventListener("pointermove", event => {
+      if (ownsViewportGesture(event)) movePointer(event);
+    }, { capture: true });
+    ["pointerup", "pointercancel"].forEach(type => ui.viewport.addEventListener(type, event => {
+      if (ownsViewportGesture(event)) endPointer(event);
+    }, { capture: true }));
+    ui.stage.addEventListener("pointerdown", beginPointer);
+    ui.stage.addEventListener("pointermove", event => { if (!ownsViewportGesture(event)) movePointer(event); });
+    ui.stage.addEventListener("pointerup", event => { if (!ownsViewportGesture(event)) endPointer(event); });
+    ui.stage.addEventListener("pointercancel", event => { if (!ownsViewportGesture(event)) endPointer(event); });
     // WebKit can retarget the synthetic click which follows a pointer sequence
     // after renderPage() has replaced the SVG node.  Keep selection usable by
     // resolving the click against the persisted page geometry as a fallback.
@@ -7368,6 +7834,7 @@ export function createStudyNotes(dependencies) {
     });
     ui.stage.addEventListener("pointerleave", hidePixelEraserCursor);
     ui.viewport.addEventListener("pagezoomstart", () => {
+      panMomentum.stop();
       studyMaskTap = null;
       if (swipeGesture) swipeGesture.blocked = true;
       dismissTransientForViewportChange();
@@ -7400,12 +7867,12 @@ export function createStudyNotes(dependencies) {
       if (action === "previous") switchPage(Math.max(0, currentPageIndex - 1)).catch(reportError);
       if (action === "next") switchPage(Math.min(pages.length - 1, currentPageIndex + 1)).catch(reportError);
       if (action === "edit") setStudyMode(false);
-      if (action === "hide-all") { revealedMaskIds.clear(); renderPage(); }
+      if (action === "hide-all") { revealedMaskIds.clear(); showMaskRevealState(); }
       if (action === "show-all") {
         const page = pages[currentPageIndex];
         [...getMaterialPageMasks(currentMaterial(), page.background?.materialPage), ...currentContent.noteMasks]
           .forEach(mask => revealedMaskIds.add(maskVisibilityKey(mask)));
-        renderPage();
+        showMaskRevealState();
       }
     }));
     ui.editorView.querySelectorAll("[data-note-action]").forEach(button => button.addEventListener("click", () => {
@@ -7416,6 +7883,7 @@ export function createStudyNotes(dependencies) {
       if (action === "delete") deleteNote().catch(reportError);
       if (action === "reset-view") {
         closeTransientUi();
+        panMomentum.stop();
         zoomController?.reset?.();
         ui.viewport.scrollLeft = 0;
         ui.viewport.scrollTop = 0;
@@ -7461,7 +7929,7 @@ export function createStudyNotes(dependencies) {
       else if (action === "local") void restoreDedicatedLocalDraft().catch(error => setEditorStartupState("recoverable-error", { detail: error.message || String(error), error }));
       else if (action === "cloud") void retryDedicatedOpen({ preferCloud: true });
       else if (action === "readonly") void retryDedicatedOpen({ forceReadOnly: true });
-      else if (action === "list") globalThis.location.assign(noteListUrl().toString());
+      else if (action === "list") closeNoteTab();
       else if (action === "copy-diagnostics") void copyDiagnostics().catch(reportError);
       else if (action === "download-diagnostics") void downloadDiagnostics().catch(reportError);
     });
@@ -7485,6 +7953,7 @@ export function createStudyNotes(dependencies) {
     });
     ui.cancelPdf.addEventListener("click", () => exportController?.abort());
     document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") panMomentum.stop();
       if (document.visibilityState !== "hidden" || !currentNote || readOnlyEditor) return;
       if (activeGesture && ["pen", "highlighter"].includes(activeGesture.type)) finishPointerGesture("visibilitychange");
       textEditorSession?.finish({ force: true });
@@ -7524,6 +7993,17 @@ export function createStudyNotes(dependencies) {
         void recoverAllPendingWork().catch(error => console.warn("オンライン復帰後のノート再送に失敗しました。", error));
       }
     });
+    if (!dedicatedEditor) {
+      noteEvents()?.addEventListener("message", event => {
+        const message = event.data;
+        if (message?.type !== "note-changed" || !message.uid || message.uid !== getCurrentUser()?.uid) return;
+        markNoteListStale();
+      });
+      document.addEventListener("visibilitychange", () => {
+        scheduleNoteListRefresh();
+        pumpNoteCardThumbnailQueue();
+      });
+    }
   }
 
   bindEvents();

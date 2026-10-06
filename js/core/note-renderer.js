@@ -196,11 +196,30 @@ function shouldDrawMask(mask, source, options) {
   return options.revealedMaskIds?.has(maskVisibilityKey(mask, source)) !== true;
 }
 
+// The image of a blob drawn into a canvas of the given size (with the
+// browser's default smoothing, as a page image drawn into a thumbnail was).
+export async function scaleImageBlobToCanvas(blob, width, height) {
+  const loaded = await loadImage(blob);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width));
+    canvas.height = Math.max(1, Math.round(height));
+    canvas.getContext("2d").drawImage(loaded.image, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  } finally {
+    loaded.revoke();
+  }
+}
+
+// `resolveBackgroundImage(page, width, height)`, when given, returns an image
+// (a canvas, for example) already scaled for this canvas; the background
+// blob is decoded only when it returns nothing.
 export async function renderNotePageToCanvas({
   page,
   content,
   materialMasks = [],
   resolveBackgroundBlob,
+  resolveBackgroundImage = null,
   resolveAssetBlob,
   width,
   height,
@@ -217,9 +236,19 @@ export async function renderNotePageToCanvas({
   drawPaper(context, page, canvas.width, canvas.height);
 
   if (["pdf-source-page", "material-page"].includes(page.background?.type)) {
-    const blob = await resolveBackgroundBlob(page);
+    const scaled = resolveBackgroundImage ? await resolveBackgroundImage(page, canvas.width, canvas.height) : null;
     if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
-    await drawBlobCover(context, blob, 0, 0, canvas.width, canvas.height, null, 0, 1, signal);
+    if (scaled) {
+      context.save();
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+      context.drawImage(scaled, 0, 0, canvas.width, canvas.height);
+      context.restore();
+    } else {
+      const blob = await resolveBackgroundBlob(page);
+      if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
+      await drawBlobCover(context, blob, 0, 0, canvas.width, canvas.height, null, 0, 1, signal);
+    }
   }
 
   const elements = [...(content.elements || [])].sort((a, b) => Number(a.zIndex || 0) - Number(b.zIndex || 0));

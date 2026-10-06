@@ -80,3 +80,14 @@ test("旧スキーマの設定には図形・文字の既定値を補完する",
   assert.equal(value.textFontFamily, "system-sans");
   assert.equal(value.textColor, "#111111");
 });
+
+test("2本指タップのクイック切替は既定で有効、明示的にオフにした設定だけ無効にする", () => {
+  assert.equal(normalizeNoteToolSettings({}).twoFingerTapQuickSwitch, true);
+  assert.equal(normalizeNoteToolSettings({ twoFingerTapQuickSwitch: "yes" }).twoFingerTapQuickSwitch, true);
+  assert.equal(normalizeNoteToolSettings({ twoFingerTapQuickSwitch: false }).twoFingerTapQuickSwitch, false);
+  const storage = memoryStorage();
+  const store = createNoteToolSettingsStore({ uid: "alice", storage });
+  store.save({ twoFingerTapQuickSwitch: false, quickSwitchAction: "previous" });
+  assert.equal(store.load().twoFingerTapQuickSwitch, false);
+  assert.equal(store.load().quickSwitchAction, "previous");
+});

@@ -2455,6 +2455,24 @@ test("@authenticated PDF背景は再表示時に端末キャッシュを使いSt
       Number(counters["resource-cache-api-hits"] || 0);
   })).toBeGreaterThan(0);
   expect(await page.evaluate(() => globalThis.__noteEditorStartupMetrics.counters["resource-cache-write-failures"] || 0)).toBe(0);
+  // The cache keeps a manifest of its images (key, size, time), so that
+  // making room never reads every cached image.
+  await expect.poll(() => page.evaluate(uid => new Promise(resolve => {
+    const request = indexedDB.open("dentalQaNoteLocal", 2);
+    request.onsuccess = () => {
+      const database = request.result;
+      const read = database.transaction("thumbnails", "readonly").objectStore("thumbnails").get(`${uid}|~note-resource-manifest`);
+      read.onsuccess = () => {
+        database.close();
+        const manifest = read.result;
+        resolve(manifest?.kind === "note-resource-manifest"
+          ? manifest.entries.filter(entry => /\|resource-/.test(entry.key) && entry.blobSize > 0).length
+          : 0);
+      };
+      read.onerror = () => { database.close(); resolve(-1); };
+    };
+    request.onerror = () => resolve(-1);
+  }), user.uid), { timeout: 20_000 }).toBeGreaterThan(0);
 
   let storageRequests = 0;
   await page.route("**/v0/b/demo-dental-qa.firebasestorage.app/o**", route => {
@@ -2554,7 +2572,7 @@ test("@authenticated split未整備では大きい旧mainへfallbackしても許
   expect(blockedRequests).toEqual([]);
 });
 
-test("@authenticated ページサムネイルはエディタready後に最大2件ずつ生成する", async ({ page }) => {
+test("@authenticated ページサムネイルはエディタready後に画面内のページだけ最大2件ずつ生成し、編集後は休止後に1回だけ作り直す", async ({ page }) => {
   test.setTimeout(90_000);
   const blockedRequests = await guardProductionFirebase(page);
   await page.addInitScript(() => {
@@ -2588,19 +2606,44 @@ test("@authenticated ページサムネイルはエディタready後に最大2�
   });
   await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 20_000 });
   await expect(page.locator("#notePageList > li")).toHaveCount(6);
-  await expect.poll(() => page.evaluate(() => globalThis.__noteThumbnailMetrics.completed), { timeout: 20_000 }).toBe(6);
-  expect(await page.evaluate(() => globalThis.__noteThumbnailMetrics)).toMatchObject({
-    maxActive: 2,
-    started: 6,
-    completed: 6,
-    startedBeforeReady: 0
-  });
+  // Only the page list items on screen get thumbnails at first.
+  await expect.poll(() => page.evaluate(() => globalThis.__noteEditorStartupMetrics.spans
+    .some(span => span.name === "thumbnail-queue-drain")), { timeout: 20_000 }).toBe(true);
   const thumbnailDrain = await page.evaluate(() => globalThis.__noteEditorStartupMetrics.spans
     .find(span => span.name === "thumbnail-queue-drain"));
-  expect(thumbnailDrain).toMatchObject({
-    status: "ok",
-    details: { concurrency: 2, completed: 6, failed: 0, expected: 6 }
+  expect(thumbnailDrain).toMatchObject({ status: "ok", details: { concurrency: 2, lazy: true, failed: 0 } });
+  const firstShown = thumbnailDrain.details.expected;
+  expect(firstShown).toBeGreaterThan(0);
+  expect(firstShown).toBeLessThan(6);
+  expect(thumbnailDrain.details.completed).toBe(firstShown);
+  expect(await page.evaluate(() => globalThis.__noteThumbnailMetrics)).toMatchObject({
+    started: firstShown,
+    completed: firstShown,
+    startedBeforeReady: 0
   });
+  await expect(page.locator("#notePageList .note-page-thumbnail img")).toHaveCount(firstShown);
+
+  // Scrolling the list makes the rest, still at most two at a time.
+  await page.locator("#notePageList .note-page-thumbnail").last().scrollIntoViewIfNeeded();
+  await expect.poll(() => page.evaluate(() => globalThis.__noteThumbnailMetrics.completed), { timeout: 20_000 }).toBe(6);
+  await expect(page.locator("#notePageList .note-page-thumbnail img")).toHaveCount(6);
+  expect(await page.evaluate(() => globalThis.__noteThumbnailMetrics)).toMatchObject({ maxActive: 2, started: 6 });
+
+  // Three quick strokes redraw the edited page's thumbnail once, after the
+  // pause (its list item is on screen again).
+  await page.locator("#notePageList .note-page-thumbnail").first().scrollIntoViewIfNeeded();
+  const stage = page.locator("#notePageStage");
+  const box = await stage.boundingBox();
+  for (let index = 0; index < 3; index += 1) {
+    const y = box.y + box.height * (.2 + index * .05);
+    await stage.dispatchEvent("pointerdown", { pointerId: 40 + index, pointerType: "mouse", button: 0, clientX: box.x + box.width * .2, clientY: y });
+    await stage.dispatchEvent("pointermove", { pointerId: 40 + index, pointerType: "mouse", button: 0, pressure: .5, clientX: box.x + box.width * .5, clientY: y + 4 });
+    await stage.dispatchEvent("pointerup", { pointerId: 40 + index, pointerType: "mouse", button: 0, clientX: box.x + box.width * .5, clientY: y + 4 });
+  }
+  await expect(stage.locator("[data-element-id]")).toHaveCount(3);
+  await expect.poll(() => page.evaluate(() => globalThis.__noteThumbnailMetrics.completed), { timeout: 20_000 }).toBe(7);
+  await page.waitForTimeout(1500);
+  expect(await page.evaluate(() => globalThis.__noteThumbnailMetrics)).toMatchObject({ started: 7, completed: 7 });
   expect(blockedRequests).toEqual([]);
 });
 
@@ -2628,6 +2671,57 @@ test("@authenticated 質問データの初期読込失敗に専用エディタ�
   await page.locator("#closeNoteBtn").click();
   await page.waitForURL(url => url.searchParams.get("noteEditor") !== "1", { timeout: 20_000 });
   await expect(page.locator("#cloudStatus")).toContainText("クラウドデータの初期読込に失敗", { timeout: 20_000 });
+  expect(blockedRequests).toEqual([]);
+});
+
+test("@authenticated ノート一覧へ戻るは保存してから編集タブを閉じ、一覧タブに変更を反映する", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  const onPageError = error => recordUnexpectedPageError(pageErrors, error);
+  page.on("pageerror", onPageError);
+  const user = await createUser();
+  await login(page, user);
+  const list = page;
+  await list.locator("#newNoteBtn").click();
+  await list.locator("#newNoteTitle").fill("タブを閉じるE2Eノート");
+  let editor = await openEditorPopup(list, () => list.locator('[data-create-note="blank"]').click(), { blockedRequests, onPageError });
+  const noteId = new URL(editor.url()).searchParams.get("noteId");
+
+  // A stroke and a new title just before leaving: the tab closes only after
+  // both are in the cloud.
+  const stage = editor.locator("#notePageStage");
+  await expect(stage).toHaveAttribute("data-tool", "pen");
+  const box = await stage.boundingBox();
+  await stage.dispatchEvent("pointerdown", { pointerId: 1, pointerType: "mouse", button: 0, clientX: box.x + box.width * .2, clientY: box.y + box.height * .1 });
+  await stage.dispatchEvent("pointermove", { pointerId: 1, pointerType: "mouse", button: 0, pressure: .5, clientX: box.x + box.width * .5, clientY: box.y + box.height * .15 });
+  await stage.dispatchEvent("pointerup", { pointerId: 1, pointerType: "mouse", button: 0, clientX: box.x + box.width * .5, clientY: box.y + box.height * .15 });
+  await expect(stage.locator("[data-element-id]")).toHaveCount(1);
+  await editor.locator("#noteTitleInput").fill("タブを閉じたE2Eノート");
+  const editorClosed = editor.waitForEvent("close", { timeout: 20_000 });
+  await editor.locator("#closeNoteBtn").click();
+  await editorClosed;
+  const saved = (await readNotes(user.uid)).notes.find(item => item.id === noteId);
+  expect(saved.title).toBe("タブを閉じたE2Eノート");
+  expect(saved.pages[0].contentRevision).toBeGreaterThan(0);
+  // The browser shows the list tab again: it shows the note list (not the
+  // creation screen the note was made from) with the change, without a reload.
+  await list.bringToFront();
+  await expect(list.locator("#noteListView")).toBeVisible();
+  await expect(list.locator("#noteCreateView")).toBeHidden();
+  await expect(list.locator("#noteList .note-card h4")).toHaveText(["タブを閉じたE2Eノート"], { timeout: 20_000 });
+  expect(new URL(list.url()).searchParams.get("noteEditor")).toBeNull();
+
+  // The save popover's "ノート一覧へ戻る" closes the tab the same way.
+  editor = await openEditorPopup(list, () => list.locator(".note-card", { hasText: "タブを閉じたE2Eノート" })
+    .getByRole("button", { name: "編集", exact: true }).click(), { blockedRequests, onPageError });
+  await editor.locator("#noteSaveStatus").click();
+  await expect(editor.locator("#noteSaveListBtn")).toBeVisible();
+  const reopenedEditorClosed = editor.waitForEvent("close", { timeout: 20_000 });
+  await editor.locator("#noteSaveListBtn").click();
+  await reopenedEditorClosed;
+  expect(list.isClosed()).toBe(false);
+  expect(pageErrors).toEqual([]);
   expect(blockedRequests).toEqual([]);
 });
 
@@ -3912,6 +4006,152 @@ test("@authenticated @ipad-v-next ノートのマスクは暗記学習と同じ�
   expect(pageErrors).toEqual([]);
 });
 
+test("@authenticated @ipad-v-next 指の移動は離した後も慣性で流れ、暗記モードとページの外側でも動かせ、2本指タップでペンと消しゴムを切り替える", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "指の操作E2Eノート", { pageCount: 2 });
+  await login(page, user);
+  // An Apple Pencil user: fingers move the page instead of drawing.
+  await page.evaluate(uid => localStorage.setItem(`dentalQaNoteToolSettings:${uid}`, JSON.stringify({ pencilMode: true, fingerDraw: false })), user.uid);
+  await page.setViewportSize({ width: 1180, height: 760 });
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  const stage = page.locator("#notePageStage");
+  const viewport = page.locator("#noteViewport");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  await expect(stage).toHaveAttribute("data-tool", "pen");
+  const scrollTop = () => viewport.evaluate(node => node.scrollTop);
+  const setScrollTop = value => viewport.evaluate((node, top) => { node.scrollTop = top; }, value);
+  const zoom = () => stage.evaluate(node => Number(getComputedStyle(node).getPropertyValue("--page-zoom") || 1));
+  expect(await viewport.evaluate(node => node.scrollHeight - node.clientHeight), "縦に動かせる長さがある").toBeGreaterThan(400);
+  const touch = (locator, type, pointerId, x, y) => locator.dispatchEvent(type, {
+    pointerId, pointerType: "touch", button: 0, clientX: x, clientY: y, width: 8, height: 8, pressure: type === "pointerup" ? 0 : .5
+  });
+  // A finger drags `distance` px upward in 10 steps, 16 ms apart, and lifts
+  // while it still moves (dispatched in the page, so that the timing holds
+  // however busy the test machine is).
+  const flick = (locator, x, y, distance, pointerId) => locator.evaluate(async (target, { x, y, distance, pointerId }) => {
+    const fire = (type, clientY) => target.dispatchEvent(new PointerEvent(type, {
+      pointerId, pointerType: "touch", button: 0, buttons: type === "pointerup" ? 0 : 1, isPrimary: true,
+      clientX: x, clientY, width: 8, height: 8, pressure: type === "pointerup" ? 0 : .5,
+      bubbles: true, cancelable: true, composed: true
+    }));
+    fire("pointerdown", y);
+    for (let step = 1; step <= 10; step += 1) {
+      await new Promise(resolve => setTimeout(resolve, 16));
+      fire("pointermove", y - distance * step / 10);
+    }
+    fire("pointerup", y - distance);
+  }, { x, y, distance, pointerId });
+  const box = await stage.boundingBox();
+  const onPage = { x: box.x + box.width * .5, y: Math.min(box.y + box.height, 700) - 40 };
+
+  // Edit mode: the page glides on after a quick drag, then slows to a stop.
+  await setScrollTop(0);
+  await flick(capture, onPage.x, onPage.y, 200, 601);
+  const released = await scrollTop();
+  expect(released, "指に合わせて動く").toBeGreaterThan(150);
+  await page.waitForTimeout(700);
+  const glided = await scrollTop();
+  expect(glided, "指を離した後も慣性で流れる").toBeGreaterThan(released + 60);
+  await page.waitForTimeout(2600);
+  const settled = await scrollTop();
+  await page.waitForTimeout(300);
+  expect(Math.abs(await scrollTop() - settled), "減速して止まる").toBeLessThanOrEqual(1);
+
+  // A new touch stops the glide at once.
+  await setScrollTop(0);
+  await flick(capture, onPage.x, onPage.y, 200, 602);
+  await page.waitForTimeout(60);
+  await touch(capture, "pointerdown", 603, onPage.x, onPage.y);
+  const stoppedAt = await scrollTop();
+  await page.waitForTimeout(400);
+  expect(await scrollTop(), "触れると止まる").toBe(stoppedAt);
+  await touch(capture, "pointerup", 603, onPage.x, onPage.y);
+
+  // The area around the page moves the page too.
+  await setScrollTop(0);
+  const around = await viewport.evaluate(node => {
+    const rect = node.getBoundingClientRect();
+    const page = node.querySelector("#notePageStage").getBoundingClientRect();
+    return { x: rect.left + Math.max(8, (page.left - rect.left) / 2), y: rect.top + 300 };
+  });
+  await flick(viewport, around.x, around.y, 150, 604);
+  expect(await scrollTop(), "ページの外側の指でも動く").toBeGreaterThan(100);
+
+  // Study mode: a finger moves the page as on the image memory screen.
+  await page.locator("#noteStudyModeBtn").click();
+  await expect(stage).toHaveClass(/study-mode/);
+  await page.waitForTimeout(2500);
+  await setScrollTop(0);
+  await touch(stage, "pointerdown", 605, onPage.x, onPage.y);
+  for (let step = 1; step <= 6; step += 1) {
+    await page.waitForTimeout(40);
+    await touch(stage, "pointermove", 605, onPage.x, onPage.y - step * 30);
+  }
+  await page.waitForTimeout(200);
+  await touch(stage, "pointerup", 605, onPage.x, onPage.y - 180);
+  expect(await scrollTop(), "暗記モードでも指でページを動かせる").toBeGreaterThan(150);
+  // A two-finger tap does not change tools in study mode.
+  const twoFingerTap = async (base = 900) => {
+    const center = { x: box.x + box.width * .5, y: box.y + 200 };
+    await touch(capture, "pointerdown", base + 1, center.x - 60, center.y);
+    await touch(capture, "pointerdown", base + 2, center.x + 60, center.y);
+    await page.waitForTimeout(60);
+    await touch(capture, "pointerup", base + 1, center.x - 60, center.y);
+    await touch(capture, "pointerup", base + 2, center.x + 60, center.y);
+  };
+  await twoFingerTap(910);
+  await page.waitForTimeout(300);
+  await page.locator("#noteEditModeBtn").click();
+  await expect(stage).toHaveAttribute("data-tool", "pen");
+
+  // Edit mode: a two-finger tap switches pen ⇄ eraser and keeps the zoom.
+  const zoomBefore = await zoom();
+  await twoFingerTap(920);
+  await expect(stage, "2本指タップで消しゴムへ").toHaveAttribute("data-tool", "eraser-object");
+  await expect(page.locator('[data-note-tool="eraser-object"]')).toHaveClass(/active/);
+  await expect(page.locator("#noteEditorNotice")).toContainText("消しゴムに切り替えました");
+  expect(await zoom(), "タップでは拡大率を変えない").toBeCloseTo(zoomBefore, 5);
+  await twoFingerTap(930);
+  await expect(stage, "もう一度でペンへ戻る").toHaveAttribute("data-tool", "pen");
+  // A pinch is not a tap.
+  const pinchCenter = { x: box.x + box.width * .5, y: box.y + 220 };
+  await touch(capture, "pointerdown", 941, pinchCenter.x - 40, pinchCenter.y);
+  await touch(capture, "pointerdown", 942, pinchCenter.x + 40, pinchCenter.y);
+  for (const spread of [60, 80, 100]) {
+    await touch(capture, "pointermove", 941, pinchCenter.x - spread, pinchCenter.y);
+    await touch(capture, "pointermove", 942, pinchCenter.x + spread, pinchCenter.y);
+  }
+  await touch(capture, "pointerup", 942, pinchCenter.x + 100, pinchCenter.y);
+  await expect.poll(zoom).toBeGreaterThan(zoomBefore * 1.5);
+  // The finger left down after the pinch moves the page on.
+  const beforeResume = await scrollTop();
+  for (let step = 1; step <= 5; step += 1) {
+    await page.waitForTimeout(16);
+    await touch(capture, "pointermove", 941, pinchCenter.x - 100, pinchCenter.y - step * 20);
+  }
+  expect(await scrollTop(), "ピンチ後に残した指でもページを動かせる").toBeGreaterThan(beforeResume + 50);
+  await touch(capture, "pointerup", 941, pinchCenter.x - 100, pinchCenter.y - 100);
+  await page.waitForTimeout(200);
+  await expect(stage, "ピンチではツールを変えない").toHaveAttribute("data-tool", "pen");
+
+  // The input settings can turn the two-finger tap off.
+  await page.locator("#noteInputSettingsBtn").click();
+  await expect(page.locator("#noteTwoFingerTap")).toBeChecked();
+  await page.locator("#noteTwoFingerTap").uncheck();
+  await page.locator("#noteToolSettingsDoneBtn").click();
+  await twoFingerTap(950);
+  await page.waitForTimeout(300);
+  await expect(stage, "設定をオフにすると切り替えない").toHaveAttribute("data-tool", "pen");
+  expect(await page.evaluate(uid => JSON.parse(localStorage.getItem(`dentalQaNoteToolSettings:${uid}`)).twoFingerTapQuickSwitch, user.uid)).toBe(false);
+  expect(blockedRequests).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
 test("@authenticated 教材をノートで繰り返し開いても既定ノートを重複作成しない", async ({ page }) => {
   test.setTimeout(90_000);
   const blockedRequests = await guardProductionFirebase(page);
@@ -3928,12 +4168,21 @@ test("@authenticated 教材をノートで繰り返し開いても既定ノー�
   let row = page.locator('#pdfEditTableBody tr:has-text("既定ノートE2E教材")');
   let editor = await openEditorPopup(page, () => row.locator("[data-open-note]").click(), { blockedRequests });
   await expect(editor.locator("#notePageStage .note-background-image")).toBeVisible({ timeout: 20_000 });
+  // The tab knows the note is linked to a material and loads the material
+  // together with the note.
+  expect(new URL(editor.url()).searchParams.get("material")).toBe("1");
+  expect(await editor.evaluate(() => globalThis.__noteEditorStartupMetrics.context)).toMatchObject({
+    noteType: "material-linked",
+    materialHinted: true
+  });
   await editor.close();
 
   await page.locator("#pdfEditModeBtn").click();
   row = page.locator('#pdfEditTableBody tr:has-text("既定ノートE2E教材")');
   editor = await openEditorPopup(page, () => row.locator("[data-open-note]").click(), { blockedRequests });
   await expect(editor.locator("#noteEditorView")).toBeVisible();
+  await expect(editor.locator("#notePageStage .note-background-image")).toBeVisible({ timeout: 20_000 });
+  expect(new URL(editor.url()).searchParams.get("material")).toBe("1");
 
   const stored = await readNotes(user.uid);
   const linked = stored.notes.filter(note => note.type === "material-linked");

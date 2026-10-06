@@ -438,9 +438,9 @@ studyNotes = createStudyNotes({
   },
   ensureMaterialDefaultNoteId: (materialId, preferredNoteId) =>
     imageMemory.ensureMaterialDefaultNoteId(materialId, preferredNoteId),
-  activateSection: mode => {
+  activateSection: (mode, { refresh = true } = {}) => {
     setCombinedImageNoteMode(mode);
-    if (mode === "note") void studyNotes.refresh();
+    if (mode === "note" && refresh) void studyNotes.refresh();
   }
 });
 
@@ -1548,8 +1548,9 @@ async function initFirebase() {
 
         if (noteEditorRoute) {
           // Dedicated-note readiness is independent from app-wide state. Keep
-          // `loaded` false; linked material data is fetched only after the note
-          // metadata proves it is needed.
+          // `loaded` false; linked material data is fetched only for a note
+          // whose metadata (or whose tab URL, set by the note list) says it is
+          // linked to a material.
           session.noteEditorReady = true;
           syncPhase = "note-editor-ready";
           el.authStatus.textContent = `ログイン中: ${user.email || "メール不明"}`;

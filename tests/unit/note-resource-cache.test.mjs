@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createIndexedDbNoteResourceWriter,
   createNoteResourceCache,
+  noteResourceManifestKey,
   selectNoteResourceCacheEvictions
 } from "../../js/core/note-resource-cache.js";
 
@@ -168,4 +169,116 @@ test("IndexedDB書込みキューは失敗後も後続処理を直列実行す�
   await assert.rejects(first, /forced write failure/);
   assert.equal(await second, true);
   assert.deepEqual(events, ["first:start", "first:failed", "second:start", "second:done"]);
+});
+
+// An IndexedDB stand-in that records which records are read.
+function createKeyedLocalStore(initial = []) {
+  const records = new Map(initial.map(record => [record.key, record]));
+  const reads = [];
+  return {
+    records,
+    reads,
+    async get(storeName, key) {
+      assert.equal(storeName, "thumbnails");
+      reads.push(key);
+      return records.get(key) || null;
+    },
+    async put(storeName, value) {
+      assert.equal(storeName, "thumbnails");
+      records.set(value.key, structuredClone(value));
+    },
+    async delete(storeName, key) {
+      records.delete(key);
+    },
+    async listKeysForUser(storeName, uid) {
+      return [...records.keys()].filter(key => key.startsWith(`${uid}|`)).sort();
+    },
+    async listForUser() {
+      throw new Error("画像を含む全レコードは読み込まない");
+    }
+  };
+}
+
+const resource = (name, size, updatedAt) => ({
+  key: `uid|note|page|resource-${name}`,
+  uid: "uid",
+  noteId: "note",
+  pageId: "page",
+  kind: "note-resource",
+  blobSize: size,
+  updatedAt
+});
+
+test("画像キャッシュの整理は一覧レコードとキーだけで判断し、保存済みの画像を読み込まない", async () => {
+  const localStore = createKeyedLocalStore();
+  const evictions = [];
+  const writer = createIndexedDbNoteResourceWriter({ localStore, maxEntries: 2, maxBytes: 100, onEvictions: count => evictions.push(count) });
+
+  assert.equal(await writer.write(resource("a", 10, "2026-01-01T00:00:00.000Z")), true);
+  assert.equal(await writer.write(resource("b", 10, "2026-01-02T00:00:00.000Z")), true);
+  assert.equal(await writer.write(resource("c", 10, "2026-01-03T00:00:00.000Z")), true);
+
+  assert.deepEqual([...localStore.records.keys()].sort(), [
+    "uid|note|page|resource-b",
+    "uid|note|page|resource-c",
+    noteResourceManifestKey("uid")
+  ].sort());
+  assert.deepEqual(evictions, [1]);
+  assert.deepEqual(new Set(localStore.reads), new Set([noteResourceManifestKey("uid")]));
+  assert.deepEqual(localStore.records.get(noteResourceManifestKey("uid")).entries.map(entry => [entry.key, entry.blobSize]), [
+    ["uid|note|page|resource-b", 10],
+    ["uid|note|page|resource-c", 10]
+  ]);
+});
+
+test("一覧にない既存の画像キャッシュは一度だけ読み、消えた項目は一覧から外す", async () => {
+  const localStore = createKeyedLocalStore([
+    resource("old", 60, "2026-01-01T00:00:00.000Z"),
+    resource("kept", 30, "2026-01-02T00:00:00.000Z"),
+    { key: "uid|note|page|thumbnail", uid: "uid", noteId: "note", kind: "page-thumbnail", blobSize: 500, updatedAt: "2025-01-01T00:00:00.000Z" }
+  ]);
+  const writer = createIndexedDbNoteResourceWriter({ localStore, maxEntries: 5, maxBytes: 100 });
+
+  // 60 + 30 + 20 exceeds 100 bytes: the oldest resource goes, the thumbnail stays.
+  assert.equal(await writer.write(resource("new", 20, "2026-01-03T00:00:00.000Z")), true);
+  assert.equal(localStore.records.has("uid|note|page|resource-old"), false);
+  assert.equal(localStore.records.has("uid|note|page|thumbnail"), true);
+  assert.deepEqual(localStore.reads.filter(key => key !== noteResourceManifestKey("uid")).sort(), [
+    "uid|note|page|resource-kept",
+    "uid|note|page|resource-old"
+  ]);
+
+  // Another tab removed a cached image: the manifest no longer counts it, and
+  // nothing but the manifest is read again.
+  localStore.records.delete("uid|note|page|resource-kept");
+  localStore.reads.length = 0;
+  assert.equal(await writer.write(resource("next", 20, "2026-01-04T00:00:00.000Z")), true);
+  assert.deepEqual(localStore.reads, [noteResourceManifestKey("uid")]);
+  assert.deepEqual(localStore.records.get(noteResourceManifestKey("uid")).entries.map(entry => entry.key).sort(), [
+    "uid|note|page|resource-new",
+    "uid|note|page|resource-next"
+  ]);
+});
+
+test("画像キャッシュの容量超過時はキーだけで管理対象を消して1回だけ再試行する", async () => {
+  const localStore = createKeyedLocalStore([
+    resource("a", 3, "2026-01-01T00:00:00.000Z"),
+    { key: "uid|note|page|thumbnail", uid: "uid", noteId: "note", kind: "page-thumbnail", blobSize: 3 }
+  ]);
+  const put = localStore.put;
+  let failures = 1;
+  localStore.put = async (storeName, value) => {
+    if (value.kind === "note-resource" && failures > 0) {
+      failures -= 1;
+      throw new DOMException("storage quota reached", "QuotaExceededError");
+    }
+    return put(storeName, value);
+  };
+  const writer = createIndexedDbNoteResourceWriter({ localStore });
+
+  assert.equal(await writer.write(resource("b", 3, "2026-01-02T00:00:00.000Z")), true);
+  assert.equal(localStore.records.has("uid|note|page|resource-a"), false);
+  assert.equal(localStore.records.has("uid|note|page|resource-b"), true);
+  assert.equal(localStore.records.has("uid|note|page|thumbnail"), true);
+  assert.deepEqual(localStore.records.get(noteResourceManifestKey("uid")).entries.map(entry => entry.key), ["uid|note|page|resource-b"]);
 });

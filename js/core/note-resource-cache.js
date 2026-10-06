@@ -63,50 +63,122 @@ function isIndexedDbQuotaError(error) {
   return error?.name === "QuotaExceededError" || /quota/i.test(String(error?.message || error || ""));
 }
 
+const MANIFEST_KIND = "note-resource-manifest";
+const MANIFEST_NAME = "~note-resource-manifest";
+// Cached page images are stored under keys ending in "|resource-<hash>"
+// (see resourceLocalCacheKey in study-notes.js).
+const RESOURCE_KEY_PATTERN = /\|resource-[^|]*$/;
+
+// The record that lists every cached resource of a user (key, size, time).
+export function noteResourceManifestKey(uid) {
+  return `${uid}|${MANIFEST_NAME}`;
+}
+
+function resourceEntry(record) {
+  if (record?.kind !== "note-resource" || !validText(record.key)) return null;
+  return {
+    key: record.key,
+    blobSize: recordSize(record),
+    updatedAt: String(record.updatedAt || record.createdAt || "")
+  };
+}
+
 export function createIndexedDbNoteResourceWriter({
   localStore,
   storeName = "thumbnails",
   maxEntries = NOTE_RESOURCE_CACHE_MAX_ENTRIES,
   maxBytes = NOTE_RESOURCE_IDB_MAX_BYTES,
+  isResourceKey = key => RESOURCE_KEY_PATTERN.test(String(key)),
   onEvictions = () => {}
 } = {}) {
   let writeQueue = Promise.resolve();
+  // Reading every record to decide what to evict read every cached image
+  // (up to maxBytes) from IndexedDB for each new one. A store that can list
+  // its keys alone keeps a manifest of sizes and times instead.
+  const keyed = typeof localStore?.listKeysForUser === "function" && typeof localStore?.get === "function";
 
   async function deleteKeys(keys) {
     for (const key of keys) await localStore.delete(storeName, key);
     if (keys.length) onEvictions(keys.length);
   }
 
-  async function prune(record) {
-    const records = await localStore.listForUser(storeName, record.uid);
-    await deleteKeys(selectNoteResourceCacheEvictions(records, {
-      incomingKey: record.key,
-      incomingSize: record.blobSize,
-      maxEntries,
-      maxBytes
-    }));
+  // The cached resources of a user, without their images: the manifest gives
+  // the size and time of each, and the stored keys (read without values) show
+  // which still exist. A resource the manifest does not list (cached before
+  // the manifest existed, or by another tab at the same moment) is read once.
+  async function resourceEntries(uid) {
+    if (!keyed) {
+      const records = await localStore.listForUser(storeName, uid);
+      return records.map(resourceEntry).filter(Boolean);
+    }
+    const [manifest, keys] = await Promise.all([
+      localStore.get(storeName, noteResourceManifestKey(uid)).catch(() => null),
+      localStore.listKeysForUser(storeName, uid)
+    ]);
+    const listed = new Map(
+      (manifest?.kind === MANIFEST_KIND && Array.isArray(manifest.entries) ? manifest.entries : [])
+        .filter(entry => validText(entry?.key))
+        .map(entry => [entry.key, entry])
+    );
+    const entries = [];
+    for (const key of keys) {
+      if (!validText(key) || !isResourceKey(key)) continue;
+      const entry = listed.get(key) || resourceEntry(await localStore.get(storeName, key).catch(() => null));
+      if (entry?.key === key) entries.push(entry);
+    }
+    return entries;
+  }
+
+  async function managedKeys(uid) {
+    if (!keyed) {
+      const records = await localStore.listForUser(storeName, uid);
+      return records.filter(item => item?.kind === "note-resource" && validText(item.key)).map(item => item.key);
+    }
+    return (await localStore.listKeysForUser(storeName, uid)).filter(key => validText(key) && isResourceKey(key));
+  }
+
+  async function saveManifest(uid, entries) {
+    if (!keyed) return;
+    try {
+      await localStore.put(storeName, {
+        key: noteResourceManifestKey(uid),
+        uid,
+        noteId: MANIFEST_NAME,
+        kind: MANIFEST_KIND,
+        entries,
+        updatedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      // The next write reads the resources the manifest misses.
+      console.debug("ノート画像キャッシュの一覧を保存できませんでした。", error);
+    }
   }
 
   async function write(record) {
     const blobSize = Number(record?.blobSize || 0);
     if (blobSize <= 0 || blobSize > maxBytes) return false;
-    await prune(record);
+    const entries = await resourceEntries(record.uid);
+    const evicted = selectNoteResourceCacheEvictions(
+      entries.map(entry => ({ ...entry, kind: "note-resource" })),
+      { incomingKey: record.key, incomingSize: blobSize, maxEntries, maxBytes }
+    );
+    await deleteKeys(evicted);
+    const evictedKeys = new Set(evicted);
+    let retained = entries.filter(entry => entry.key !== record.key && !evictedKeys.has(entry.key));
     try {
       await localStore.put(storeName, record);
-      return true;
     } catch (error) {
       if (!isIndexedDbQuotaError(error)) throw error;
       // Browser quotas vary substantially, especially in iPad private or
       // low-storage sessions. These records are reproducible cache data, so
       // clear only managed resources before making one final write attempt.
-      const managedRecords = await localStore.listForUser(storeName, record.uid);
-      const managedKeys = managedRecords
-        .filter(item => item?.kind === "note-resource" && validText(item.key))
-        .map(item => item.key);
-      await deleteKeys(managedKeys);
+      await deleteKeys(await managedKeys(record.uid));
+      retained = [];
       await localStore.put(storeName, record);
-      return true;
     }
+    const written = resourceEntry({ kind: "note-resource", ...record, blobSize });
+    await saveManifest(record.uid, written ? [...retained, written] : retained);
+    return true;
   }
 
   function enqueue(record) {

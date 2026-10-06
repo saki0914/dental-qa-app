@@ -32,7 +32,10 @@ export function resolvePageSwipeIntent({
   startedAtEdge = false,
   settings = NOTE_PAGE_SWIPE_DEFAULTS
 }) {
-  if (startedAtEdge) return "swipe";
+  // A finger that draws turns the page from the page's edge at once. A finger
+  // that does not draw goes by its direction everywhere, so that it can move
+  // the page up and down near the edge too.
+  if (startedAtEdge && fingerDraw) return "swipe";
   const dx = Math.abs(Number(endX) - Number(startX));
   const dy = Math.abs(Number(endY) - Number(startY));
   if (Math.hypot(dx, dy) < settings.directionLockDistance) return "pending";

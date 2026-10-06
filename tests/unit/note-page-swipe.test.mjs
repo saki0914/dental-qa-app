@@ -36,6 +36,13 @@ test("edge gestures reserve page swipe immediately", () => {
   }), "swipe");
 });
 
+test("指で描かない設定では、ページ端から始めた縦の動きもページを動かす", () => {
+  const edge = { startX: 4, startY: 200, fingerDraw: false, startedAtEdge: true };
+  assert.equal(resolvePageSwipeIntent({ ...edge, endX: 4, endY: 200 }), "pending");
+  assert.equal(resolvePageSwipeIntent({ ...edge, endX: 8, endY: 260 }), "content");
+  assert.equal(resolvePageSwipeIntent({ ...edge, endX: -60, endY: 205 }), "swipe");
+});
+
 test("隣接ページがない方向では指追従量へ抵抗を加える", () => {
   assert.equal(pageSwipeVisualOffset(-100, { hasAdjacentPage: true }), -100);
   assert.equal(pageSwipeVisualOffset(-100, { hasAdjacentPage: false }), -24);

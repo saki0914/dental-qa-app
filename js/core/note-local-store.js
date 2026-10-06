@@ -255,6 +255,15 @@ export function createNoteLocalStore(indexedDb = globalThis.indexedDB, keyRange 
         .filter(value => value.uid === uid)
         .map(value => restoreFromStore(store, value));
     },
+    // The keys of a user's records, without reading the records (a cache of
+    // page images would otherwise be read in full).
+    async listKeysForUser(store, uid) {
+      if (!uid) throw new Error("ローカル保存のユーザー識別子が不足しています。");
+      const keys = await run(store, "readonly", objectStore => (
+        objectStore.getAllKeys(prefixRange(`${uid}|`))
+      )) || [];
+      return keys.map(String);
+    },
     async listForNote(store, uid, noteId) {
       if (!uid || !noteId) throw new Error("ローカル保存のノート識別子が不足しています。");
       const prefix = `${uid}|${noteId}|`;
