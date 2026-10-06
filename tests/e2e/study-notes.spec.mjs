@@ -4110,12 +4110,15 @@ test("@authenticated @ipad-v-next 指の移動は離した後も慣性で流れ�
   await expect(stage).toHaveAttribute("data-tool", "pen");
 
   // Edit mode: a two-finger tap switches pen ⇄ eraser and keeps the zoom.
+  // (Taps less than 0.45 s apart are one double tap: wait between them.)
   const zoomBefore = await zoom();
+  await page.waitForTimeout(500);
   await twoFingerTap(920);
   await expect(stage, "2本指タップで消しゴムへ").toHaveAttribute("data-tool", "eraser-object");
   await expect(page.locator('[data-note-tool="eraser-object"]')).toHaveClass(/active/);
   await expect(page.locator("#noteEditorNotice")).toContainText("消しゴムに切り替えました");
   expect(await zoom(), "タップでは拡大率を変えない").toBeCloseTo(zoomBefore, 5);
+  await page.waitForTimeout(500);
   await twoFingerTap(930);
   await expect(stage, "もう一度でペンへ戻る").toHaveAttribute("data-tool", "pen");
   // A pinch is not a tap.
@@ -4148,6 +4151,158 @@ test("@authenticated @ipad-v-next 指の移動は離した後も慣性で流れ�
   await page.waitForTimeout(300);
   await expect(stage, "設定をオフにすると切り替えない").toHaveAttribute("data-tool", "pen");
   expect(await page.evaluate(uid => JSON.parse(localStorage.getItem(`dentalQaNoteToolSettings:${uid}`)).twoFingerTapQuickSwitch, user.uid)).toBe(false);
+  expect(blockedRequests).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
+test("@authenticated @ipad-v-next iPadの大きさの指（幅42〜84px）でも2本指タップ・2本指ダブルタップ・指の移動・ピンチ・マスクのタップが働き、手のひらとPencil直後の手は無視する", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "iPadの指E2Eノート", { pageCount: 2 });
+  await login(page, user);
+  // An Apple Pencil user: fingers move the page instead of drawing.
+  await page.evaluate(uid => localStorage.setItem(`dentalQaNoteToolSettings:${uid}`, JSON.stringify({ pencilMode: true, fingerDraw: false })), user.uid);
+  await page.setViewportSize({ width: 1180, height: 760 });
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  const stage = page.locator("#notePageStage");
+  const viewport = page.locator("#noteViewport");
+  const capture = stage.locator('[data-layer="drawing-input"]');
+  await expect(stage).toHaveAttribute("data-tool", "pen");
+  const scrollTop = () => viewport.evaluate(node => node.scrollTop);
+  const setScrollTop = value => viewport.evaluate((node, top) => { node.scrollTop = top; }, value);
+  const zoom = () => stage.evaluate(node => Number(getComputedStyle(node).getPropertyValue("--page-zoom") || 1));
+  // Safari on iPad reports a contact's width and height as twice its radius:
+  // a fingertip is about 40 px or more, a thumb pressed flat about 80 px.
+  const touch = (locator, type, pointerId, x, y, size = 52) => locator.dispatchEvent(type, {
+    pointerId, pointerType: "touch", button: 0, clientX: x, clientY: y, width: size, height: size, pressure: type === "pointerup" ? 0 : .5
+  });
+  // Contacts dispatched in the page, so that their timing holds however busy
+  // the test machine is. Each step: [type, pointerId, pointerType, x, y, size, waitAfterMs].
+  const sequence = (locator, steps) => locator.evaluate(async (target, steps) => {
+    for (const [type, pointerId, pointerType, clientX, clientY, size, waitMs] of steps) {
+      target.dispatchEvent(new PointerEvent(type, {
+        pointerId, pointerType, button: 0, buttons: type === "pointerup" ? 0 : 1, isPrimary: pointerId % 2 === 1,
+        clientX, clientY, width: size, height: size, pressure: type === "pointerup" ? 0 : .5,
+        bubbles: true, cancelable: true, composed: true
+      }));
+      if (waitMs) await new Promise(resolve => setTimeout(resolve, waitMs));
+    }
+  }, steps);
+  const box = await stage.boundingBox();
+  const tapAt = { x: box.x + box.width * .5, y: box.y + 300 };
+  const twoFingerTapSteps = (base, sizes = [46, 60], waitAfterMs = 0) => [
+    ["pointerdown", base + 1, "touch", tapAt.x - 60, tapAt.y, sizes[0], 20],
+    ["pointerdown", base + 2, "touch", tapAt.x + 60, tapAt.y + 4, sizes[1], 90],
+    ["pointerup", base + 1, "touch", tapAt.x - 58, tapAt.y + 2, sizes[0], 0],
+    ["pointerup", base + 2, "touch", tapAt.x + 61, tapAt.y + 5, sizes[1], waitAfterMs]
+  ];
+  const flickSteps = (pointerId, x, y, distance, size) => [
+    ["pointerdown", pointerId, "touch", x, y, size, 16],
+    ...Array.from({ length: 10 }, (_, index) => ["pointermove", pointerId, "touch", x, y - distance * (index + 1) / 10, size, 16]),
+    ["pointerup", pointerId, "touch", x, y - distance, size, 0]
+  ];
+
+  // A note mask (drawn with the mouse) for the study mode tap later.
+  await page.locator('[data-note-tool="mask"]').click();
+  await page.mouse.move(box.x + box.width * .3, box.y + 80);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * .55, box.y + 150, { steps: 5 });
+  await page.mouse.up();
+  await expect(stage.locator(".note-mask")).toHaveCount(1);
+  await page.locator('[data-note-tool="pen"]').click();
+  await expect(stage).toHaveAttribute("data-tool", "pen");
+
+  // A two-finger tap with iPad-sized fingers switches to the eraser.
+  await page.waitForTimeout(500);
+  await sequence(capture, twoFingerTapSteps(700));
+  await expect(stage, "幅46px・60pxの指の2本指タップで消しゴムへ").toHaveAttribute("data-tool", "eraser-object");
+  await expect(page.locator("#noteEditorNotice")).toContainText("消しゴムに切り替えました");
+  // A two-finger double tap switches once (back to the pen), not twice.
+  await page.waitForTimeout(600);
+  await sequence(capture, [...twoFingerTapSteps(710, [52, 84], 150), ...twoFingerTapSteps(720, [52, 84])]);
+  await page.waitForTimeout(300);
+  await expect(stage, "2本指のダブルタップは1回分だけ切り替える").toHaveAttribute("data-tool", "pen");
+  await expect(page.locator("#noteEditorNotice")).toContainText("ペンに切り替えました");
+  // Later, a tap switches again.
+  await page.waitForTimeout(600);
+  await sequence(capture, twoFingerTapSteps(730));
+  await expect(stage, "間を空けた次のタップでは再び切り替える").toHaveAttribute("data-tool", "eraser-object");
+  await page.waitForTimeout(600);
+  await sequence(capture, twoFingerTapSteps(740));
+  await expect(stage).toHaveAttribute("data-tool", "pen");
+
+  // The hand just after the Pencil lifts is not a tap.
+  await page.waitForTimeout(600);
+  const strokes = await stage.locator("path[data-element-id]").count();
+  await sequence(capture, [
+    ["pointerdown", 750, "pen", box.x + box.width * .2, box.y + 420, 1, 16],
+    ["pointermove", 750, "pen", box.x + box.width * .35, box.y + 440, 1, 16],
+    ["pointerup", 750, "pen", box.x + box.width * .35, box.y + 440, 1, 30],
+    ...twoFingerTapSteps(760)
+  ]);
+  await expect(stage.locator("path[data-element-id]")).toHaveCount(strokes + 1);
+  await page.waitForTimeout(300);
+  await expect(stage, "Pencilを離した直後の2本の指では切り替えない").toHaveAttribute("data-tool", "pen");
+
+  // A finger (52 px) moves the page and lets it glide; a palm (140 px) does not.
+  await setScrollTop(0);
+  await sequence(capture, flickSteps(770, box.x + box.width * .5, 660, 200, 52));
+  expect(await scrollTop(), "iPadの大きさの指でページを動かせる").toBeGreaterThan(150);
+  await page.waitForTimeout(3500);
+  await setScrollTop(0);
+  await sequence(capture, flickSteps(771, box.x + box.width * .5, 660, 200, 140));
+  await page.waitForTimeout(300);
+  expect(await scrollTop(), "手のひらほどの接触ではページを動かさない").toBe(0);
+  await expect(stage.locator("path[data-element-id]"), "指・手のひらでは描かない").toHaveCount(strokes + 1);
+  // A small wobble of a resting finger does not move the page.
+  await sequence(capture, [
+    ["pointerdown", 772, "touch", box.x + box.width * .5, 600, 60, 16],
+    ["pointermove", 772, "touch", box.x + box.width * .5 + 3, 605, 60, 16],
+    ["pointerup", 772, "touch", box.x + box.width * .5 + 3, 605, 60, 0]
+  ]);
+  expect(await scrollTop(), "8px未満のずれではページを動かさない").toBe(0);
+
+  // The area around the page.
+  const around = await viewport.evaluate(node => {
+    const rect = node.getBoundingClientRect();
+    const page = node.querySelector("#notePageStage").getBoundingClientRect();
+    return { x: rect.left + Math.max(8, (page.left - rect.left) / 2), y: rect.top + 300 };
+  });
+  await sequence(viewport, flickSteps(773, around.x, around.y, 150, 48));
+  expect(await scrollTop(), "ページの外側でもiPadの大きさの指で動く").toBeGreaterThan(100);
+  await page.waitForTimeout(3500);
+
+  // Study mode: a fingertip taps a mask open.
+  await page.locator("#noteStudyModeBtn").click();
+  await expect(stage).toHaveClass(/study-mode/);
+  await setScrollTop(0);
+  await page.waitForTimeout(500);
+  const maskBox = await stage.locator(".note-mask").first().boundingBox();
+  const maskCenter = { x: maskBox.x + maskBox.width / 2, y: maskBox.y + maskBox.height / 2 };
+  await touch(stage.locator(".note-mask").first(), "pointerdown", 780, maskCenter.x, maskCenter.y, 56);
+  await touch(stage.locator(".note-mask").first(), "pointerup", 780, maskCenter.x + 2, maskCenter.y + 1, 56);
+  await expect(stage.locator(".note-mask.revealed"), "幅56pxの指のタップでマスクをめくる").toHaveCount(1);
+  await page.locator("#noteEditModeBtn").click();
+  await expect(stage).toHaveAttribute("data-tool", "pen");
+
+  // A pinch with iPad-sized fingers zooms.
+  const zoomBefore = await zoom();
+  const pinchAt = { x: box.x + box.width * .5, y: box.y + 260 };
+  await touch(capture, "pointerdown", 791, pinchAt.x - 40, pinchAt.y, 50);
+  await touch(capture, "pointerdown", 792, pinchAt.x + 40, pinchAt.y, 58);
+  for (const spread of [60, 80, 100]) {
+    await touch(capture, "pointermove", 791, pinchAt.x - spread, pinchAt.y, 50);
+    await touch(capture, "pointermove", 792, pinchAt.x + spread, pinchAt.y, 58);
+  }
+  await touch(capture, "pointerup", 791, pinchAt.x - 100, pinchAt.y, 50);
+  await touch(capture, "pointerup", 792, pinchAt.x + 100, pinchAt.y, 58);
+  await expect.poll(zoom, { message: "iPadの大きさの指でピンチすると拡大する" }).toBeGreaterThan(zoomBefore * 1.5);
+  await page.waitForTimeout(300);
+  await expect(stage, "ピンチではツールを変えない").toHaveAttribute("data-tool", "pen");
   expect(blockedRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
 });

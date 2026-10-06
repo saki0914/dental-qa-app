@@ -88,6 +88,36 @@ test("大きいtouch接触を掌候補として無視する", () => {
   assert.equal(guard.isPalmCandidate({ pointerType: "touch", width: 8, height: 8 }), false);
 });
 
+test("iPadの指（Safariは接触の幅を半径の2倍、指先で約40px以上と報告する）を掌にしない", () => {
+  const guard = createNoteInputGuard();
+  for (const size of [8, 42, 52, 63, 84]) {
+    const finger = { pointerType: "touch", width: size, height: size };
+    assert.equal(guard.isPalmCandidate(finger), false, `${size}pxの指`);
+    assert.equal(guard.shouldIgnoreTouch(finger), false, `${size}pxの指は無視しない`);
+  }
+  for (const size of [100, 140, 220]) {
+    assert.equal(guard.isPalmCandidate({ pointerType: "touch", width: size, height: size * .7 }), true, `${size}pxは手のひら`);
+  }
+  assert.equal(guard.isPalmCandidate({ pointerType: "pen", width: 140, height: 140 }), false, "Pencilは大きさで拒否しない");
+});
+
+test("Pencilが触れている間と離れた直後だけをPencil使用中とする（2本指タップの除外条件）", () => {
+  let clock = 0;
+  const guard = createNoteInputGuard({ now: () => clock, cooldownMs: 350 });
+  assert.equal(guard.isPenRecentlyActive(), false);
+  guard.notePointerDown({ pointerType: "pen", pointerId: 7 });
+  assert.equal(guard.isPenRecentlyActive(), true);
+  clock = 1000;
+  guard.notePointerEnd({ pointerType: "pen", pointerId: 7 });
+  clock = 1349;
+  assert.equal(guard.isPenRecentlyActive(), true);
+  clock = 1351;
+  assert.equal(guard.isPenRecentlyActive(), false);
+  // A finger never counts as the Pencil.
+  guard.notePointerDown({ pointerType: "touch", pointerId: 8, width: 60, height: 60 });
+  assert.equal(guard.isPenRecentlyActive(), false);
+});
+
 test("Apple Pencilモードは1本指の編集入力を抑止しつつ2本指ジェスチャーを残す", () => {
   const guard = createNoteInputGuard();
   const touch = { pointerType: "touch", width: 8, height: 8 };

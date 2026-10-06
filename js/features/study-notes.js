@@ -155,9 +155,10 @@ const NOTE_COPY_CONCURRENCY = 3;
 // Leaving a note waits this long for a title or page structure write before
 // asking whether to wait more (offline, such a write waits for the network).
 const NOTE_OPERATION_WAIT_MS = 10_000;
-// In study mode a finger or Pencil moves this far before the page follows
-// it, so that tapping a mask does not nudge the page.
-const STUDY_PAN_SLOP_PX = 8;
+// A finger (or, in study mode, the Pencil) moves this far before the page
+// follows it, so that tapping a mask, tapping with two fingers or a hand
+// settling on the screen just before the Pencil lands does not nudge the page.
+const PAN_SLOP_PX = 8;
 // An edited page's thumbnail is redrawn this long after the last edit.
 const PAGE_THUMBNAIL_REFRESH_DELAY_MS = 900;
 // Page backgrounds kept scaled down for redrawing thumbnails.
@@ -5112,7 +5113,7 @@ export function createStudyNotes(dependencies) {
         : null;
       // A finger or Pencil moves the page, as on the image memory screen.
       if (event.pointerType === "touch" || event.pointerType === "pen") {
-        startPanGesture(event, { slop: STUDY_PAN_SLOP_PX });
+        startPanGesture(event, { slop: PAN_SLOP_PX });
         captureActivePointer(event);
       }
       return;
@@ -5160,7 +5161,8 @@ export function createStudyNotes(dependencies) {
       (!toolSettings.fingerDraw || swipeGesture.startedAtEdge);
     const drawWithTouch = event.pointerType !== "touch" || (!reservedForPageSwipe && !guardedTouch && (toolSettings.fingerDraw || !hasSeenPen));
     if (["pen", "highlighter", "shape", "text", "mask", "eraser-object", "eraser-pixel"].includes(currentTool) && !drawWithTouch) {
-      startPanGesture(event);
+      // A finger that does not draw moves the page.
+      startPanGesture(event, { slop: PAN_SLOP_PX });
     } else if (currentTool === "pan") {
       startPanGesture(event);
     } else if (currentTool === "text" && textEditorSession) {
@@ -7740,14 +7742,15 @@ export function createStudyNotes(dependencies) {
     ui.viewport.addEventListener("wheel", () => panMomentum.stop(), { passive: true });
     // Two fingers tapped together run the quick switch (pen ⇄ eraser unless
     // set otherwise), standing in for the Apple Pencil double tap, which
-    // Safari does not report to web pages. The slight pinch of the tap is
-    // undone.
+    // Safari does not report to web pages. A two-finger double tap switches
+    // once. The slight pinch of the tap is undone.
     const twoFingerTap = createTwoFingerTapRecognizer();
     let viewBeforeTwoFingerTap = null;
     ui.viewport.addEventListener("pointerdown", event => {
-      // A palm, or the hand while (and just after) the Pencil writes, is not
-      // a tap.
-      if (event.pointerType === "touch" && inputGuard.shouldIgnoreTouch(event, { touchCount: 1 })) {
+      // The hand while (and just after) the Pencil writes is not a tap. The
+      // size of the contact is not looked at: Safari on iPad reports even a
+      // light fingertip about 40 px wide.
+      if (event.pointerType === "touch" && inputGuard.isPenRecentlyActive()) {
         twoFingerTap.cancel();
         return;
       }
@@ -7759,10 +7762,12 @@ export function createStudyNotes(dependencies) {
     }, { capture: true });
     ui.viewport.addEventListener("pointermove", event => twoFingerTap.move(event), { capture: true });
     ["pointerup", "pointercancel"].forEach(type => ui.viewport.addEventListener(type, event => {
-      if (!twoFingerTap.up(event)) return;
+      const tap = twoFingerTap.up(event);
+      if (!tap) return;
       const view = viewBeforeTwoFingerTap;
       viewBeforeTwoFingerTap = null;
-      const quickSwitch = toolSettings.twoFingerTapQuickSwitch && !studyMode && markupMode && currentContent &&
+      // The second tap of a two-finger double tap only undoes its own pinch.
+      const quickSwitch = !tap.repeat && toolSettings.twoFingerTapQuickSwitch && !studyMode && markupMode && currentContent &&
         !textEditorSession && !cropSession;
       // Once the pinch handling of this lift is over.
       setTimeout(() => {
@@ -7791,7 +7796,7 @@ export function createStudyNotes(dependencies) {
       // While the Pencil writes (and just after), a touch beside the page is
       // the hand.
       if (inputGuard.shouldIgnoreTouch(event, { touchCount: 1 })) return;
-      startPanGesture(event, { slop: studyMode ? STUDY_PAN_SLOP_PX : 0, viewportLevel: true });
+      startPanGesture(event, { slop: PAN_SLOP_PX, viewportLevel: true });
       captureActivePointer(event);
     });
     // A finger left down after a pinch moves the page on, as native scrolling does.

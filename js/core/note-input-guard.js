@@ -1,4 +1,10 @@
-export const NOTE_PALM_CONTACT_PX = 34;
+// A touch this wide (CSS px) or wider is taken for a resting hand. Safari on
+// iPad reports a contact's width and height as twice the UITouch major radius
+// (WebKit PointerEventIOS.cpp), so an ordinary fingertip is already about
+// 40 px wide there and a thumb pressed flat about 80 px. Up to revision 10 the
+// limit was 34 px, which turned almost every finger on iPad into a "palm":
+// two-finger taps, finger pans and finger taps on masks did nothing.
+export const NOTE_PALM_CONTACT_PX = 100;
 export const NOTE_PEN_TOUCH_COOLDOWN_MS = 350;
 
 export function isDrawingInputCaptureEnabled({
@@ -83,10 +89,16 @@ export function createNoteInputGuard({
     return event.pointerType === "touch" && Math.max(Number(event.width || 0), Number(event.height || 0)) >= palmContactPx;
   }
 
+  // The Pencil is on the screen, or left it moments ago: a touch now is the
+  // writing hand.
+  function isPenRecentlyActive() {
+    return penActive || now() - penEndedAt < cooldownMs;
+  }
+
   function shouldIgnoreTouch(event, { pencilMode = false, touchCount = 1 } = {}) {
     if (event.pointerType !== "touch") return false;
     if (touchCount >= 2) return false;
-    return pencilMode || penActive || now() - penEndedAt < cooldownMs || isPalmCandidate(event);
+    return pencilMode || isPenRecentlyActive() || isPalmCandidate(event);
   }
 
   return {
@@ -94,6 +106,7 @@ export function createNoteInputGuard({
     notePointerEnd,
     shouldIgnoreTouch,
     isPalmCandidate,
+    isPenRecentlyActive,
     isPenActive: () => penActive,
     activePenPointerId: () => activePenPointerId
   };
