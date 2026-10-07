@@ -783,3 +783,6 @@ body.note-editor-dedicated .local-environment-details{
   stroke-linejoin:round;
   pointer-events:none;
 }
+/* Revision 13: the build this tab runs (input settings). */
+.note-app-build{margin:8px 0 0;font-size:12px;color:#64748b}
+.note-app-build span{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}

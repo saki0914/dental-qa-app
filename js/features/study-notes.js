@@ -7899,6 +7899,10 @@ export function createStudyNotes(dependencies) {
     ui.toolbarDock.addEventListener("change", () => persistToolSettings({ toolbarDock: ui.toolbarDock.value }));
     ui.quickSwitchAction.addEventListener("change", () => persistToolSettings({ quickSwitchAction: ui.quickSwitchAction.value }));
     ui.twoFingerTap?.addEventListener("change", () => persistToolSettings({ twoFingerTapQuickSwitch: ui.twoFingerTap.checked }));
+    // The build of the app this tab runs (revision 13), to tell whether a
+    // release has reached this device.
+    const appBuild = byId("noteAppBuild");
+    if (appBuild) appBuild.textContent = document.querySelector('meta[name="app-build"]')?.content || "不明";
     ui.pageNavigation?.addEventListener("change", () => persistToolSettings({ pageNavigation: ui.pageNavigation.value }));
     ui.quickSwitch.addEventListener("click", quickSwitchTool);
     ui.toolbarCollapse.addEventListener("click", () => ui.toolbar.classList.toggle("collapsed"));

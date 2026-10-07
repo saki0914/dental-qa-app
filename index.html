@@ -17,8 +17,77 @@
     })();
   </script>
   <title>Dental QA Ultimate</title>
-  <link rel="stylesheet" href="./css/app.css">
-  <link rel="stylesheet" href="./css/study-notes.css">
+  <!-- asset-versions:start (npm run stamp) -->
+  <meta name="app-build" content="ea24dfe091">
+  <script type="importmap">
+  {
+    "imports": {
+      "./js/app.js": "./js/app.js?v=1a2dcb29f5",
+      "./js/config/firebase.js": "./js/config/firebase.js?v=a5ae88cb06",
+      "./js/core/answer-comparison.js": "./js/core/answer-comparison.js?v=fdb54e842d",
+      "./js/core/bounded-concurrency.js": "./js/core/bounded-concurrency.js?v=2a5884e716",
+      "./js/core/cloud-sync-state.js": "./js/core/cloud-sync-state.js?v=804bb1e6ea",
+      "./js/core/file-validator.js": "./js/core/file-validator.js?v=cd31674c15",
+      "./js/core/firebase-emulator-connectivity.js": "./js/core/firebase-emulator-connectivity.js?v=70c3b4da78",
+      "./js/core/id.js": "./js/core/id.js?v=27adf7a6f3",
+      "./js/core/image-memory-file-order.js": "./js/core/image-memory-file-order.js?v=816e912651",
+      "./js/core/image-memory-filters.js": "./js/core/image-memory-filters.js?v=c0fbe00906",
+      "./js/core/note-background.js": "./js/core/note-background.js?v=56d8b876d3",
+      "./js/core/note-clipboard.js": "./js/core/note-clipboard.js?v=7be5725f1e",
+      "./js/core/note-conflict-resolution.js": "./js/core/note-conflict-resolution.js?v=86418f1bfd",
+      "./js/core/note-editor-lock.js": "./js/core/note-editor-lock.js?v=4f061bb325",
+      "./js/core/note-editor-state.js": "./js/core/note-editor-state.js?v=b3273b91fc",
+      "./js/core/note-errors.js": "./js/core/note-errors.js?v=84119462ae",
+      "./js/core/note-geometry.js": "./js/core/note-geometry.js?v=5f6d72c938",
+      "./js/core/note-history.js": "./js/core/note-history.js?v=e57991a5d7",
+      "./js/core/note-input-guard.js": "./js/core/note-input-guard.js?v=a583b401ff",
+      "./js/core/note-local-store.js": "./js/core/note-local-store.js?v=2b01f8540c",
+      "./js/core/note-mask-adapter.js": "./js/core/note-mask-adapter.js?v=78bb0d0877",
+      "./js/core/note-material-mutation.js": "./js/core/note-material-mutation.js?v=33a088d09c",
+      "./js/core/note-page-metrics.js": "./js/core/note-page-metrics.js?v=5fdd713427",
+      "./js/core/note-page-save-queue.js": "./js/core/note-page-save-queue.js?v=022b3f81ea",
+      "./js/core/note-page-swipe.js": "./js/core/note-page-swipe.js?v=8382a07ddf",
+      "./js/core/note-pan-momentum.js": "./js/core/note-pan-momentum.js?v=534664a8cd",
+      "./js/core/note-pdf-export.js": "./js/core/note-pdf-export.js?v=503be812ca",
+      "./js/core/note-renderer.js": "./js/core/note-renderer.js?v=9122f9de2e",
+      "./js/core/note-resource-cache.js": "./js/core/note-resource-cache.js?v=9048db4a92",
+      "./js/core/note-save-coordinator.js": "./js/core/note-save-coordinator.js?v=f53615b557",
+      "./js/core/note-session-loading.js": "./js/core/note-session-loading.js?v=18e62dbcca",
+      "./js/core/note-startup-metrics.js": "./js/core/note-startup-metrics.js?v=8631a0c19d",
+      "./js/core/note-straightener.js": "./js/core/note-straightener.js?v=0caefe2399",
+      "./js/core/note-stroke-session.js": "./js/core/note-stroke-session.js?v=965b6bf238",
+      "./js/core/note-stroke.js": "./js/core/note-stroke.js?v=62d0edee3f",
+      "./js/core/note-text-colors.js": "./js/core/note-text-colors.js?v=dbfc7d37ba",
+      "./js/core/note-text-layout.js": "./js/core/note-text-layout.js?v=83df0c576e",
+      "./js/core/note-thumbnail.js": "./js/core/note-thumbnail.js?v=149f96bb2e",
+      "./js/core/note-tool-settings.js": "./js/core/note-tool-settings.js?v=81fbb20bf5",
+      "./js/core/note-transient-ui.js": "./js/core/note-transient-ui.js?v=8feffe47a2",
+      "./js/core/note-two-finger-tap.js": "./js/core/note-two-finger-tap.js?v=5b3a13bba4",
+      "./js/core/note-work-timing.js": "./js/core/note-work-timing.js?v=e2bee1b455",
+      "./js/core/page-zoom-controller.js": "./js/core/page-zoom-controller.js?v=6ce5953e9a",
+      "./js/core/pdf-bilevel-image.js": "./js/core/pdf-bilevel-image.js?v=89322f8bcc",
+      "./js/core/pdf-converter.js": "./js/core/pdf-converter.js?v=b2a2a4b0c8",
+      "./js/core/pdf-creation-progress.js": "./js/core/pdf-creation-progress.js?v=4c659c0e3a",
+      "./js/core/pdf-lib-loader.js": "./js/core/pdf-lib-loader.js?v=6872a028ea",
+      "./js/core/pdf-scanned-page.js": "./js/core/pdf-scanned-page.js?v=88305500d3",
+      "./js/core/question-image-delete.js": "./js/core/question-image-delete.js?v=6e40cc95a0",
+      "./js/core/question-import.js": "./js/core/question-import.js?v=743773d067",
+      "./js/core/save-coordinator.js": "./js/core/save-coordinator.js?v=53527be3d4",
+      "./js/core/sha256.js": "./js/core/sha256.js?v=354b5b93bf",
+      "./js/core/storage-errors.js": "./js/core/storage-errors.js?v=7a2dabb37e",
+      "./js/core/study-filters.js": "./js/core/study-filters.js?v=e2b83af035",
+      "./js/core/text-utils.js": "./js/core/text-utils.js?v=262e6e686d",
+      "./js/features/image-memory.js": "./js/features/image-memory.js?v=eb1f7db7f6",
+      "./js/features/question-manager.js": "./js/features/question-manager.js?v=acbfa3b67c",
+      "./js/features/study-notes.js": "./js/features/study-notes.js?v=9e3e61803c",
+      "./js/services/cloud-store.js": "./js/services/cloud-store.js?v=bcde239f2a",
+      "./js/services/note-store.js": "./js/services/note-store.js?v=b780c72475"
+    }
+  }
+  </script>
+  <!-- asset-versions:end -->
+  <link rel="stylesheet" href="./css/app.css?v=565c4fe9ae">
+  <link rel="stylesheet" href="./css/study-notes.css?v=7d2b01deb4">
 </head>
 <body>
 <div class="wrap">
@@ -504,6 +573,7 @@
                 <label class="tool-setting-label">クイック切替 <select id="noteQuickSwitchAction"><option value="eraser">現在ツール ↔ 消しゴム</option><option value="previous">現在ツール ↔ 前回ツール</option><option value="select">現在ツール ↔ 選択</option><option value="select-all">すべて選択</option><option value="colors">カラーパレット表示</option></select></label>
                 <label class="tool-setting-toggle"><input id="noteTwoFingerTap" type="checkbox"><span>2本指タップでクイック切替</span></label>
                 <p class="note-pencil-doubletap-notice">SafariのWebアプリではApple Pencil本体のダブルタップを取得できません。画面を2本指で軽くタップするか（2本指でダブルタップしても1回分だけ切り替わります）、画面上のクイック切替を使用してください。</p>
+                <p class="note-app-build">アプリの版: <span id="noteAppBuild">-</span></p>
               </section>
             </div>
           </div>
@@ -701,6 +771,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/app.js"></script>
+<script type="module" src="./js/app.js?v=1a2dcb29f5"></script>
 </body>
 </html>

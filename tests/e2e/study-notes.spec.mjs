@@ -1664,6 +1664,11 @@ test("@authenticated @ipad-v-next 選択枠の右上の取手で移動でき、�
   await page.locator("#noteUndoBtn").click();
   await expect.poll(async () => Math.round((await masks.nth(0).boundingBox()).x)).toBe(Math.round(maskA.x));
   await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+
+  // The input settings tell which build of the app the tab runs (revision 13).
+  await page.locator("#noteInputSettingsBtn").click();
+  const build = await page.locator('meta[name="app-build"]').getAttribute("content");
+  await expect(page.locator("#noteAppBuild")).toHaveText(build);
   expect(blockedRequests).toEqual([]);
   expect(pageErrors).toEqual([]);
 });
