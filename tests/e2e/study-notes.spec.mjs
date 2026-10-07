@@ -176,6 +176,29 @@ async function seedNotePageBackground(uid, noteId, pageId, { image = TEST_PNG, s
   }
 }
 
+// Page content written by another build (for example an earlier revision).
+async function seedNotePageContent(uid, noteId, pageId, elements, noteMasks = []) {
+  const environment = await initializeTestEnvironment({
+    projectId: "demo-dental-qa",
+    firestore: { host: "127.0.0.1", port: 8080 },
+    storage: { host: "127.0.0.1", port: 9199 }
+  });
+  const contentPath = `users/${uid}/notes/${noteId}/pages/${pageId}/revisions/seed-${crypto.randomUUID()}.json`;
+  try {
+    const context = environment.authenticatedContext(uid);
+    const json = JSON.stringify({ schemaVersion: 1, noteId, pageId, revision: 1, elements, noteMasks, savedAt: new Date().toISOString() });
+    await uploadBytes(ref(context.storage("gs://demo-dental-qa.firebasestorage.app"), contentPath), Buffer.from(json), { contentType: "application/json" });
+    await environment.withSecurityRulesDisabled(async adminContext => {
+      await updateDoc(doc(adminContext.firestore(), "users", uid, "notes", noteId, "pages", pageId), {
+        contentPath, contentRevision: 1, contentHash: "seed", noteMaskCount: noteMasks.length
+      });
+    });
+    return contentPath;
+  } finally {
+    await environment.cleanup();
+  }
+}
+
 async function deleteTestStorageObject(uid, path) {
   const environment = await initializeTestEnvironment({
     projectId: "demo-dental-qa",
@@ -1437,6 +1460,212 @@ test("@authenticated @ipad-v-next 日本語複数行テキストを再編集し�
   await page.locator("#noteTextAlign").selectOption("right");
   await expect(stage.locator("text.note-element")).toHaveAttribute("text-anchor", "end");
   await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+});
+
+test("@authenticated @ipad-v-next テキストの枠は書いた文字に合わせ、すぐ横に別のテキストを書け、書いている途中で文字ごとに色を変えられる", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "テキスト枠E2Eノート");
+  // A text written by an earlier build: one character in the default box
+  // (35% of the page wide).
+  await seedNotePageContent(user.uid, note.noteId, note.pageId, [{
+    id: "old-text", type: "text", text: "旧", rotation: 0, autoHeight: true, zIndex: 1,
+    bounds: { x: .55, y: .08, width: .35, height: .12 },
+    style: { fontFamily: "system-sans", fontSizeRatio: .025, fontWeight: "normal", fontStyle: "normal", textAlign: "left", lineHeight: 1.25, color: "#111111", opacity: 1 }
+  }]);
+  await login(page, user);
+  await page.setViewportSize({ width: 1180, height: 820 });
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  const stage = page.locator("#notePageStage");
+  const oldText = stage.locator('text[data-element-id="old-text"]');
+  await expect(oldText).toHaveCount(1);
+  const box = await stage.boundingBox();
+  const at = (x, y) => ({ x: box.x + box.width * x, y: box.y + box.height * y });
+  const editor = stage.locator('textarea[data-note-text-editor="true"]');
+  const palette = stage.locator(".note-text-palette");
+  const mirrorParts = stage.locator(".note-text-editor-mirror span");
+  const colorsOf = locator => locator.locator("tspan").evaluateAll(nodes => nodes.map(node => [node.textContent, node.getAttribute("fill")]));
+
+  // Black, red from the middle, then black again, without leaving the text.
+  await page.locator('[data-note-tool="text"]').click();
+  await page.mouse.click(at(.08, .3).x, at(.08, .3).y);
+  await expect(editor).toBeFocused();
+  await expect(palette).toBeVisible();
+  await expect(palette.locator("[data-text-color]")).toHaveCount(8);
+  await page.keyboard.type("象牙");
+  await palette.locator('[data-text-color="#ef4444"]').click();
+  await expect(editor, "色を選んでも書き続けられる").toBeFocused();
+  await page.keyboard.type("質");
+  await palette.locator('[data-text-color="#111111"]').click();
+  await page.keyboard.type("は硬い");
+  await expect(editor).toHaveValue("象牙質は硬い");
+  await expect(mirrorParts, "書いている間も色が見える").toHaveCount(3);
+  await expect(mirrorParts.nth(1)).toHaveText("質");
+  await expect(mirrorParts.nth(1)).toHaveCSS("color", "rgb(239, 68, 68)");
+  await editor.press("Control+Enter");
+  await expect(editor).toHaveCount(0);
+  await expect(palette).toHaveCount(0);
+  const written = stage.locator("text.note-element").filter({ hasText: "象牙" });
+  expect(await colorsOf(written)).toEqual([["象牙", "#111111"], ["質", "#ef4444"], ["は硬い", "#111111"]]);
+
+  // The frame is the written text, not the box it was typed in.
+  await page.locator('[data-note-tool="select"]').click();
+  const textBox = await written.boundingBox();
+  await page.mouse.click(textBox.x + textBox.width / 2, textBox.y + textBox.height / 2);
+  const overlay = stage.locator('[data-selection-overlay="true"]');
+  await expect(overlay).toBeVisible();
+  const frame = await overlay.boundingBox();
+  expect(Math.abs(frame.x - textBox.x), "枠の左端は文字の左端").toBeLessThan(4);
+  expect(frame.width, "枠の幅は書いた6文字ぶん").toBeLessThan(textBox.width + 12);
+  expect(frame.width).toBeGreaterThan(textBox.width - 2);
+  expect(frame.width, "新しいテキストの枠（ページ幅の35%）より狭い").toBeLessThan(box.width * .3);
+  // The old text's frame is its one character too.
+  await page.mouse.click(at(.95, .5).x, at(.95, .5).y);
+  const oldBox = await oldText.boundingBox();
+  await page.mouse.click(oldBox.x + oldBox.width / 2, oldBox.y + oldBox.height / 2);
+  await expect(overlay).toBeVisible();
+  expect((await overlay.boundingBox()).width, "以前のテキストの枠も1文字ぶん").toBeLessThan(oldBox.width + 12);
+
+  // Right beside the old text (inside its old 35% box) a new text starts.
+  await page.locator('[data-note-tool="text"]').click();
+  await page.mouse.click(oldBox.x + oldBox.width + 60, oldBox.y + oldBox.height / 2);
+  await expect(editor).toBeFocused();
+  await expect(editor, "以前のテキストの空いた枠の中をタップしても新しいテキストになる").toHaveValue("");
+  await page.keyboard.type("隣");
+  await editor.press("Control+Enter");
+  await expect(stage.locator("text.note-element")).toHaveCount(3);
+  await expect(oldText).toHaveText("旧");
+
+  // Selected characters of a written text change color.
+  await page.mouse.click(textBox.x + 6, textBox.y + textBox.height / 2);
+  await expect(editor).toHaveValue("象牙質は硬い");
+  await editor.evaluate(node => node.setSelectionRange(0, 2));
+  await palette.locator('[data-text-color="#2563eb"]').click();
+  await expect(editor).toBeFocused();
+  await editor.press("Control+Enter");
+  await expect(editor).toHaveCount(0);
+  expect(await colorsOf(written)).toEqual([["象牙", "#2563eb"], ["質", "#ef4444"], ["は硬い", "#111111"]]);
+
+  // Saved: the colors and the fitted frame come back after reopening.
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  expect(await colorsOf(stage.locator("text.note-element").filter({ hasText: "象牙" }))).toEqual([["象牙", "#2563eb"], ["質", "#ef4444"], ["は硬い", "#111111"]]);
+  expect(blockedRequests).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
+test("@authenticated @ipad-v-next 選択枠の右上の取手で移動でき、小さな線も複数選択もマスクもまとめて動かせる", async ({ page }) => {
+  test.setTimeout(120_000);
+  const blockedRequests = await guardProductionFirebase(page);
+  const pageErrors = [];
+  page.on("pageerror", error => recordUnexpectedPageError(pageErrors, error));
+  const user = await createUser();
+  const note = await seedReadyNote(user.uid, "移動の取手E2Eノート", { pageCount: 2 });
+  await login(page, user);
+  await page.setViewportSize({ width: 1180, height: 820 });
+  await page.goto(`/?firebaseEmulator=1&noteEditor=1&noteId=${note.noteId}&editorTabId=${crypto.randomUUID()}`, { waitUntil: "domcontentloaded" });
+  await expect(page.locator("#noteEditorStartup")).toBeHidden({ timeout: 30_000 });
+  const stage = page.locator("#notePageStage");
+  const box = await stage.boundingBox();
+  const at = (x, y) => ({ x: box.x + box.width * x, y: box.y + box.height * y });
+  const drag = async (from, to, steps = 8) => {
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps });
+    await page.mouse.up();
+  };
+  const elementBox = id => stage.locator(`[data-element-id="${id}"]`).first().boundingBox();
+  const overlay = stage.locator('[data-selection-overlay="true"]');
+  const moveHandle = stage.locator('[data-transform-handle="move"]');
+  const handleCenter = async () => {
+    const handle = await moveHandle.boundingBox();
+    return { x: handle.x + handle.width / 2, y: handle.y + handle.height / 2 };
+  };
+
+  // A tiny stroke (8 px long) and a longer one.
+  await drag(at(.3, .1), { x: at(.3, .1).x + 8, y: at(.3, .1).y }, 3);
+  await drag(at(.3, .22), at(.6, .22));
+  await expect(stage.locator("path[data-element-id]")).toHaveCount(2);
+  const [tinyId, longId] = await stage.locator("path[data-element-id]").evaluateAll(nodes => nodes.map(node => node.dataset.elementId));
+
+  // One tiny stroke selected: the handle is diagonally beyond the top right.
+  await page.locator('[data-note-tool="select"]').click();
+  await page.mouse.click(at(.3, .1).x + 4, at(.3, .1).y);
+  await expect(overlay).toBeVisible();
+  await expect(moveHandle).toHaveCount(1);
+  const frame = await overlay.boundingBox();
+  const corner = await handleCenter();
+  expect(Math.abs(corner.x - (frame.x + frame.width) - 32), "枠の右上から右へ32px").toBeLessThan(3);
+  expect(Math.abs(frame.y - corner.y - 32), "枠の右上から上へ32px").toBeLessThan(3);
+  const tinyBefore = await elementBox(tinyId);
+  await drag(corner, { x: corner.x + 120, y: corner.y + 60 });
+  const tinyAfter = await elementBox(tinyId);
+  expect(Math.abs(tinyAfter.x - tinyBefore.x - 120), "取手で小さな線を移動できる").toBeLessThan(3);
+  expect(Math.abs(tinyAfter.y - tinyBefore.y - 60)).toBeLessThan(3);
+
+  // Both strokes selected (lasso): one handle on the outer frame moves both.
+  await page.mouse.click(at(.9, .45).x, at(.9, .45).y);
+  await page.mouse.move(at(.2, .05).x, at(.2, .05).y);
+  await page.mouse.down();
+  for (const point of [at(.8, .05), at(.8, .3), at(.2, .3), at(.2, .06)]) await page.mouse.move(point.x, point.y, { steps: 6 });
+  await page.mouse.up();
+  await expect(overlay).toBeVisible();
+  await expect(moveHandle, "複数選択でも取手は外枠に1つ").toHaveCount(1);
+  const [tinyStart, longStart] = await Promise.all([elementBox(tinyId), elementBox(longId)]);
+  const groupCorner = await handleCenter();
+  const groupFrame = await overlay.boundingBox();
+  expect(Math.abs(groupCorner.x - (groupFrame.x + groupFrame.width) - 32)).toBeLessThan(3);
+  await drag(groupCorner, { x: groupCorner.x - 70, y: groupCorner.y + 50 });
+  const [tinyEnd, longEnd] = await Promise.all([elementBox(tinyId), elementBox(longId)]);
+  for (const [start, end] of [[tinyStart, tinyEnd], [longStart, longEnd]]) {
+    expect(Math.abs(end.x - start.x + 70), "まとめて同じだけ動く").toBeLessThan(3);
+    expect(Math.abs(end.y - start.y - 50)).toBeLessThan(3);
+  }
+
+  // A finger on the handle drags the selection; the page does not turn.
+  const fingerFrom = await handleCenter();
+  const fingerTo = { x: fingerFrom.x - 120, y: fingerFrom.y + 4 };
+  await stage.locator('[data-transform-handle="move"]').dispatchEvent("pointerdown", {
+    pointerId: 71, pointerType: "touch", button: 0, clientX: fingerFrom.x, clientY: fingerFrom.y, width: 48, height: 48, pressure: .5
+  });
+  for (let step = 1; step <= 6; step += 1) {
+    await stage.dispatchEvent("pointermove", {
+      pointerId: 71, pointerType: "touch", button: 0, width: 48, height: 48, pressure: .5,
+      clientX: fingerFrom.x + (fingerTo.x - fingerFrom.x) * step / 6, clientY: fingerFrom.y + (fingerTo.y - fingerFrom.y) * step / 6
+    });
+  }
+  await stage.dispatchEvent("pointerup", { pointerId: 71, pointerType: "touch", button: 0, clientX: fingerTo.x, clientY: fingerTo.y, width: 48, height: 48, pressure: 0 });
+  await page.waitForTimeout(500);
+  await expect(page.locator("#notePageCounter"), "取手の上の指ではページを送らない").toHaveText("1 / 2");
+  expect(Math.abs((await elementBox(longId)).x - longEnd.x + 120), "指でも取手で移動できる").toBeLessThan(3);
+
+  // Two masks selected together move together, and undo puts them back.
+  await page.locator('[data-note-tool="mask"]').click();
+  await drag(at(.15, .34), at(.3, .38));
+  await drag(at(.4, .34), at(.55, .38));
+  const masks = stage.locator(".note-mask");
+  await expect(masks).toHaveCount(2);
+  await page.locator('#noteSelectionActions [data-selection-action="select-page-masks"]').click();
+  await expect(stage.locator(".note-mask.note-selected")).toHaveCount(2);
+  await expect(moveHandle, "選んだマスクにも取手は1つ").toHaveCount(1);
+  const [maskA, maskB] = [await masks.nth(0).boundingBox(), await masks.nth(1).boundingBox()];
+  const maskCorner = await handleCenter();
+  await drag(maskCorner, { x: maskCorner.x + 40, y: maskCorner.y + 30 });
+  const [movedA, movedB] = [await masks.nth(0).boundingBox(), await masks.nth(1).boundingBox()];
+  for (const [start, end] of [[maskA, movedA], [maskB, movedB]]) {
+    expect(Math.abs(end.x - start.x - 40), "選んだマスクがまとめて動く").toBeLessThan(3);
+    expect(Math.abs(end.y - start.y - 30)).toBeLessThan(3);
+  }
+  await page.locator("#noteUndoBtn").click();
+  await expect.poll(async () => Math.round((await masks.nth(0).boundingBox()).x)).toBe(Math.round(maskA.x));
+  await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
+  expect(blockedRequests).toEqual([]);
+  expect(pageErrors).toEqual([]);
 });
 
 test("@authenticated @ipad-v-next ハイライト・オブジェクト消しゴム・ピクセル消しゴムを実操作してUndoできる", async ({ page }) => {

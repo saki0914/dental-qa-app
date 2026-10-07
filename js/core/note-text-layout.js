@@ -235,6 +235,147 @@ export function layoutTextLines(text, maxWidth, measureText) {
   return lines.length ? lines : [""];
 }
 
+// The text as laid out (line breaks normalized, tabs expanded) with, for each
+// of its UTF-16 code units, the index of the code unit of `text` it came from.
+function laidOutTextWithSourceIndices(text) {
+  const source = String(text ?? "");
+  let normalized = "";
+  const indices = [];
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "\r") {
+      if (source[index + 1] === "\n") continue;
+      normalized += "\n";
+      indices.push(index);
+    } else if (character === "\t") {
+      normalized += TAB_REPLACEMENT;
+      for (let count = 0; count < TAB_REPLACEMENT.length; count += 1) indices.push(index);
+    } else {
+      normalized += character;
+      indices.push(index);
+    }
+  }
+  return { normalized, indices };
+}
+
+// The same lines as layoutTextLines, each with the index into `text` of every
+// code unit of the line (`sourceIndices`), so that parts of a line can be
+// traced back to the characters they show (for example their colors).
+export function layoutTextLineRanges(text, maxWidth, measureText) {
+  const width = Math.max(1, Number(maxWidth) || 1);
+  const measure = typeof measureText === "function" ? measureText : value => String(value).length;
+  const { normalized, indices } = laidOutTextWithSourceIndices(text);
+  const lines = [];
+  let offset = 0;
+  for (const paragraph of normalized.split("\n")) {
+    for (const line of layoutParagraph(paragraph, width, measure)) {
+      lines.push({ text: line, sourceIndices: indices.slice(offset, offset + line.length) });
+      offset += line.length;
+    }
+    // The line break itself.
+    offset += 1;
+  }
+  return lines.length ? lines : [{ text: "", sourceIndices: [] }];
+}
+
+// Colors of parts of a text (revision 12). A text element may carry
+// `textColors: { length, runs: [{ start, end, color }] }`: runs of UTF-16
+// offsets into `text`, in order and not overlapping, each with a "#rrggbb"
+// color. Characters outside every run have the element's `style.color`. The
+// runs apply only while `length` is the length of the text: a build that does
+// not know them may change the text, and then the text falls back to its one
+// color instead of coloring the wrong characters.
+export const NOTE_TEXT_COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
+
+export function textElementColorRuns(element) {
+  const text = String(element?.text ?? "");
+  const colors = element?.textColors;
+  if (!colors || typeof colors !== "object" || colors.length !== text.length || !Array.isArray(colors.runs)) return [];
+  const runs = [];
+  let previousEnd = 0;
+  for (const run of colors.runs) {
+    const start = Number(run?.start);
+    const end = Number(run?.end);
+    const color = String(run?.color ?? "");
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < previousEnd || end <= start || end > text.length) continue;
+    if (!NOTE_TEXT_COLOR_PATTERN.test(color)) continue;
+    runs.push({ start, end, color: color.toLowerCase() });
+    previousEnd = end;
+  }
+  return runs;
+}
+
+// The color of each code unit of `text` (null: the base color).
+export function textCharacterColors(length, runs = []) {
+  const colors = new Array(Math.max(0, Number(length) || 0)).fill(null);
+  for (const run of runs) {
+    for (let index = Math.max(0, run.start); index < Math.min(colors.length, run.end); index += 1) colors[index] = run.color;
+  }
+  return colors;
+}
+
+// The visible part of a laid-out line (see layoutTextLineRanges) split where
+// its color changes. Graphemes are never split.
+export function textLineColorSegments(line, characterColors, baseColor) {
+  const visible = renderableTextLine(line?.text);
+  const segments = [];
+  let offset = 0;
+  for (const grapheme of graphemes(visible)) {
+    const sourceIndex = line.sourceIndices?.[offset];
+    const color = characterColors?.[sourceIndex] || baseColor;
+    const last = segments[segments.length - 1];
+    if (last && last.color === color) last.text += grapheme;
+    else segments.push({ text: grapheme, color });
+    offset += grapheme.length;
+  }
+  return segments;
+}
+
+// The box of what a text element shows (revision 12): its lines, as wide as
+// the widest line (plus a little room, so that the same lines fit again), in
+// page ratios. `softWrapped` tells whether the box width broke a line.
+export function measureTextContentBox(element, { pageWidth = 1000, pageHeight = 1414, measureText }) {
+  const bounds = element?.bounds || { x: 0, y: 0, width: 0, height: 0 };
+  const style = element?.style || {};
+  const fontSize = Math.max(8, Number(style.fontSizeRatio || .025) * pageHeight);
+  const boxWidth = Math.max(1, Number(bounds.width || 0) * pageWidth);
+  const measure = typeof measureText === "function" ? measureText : value => String(value).length;
+  const lines = layoutTextLines(element?.text, boxWidth, measure);
+  const hardLineCount = String(element?.text ?? "").replace(/\r\n?/g, "\n").split("\n").length;
+  const widest = lines.reduce((width, line) => Math.max(width, measure(renderableTextLine(line))), 0);
+  const contentWidth = Math.min(boxWidth, widest + Math.max(2, fontSize * .1));
+  const align = style.textAlign === "center" || style.textAlign === "right" ? style.textAlign : "left";
+  const offset = align === "center" ? (boxWidth - contentWidth) / 2 : align === "right" ? boxWidth - contentWidth : 0;
+  const lineHeight = fontSize * Number(style.lineHeight || 1.25);
+  const y = Number(bounds.y || 0);
+  return {
+    x: Number(bounds.x || 0) + offset / pageWidth,
+    y,
+    width: contentWidth / pageWidth,
+    height: Math.min(Math.max(.001, 1 - y), lines.length * lineHeight / pageHeight),
+    softWrapped: lines.length > hardLineCount
+  };
+}
+
+// The text element with its box fitted to what it shows, so that its frame
+// and the area that picks it are no larger than its text (revision 12). The
+// lines break where they did. A rotated text keeps its box (it turns around
+// the box's center).
+export function fitTextElementToContent(element, options) {
+  if (element?.type !== "text" || !element.bounds || !String(element.text ?? "").length) return element;
+  if (Math.abs(Number(element.rotation || 0) % 360) > 0.001) return element;
+  const content = measureTextContentBox(element, options);
+  const bounds = {
+    x: Math.min(1, Math.max(0, content.x)),
+    y: Math.min(1, Math.max(0, content.y)),
+    width: Math.max(.001, Math.min(Number(element.bounds.width), content.width)),
+    height: content.height
+  };
+  bounds.width = Math.min(bounds.width, 1 - bounds.x);
+  const same = ["x", "y", "width", "height"].every(key => Math.abs(Number(element.bounds[key]) - bounds[key]) < 1e-6);
+  return same ? element : { ...element, bounds, autoHeight: true };
+}
+
 // Trailing spaces hang outside the line box; they must not shift centered or
 // right-aligned text, so renderers draw lines without them.
 export function renderableTextLine(line) {

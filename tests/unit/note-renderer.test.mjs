@@ -35,7 +35,7 @@ function createCanvasHarness() {
       const size = Number(/([\d.]+)px/.exec(this.font)?.[1] || 10);
       return { width: [...String(value)].length * size };
     },
-    fillText(value, x, y) { texts.push({ value, x, y, align: this.textAlign }); }
+    fillText(value, x, y) { texts.push({ value, x, y, align: this.textAlign, color: this.fillStyle }); }
   };
   const canvas = {
     width: 0,
@@ -196,4 +196,35 @@ test("日本語の明示改行・折り返しと中央・右寄せをCanvas PDF�
     }], noteMasks: [] }
   });
   assert.ok(harness.texts.every(item => item.align === "right" && item.x === 60));
+});
+
+test("文字ごとの色をサムネイル・PDFの描画にも反映し、揃えは行全体で行う", async t => {
+  const previousDocument = globalThis.document;
+  const harness = createCanvasHarness();
+  globalThis.document = { createElement: () => harness.canvas };
+  t.after(() => { globalThis.document = previousDocument; });
+  const base = {
+    page: { background: { type: "blank" } },
+    materialMasks: [],
+    resolveBackgroundBlob: async () => { throw new Error("不要"); },
+    resolveAssetBlob: async () => { throw new Error("不要"); },
+    width: 200,
+    height: 200
+  };
+  const element = {
+    id: "colored", type: "text", text: "象牙質は硬い", zIndex: 1,
+    bounds: { x: .1, y: .1, width: .8, height: .2 }, rotation: 0,
+    style: { fontSizeRatio: .05, lineHeight: 1.25, textAlign: "left", color: "#111111" },
+    textColors: { length: 6, runs: [{ start: 0, end: 3, color: "#ef4444" }] }
+  };
+  await renderNotePageToCanvas({ ...base, content: { elements: [element], noteMasks: [] } });
+  assert.deepEqual(harness.texts.map(item => [item.value, item.color]), [["象牙質", "#ef4444"], ["は硬い", "#111111"]]);
+  assert.equal(harness.texts[1].x - harness.texts[0].x, 30, "続きは前の部分の幅だけ右から描く（1文字10px）");
+  harness.texts.length = 0;
+  await renderNotePageToCanvas({ ...base, content: { elements: [{ ...element, style: { ...element.style, textAlign: "right" } }], noteMasks: [] } });
+  assert.equal(harness.texts[0].x, 160 - 60, "右揃えは枠の右端（枠内の座標160）から行全体（6文字60px）の幅で置く");
+  harness.texts.length = 0;
+  // A text a build without colors changed keeps its one color.
+  await renderNotePageToCanvas({ ...base, content: { elements: [{ ...element, text: "象牙質は硬いです" }], noteMasks: [] } });
+  assert.deepEqual(harness.texts.map(item => item.color), ["#111111"]);
 });

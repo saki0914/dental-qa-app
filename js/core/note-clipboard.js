@@ -1,8 +1,10 @@
 const MIME_PRIORITY = ["image/png", "image/webp", "image/jpeg"];
 
+// Text being written, or the color palette shown with it (revision 12):
+// pointer and keyboard handling of the page leaves these alone.
 export function isTextEditingTarget(target) {
   if (!target?.closest) return false;
-  return Boolean(target.closest("input, textarea, [contenteditable='true'], [contenteditable=''], [data-note-text-editor='true']"));
+  return Boolean(target.closest("input, textarea, [contenteditable='true'], [contenteditable=''], [data-note-text-editor='true'], [data-note-text-palette='true']"));
 }
 
 export function chooseClipboardImage(items = []) {

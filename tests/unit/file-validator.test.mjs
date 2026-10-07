@@ -151,6 +151,33 @@ test("旧points形式のlineは読み込み検証で許容し、保存時はstar
   assert.throws(() => serializeValidatedJson(value), /保存形式のstart\/end/);
 });
 
+test("テキストの色の範囲は保存時に検証し、読み込みでは不正でもページを開ける", () => {
+  const value = runs => ({
+    schemaVersion: 1,
+    noteId: "note-1",
+    pageId: "page-1",
+    elements: [{
+      id: "text-1", type: "text", text: "象牙質は硬い",
+      bounds: { x: .1, y: .1, width: .2, height: .05 },
+      style: { fontSizeRatio: .025, color: "#111111" },
+      textColors: { length: 6, runs }
+    }],
+    noteMasks: []
+  });
+  assert.doesNotThrow(() => serializeValidatedJson(value([{ start: 2, end: 4, color: "#ef4444" }])));
+  for (const runs of [
+    [{ start: 2, end: 2, color: "#ef4444" }],
+    [{ start: 3, end: 5, color: "#ef4444" }, { start: 4, end: 6, color: "#2563eb" }],
+    [{ start: 5, end: 7, color: "#ef4444" }],
+    [{ start: 0, end: 1, color: "red" }],
+    [{ start: .5, end: 1, color: "#ef4444" }]
+  ]) {
+    assert.throws(() => serializeValidatedJson(value(runs)), /textColors/);
+    assert.doesNotThrow(() => serializeValidatedJson(value(runs), {}, { strict: false }));
+  }
+  assert.throws(() => serializeValidatedJson({ ...value([]), elements: [{ ...value([]).elements[0], textColors: { length: 6 } }] }), /runs/);
+});
+
 test("PDFファイル名に使えない文字を置換する", () => {
   assert.equal(sanitizeDownloadFilename('a/b:c*?"<d>|'), "a_b_c____d__");
   assert.equal(sanitizeDownloadFilename("  ", "note"), "note");

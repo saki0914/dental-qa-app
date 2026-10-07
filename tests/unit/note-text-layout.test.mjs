@@ -4,10 +4,16 @@ import {
   NOTE_TEXT_REFERENCE_FONT_PX,
   createNoteTextMeasure,
   ensureTextElementHeight,
+  fitTextElementToContent,
   layoutTextBox,
+  layoutTextLineRanges,
   layoutTextLines,
+  measureTextContentBox,
   punctuationSpacingSegments,
   setNoteTextCanvasFont,
+  textCharacterColors,
+  textElementColorRuns,
+  textLineColorSegments,
   visibleTextLines
 } from "../../js/core/note-text-layout.js";
 
@@ -235,4 +241,81 @@ test("Canvasへノート文字のフォントを設定するときはカーニ�
   const legacyContext = { font: "" };
   setNoteTextCanvasFont(legacyContext, {}, 16);
   assert.equal("fontKerning" in legacyContext, false, "未対応のCanvasへは設定しない");
+});
+
+// One unit per grapheme, as a 1em-per-character CJK font of size 1.
+const unitMeasure = value => Array.from(String(value)).length;
+
+test("行ごとに元の文字の位置を持つ折り返しは、通常の折り返しと同じ行を返す（タブ・CRLFを含む）", () => {
+  const text = "歯科衛生士\r\nA\tB\n";
+  const ranges = layoutTextLineRanges(text, 2, unitMeasure);
+  assert.deepEqual(ranges.map(line => line.text), layoutTextLines(text, 2, unitMeasure));
+  assert.deepEqual(ranges[0].sourceIndices, [0, 1]);
+  assert.deepEqual(ranges[2].sourceIndices, [4], "「士」は改行の前");
+  // "A" then the tab expanded to four spaces (all from index 8), then "B".
+  const tabLine = ranges.find(line => line.text.startsWith("A"));
+  assert.equal(tabLine.sourceIndices[0], 7);
+  assert.ok(tabLine.sourceIndices.slice(1, 5).every(index => index === 8));
+});
+
+test("色の範囲は文字数が一致するときだけ使い、不正な範囲と色は無視する", () => {
+  const element = { text: "象牙質は硬い", textColors: { length: 6, runs: [
+    { start: 2, end: 4, color: "#EF4444" },
+    { start: 3, end: 5, color: "#2563eb" },
+    { start: 5, end: 9, color: "#2563eb" },
+    { start: 5, end: 6, color: "red" }
+  ] } };
+  assert.deepEqual(textElementColorRuns(element), [{ start: 2, end: 4, color: "#ef4444" }]);
+  assert.deepEqual(textElementColorRuns({ ...element, text: "象牙質は硬いです" }), [], "旧版が文字を変えた場合は1色に戻す");
+  assert.deepEqual(textElementColorRuns({ text: "abc" }), []);
+  assert.deepEqual(textCharacterColors(4, [{ start: 1, end: 3, color: "#ef4444" }]), [null, "#ef4444", "#ef4444", null]);
+});
+
+test("行の見える部分を色の変わり目で分け、合成文字は分けない", () => {
+  const text = "歯👩‍⚕️冠 ";
+  const colors = textCharacterColors(text.length, [{ start: 1, end: 3, color: "#ef4444" }]);
+  const [line] = layoutTextLineRanges(text, 10, unitMeasure);
+  assert.deepEqual(textLineColorSegments(line, colors, "#111111"), [
+    { text: "歯", color: "#111111" },
+    { text: "👩‍⚕️", color: "#ef4444" },
+    { text: "冠", color: "#111111" }
+  ], "絵文字の途中で色が変わっても1文字として描き、行末の空白は描かない");
+});
+
+test("テキストの枠は一番長い行の幅（少しの余白込み）と行数の高さにする", () => {
+  const element = {
+    type: "text", text: "歯冠\n象牙質", rotation: 0,
+    bounds: { x: .1, y: .2, width: .35, height: .12 },
+    style: { fontSizeRatio: .02, lineHeight: 1.25, textAlign: "left" }
+  };
+  const options = { pageWidth: 1000, pageHeight: 1000, measureText: value => Array.from(String(value)).length * 20 };
+  const box = measureTextContentBox(element, options);
+  assert.ok(Math.abs(box.x - .1) < 1e-9);
+  assert.ok(Math.abs(box.width - (60 + 2) / 1000) < 1e-9, "3文字×20px＋余白2px");
+  assert.ok(Math.abs(box.height - 2 * 25 / 1000) < 1e-9, "2行×行の高さ25px");
+  assert.equal(box.softWrapped, false);
+  const centered = measureTextContentBox({ ...element, style: { ...element.style, textAlign: "center" } }, options);
+  assert.ok(Math.abs(centered.x - (.1 + (.35 - .062) / 2)) < 1e-9, "中央揃えは枠の中央に置く");
+  const right = measureTextContentBox({ ...element, style: { ...element.style, textAlign: "right" } }, options);
+  assert.ok(Math.abs(right.x + right.width - .45) < 1e-9, "右揃えは右端をそろえる");
+  const wrapped = measureTextContentBox({ ...element, text: "歯科衛生士国家試験の過去問題", bounds: { ...element.bounds, width: .1 } }, options);
+  assert.equal(wrapped.softWrapped, true, "枠の幅で折り返した");
+});
+
+test("テキストを書いた文字に合わせて縮め、折り返しの位置は変えない。回転したテキストはそのまま", () => {
+  const options = { pageWidth: 1000, pageHeight: 1000, measureText: value => Array.from(String(value)).length * 20 };
+  const element = {
+    type: "text", text: "歯科衛生士国家試験の過去問題を解く", rotation: 0, autoHeight: true,
+    bounds: { x: .1, y: .2, width: .35, height: .12 },
+    style: { fontSizeRatio: .02, lineHeight: 1.25, textAlign: "left" }
+  };
+  const before = layoutTextLines(element.text, 350, options.measureText);
+  const fitted = fitTextElementToContent(element, options);
+  assert.ok(fitted.bounds.width < element.bounds.width);
+  assert.deepEqual(layoutTextLines(fitted.text, fitted.bounds.width * 1000, options.measureText), before);
+  assert.ok(Math.abs(fitted.bounds.height - before.length * 25 / 1000) < 1e-9);
+  assert.equal(fitTextElementToContent(fitted, options), fitted, "合わせ済みなら同じ要素を返す");
+  const rotated = { ...element, rotation: 30 };
+  assert.equal(fitTextElementToContent(rotated, options), rotated);
+  assert.equal(fitTextElementToContent({ ...element, text: "" }, options).bounds, element.bounds);
 });

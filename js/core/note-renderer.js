@@ -4,11 +4,15 @@ import { drawStrokeOnCanvas } from "./note-stroke.js";
 import {
   createNoteTextMeasure,
   layoutTextBox,
+  layoutTextLineRanges,
   measureTextFontMetrics,
   punctuationSpacingSegments,
   renderableTextLine,
   setNoteTextCanvasFont,
-  textLineBaselines
+  textCharacterColors,
+  textElementColorRuns,
+  textLineBaselines,
+  textLineColorSegments
 } from "./note-text-layout.js";
 import { maskVisibilityKey } from "./note-mask-adapter.js";
 
@@ -146,11 +150,15 @@ function drawText(context, element, width, height) {
   // one line breaker and the CSS half-leading baseline model.
   const anchorX = align === "center" ? boxWidth / 2 : align === "right" ? boxWidth : 0;
   const lineHeight = fontSize * Number(style.lineHeight || 1.25);
-  const layout = layoutTextBox(element.text, {
-    maxWidth: boxWidth,
-    lineHeight,
-    measureText: createNoteTextMeasure(context, style, fontSize)
-  });
+  const measureText = createNoteTextMeasure(context, style, fontSize);
+  // A text with colored parts keeps, for each line, where its characters
+  // came from (revision 12).
+  const runs = textElementColorRuns(element);
+  const lineRanges = runs.length ? layoutTextLineRanges(element.text, boxWidth, measureText) : null;
+  const layout = lineRanges
+    ? { lines: lineRanges.map(line => line.text), requiredHeight: Math.max(lineHeight, lineRanges.length * lineHeight) }
+    : layoutTextBox(element.text, { maxWidth: boxWidth, lineHeight, measureText });
+  const characterColors = lineRanges ? textCharacterColors(String(element.text ?? "").length, runs) : null;
   setNoteTextCanvasFont(context, style, fontSize);
   context.textBaseline = "alphabetic";
   context.textAlign = align;
@@ -164,10 +172,31 @@ function drawText(context, element, width, height) {
   context.rotate(Number(element.rotation || 0) * Math.PI / 180);
   context.translate(-boxWidth / 2, -boxHeight / 2);
   layout.lines.forEach((line, index) => {
+    if (lineRanges) {
+      const segments = textLineColorSegments(lineRanges[index], characterColors, style.color || "#111111");
+      if (segments.length) fillColoredTextLine(context, segments, anchorX, baselines[index], align);
+      return;
+    }
     const visible = renderableTextLine(line);
     if (visible) fillTextLine(context, visible, anchorX, baselines[index], align);
   });
   context.restore();
+}
+
+// A line whose parts have different colors (revision 12): the parts are drawn
+// one after another with the advances the line breaker measured.
+function fillColoredTextLine(context, segments, anchorX, baseline, align) {
+  const pieces = segments.flatMap(segment => punctuationSpacingSegments(segment.text).map(text => ({ text, color: segment.color })));
+  const widths = pieces.map(piece => context.measureText(piece.text).width);
+  const total = widths.reduce((sum, width) => sum + width, 0);
+  let x = align === "center" ? anchorX - total / 2 : align === "right" ? anchorX - total : anchorX;
+  context.textAlign = "left";
+  pieces.forEach((piece, index) => {
+    context.fillStyle = piece.color;
+    context.fillText(piece.text, x, baseline);
+    x += widths[index];
+  });
+  context.textAlign = align;
 }
 
 // Draws one laid-out line with the same advances the line breaker measured:

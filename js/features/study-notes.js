@@ -98,15 +98,28 @@ import {
   NOTE_TEXT_MIN_DRAG_WIDTH,
   createNoteTextMeasure,
   ensureTextElementHeight,
+  fitTextElementToContent,
   layoutTextBox,
+  layoutTextLineRanges,
+  measureTextContentBox,
   measureTextFontMetrics,
   noteTextFontStack,
   noteTextGenericFamily,
   renderableTextLine,
   resolveTextBoxFromGesture,
   setNoteTextCanvasFont,
-  textLineBaselines
+  textCharacterColors,
+  textElementColorRuns,
+  textLineBaselines,
+  textLineColorSegments
 } from "../core/note-text-layout.js";
+import {
+  applyTextValueChange,
+  setTextColorRange,
+  textColorAtCaret,
+  textColorSegments,
+  textColorsForStorage
+} from "../core/note-text-colors.js";
 import { pageSwipeReleaseVelocity, pageSwipeVisualOffset, resolvePageSwipe, resolvePageSwipeIntent } from "../core/note-page-swipe.js";
 import { createPanMomentum, panReleaseVelocity } from "../core/note-pan-momentum.js";
 import { createTwoFingerTapRecognizer } from "../core/note-two-finger-tap.js";
@@ -159,6 +172,14 @@ const NOTE_OPERATION_WAIT_MS = 10_000;
 // follows it, so that tapping a mask, tapping with two fingers or a hand
 // settling on the screen just before the Pencil lands does not nudge the page.
 const PAN_SLOP_PX = 8;
+// The move handle sits this far (CSS px, before zoom) right of and above the
+// selection frame's top right corner (css/study-notes.css).
+const MOVE_HANDLE_OFFSET_PX = 32;
+// Colors offered while a text is written (the pen's colors).
+const NOTE_TEXT_PALETTE_COLORS = Object.freeze([
+  ["#111111", "黒"], ["#ef4444", "赤"], ["#2563eb", "青"], ["#16a34a", "緑"],
+  ["#eab308", "黄"], ["#f97316", "オレンジ"], ["#9333ea", "紫"], ["#ffffff", "白"]
+]);
 // An edited page's thumbnail is redrawn this long after the last edit.
 const PAGE_THUMBNAIL_REFRESH_DELAY_MS = 900;
 // Page backgrounds kept scaled down for redrawing thumbnails.
@@ -179,6 +200,7 @@ const TOUCH_PREEMPT_POLICY = Object.freeze({
   select: "rollback",
   "move-elements": "rollback",
   "move-mask": "rollback",
+  "move-masks": "rollback",
   "resize-selection": "rollback",
   "rotate-selection": "rollback",
   "line-endpoint": "rollback",
@@ -3796,11 +3818,15 @@ export function createStudyNotes(dependencies) {
     const anchorX = align === "center" ? left + boxWidth / 2 : align === "right" ? left + boxWidth : left;
     const lineHeight = fontSize * Number(style.lineHeight || 1.25);
     const fontMetrics = measureTextFontMetrics(measurement, fontSize);
-    const layout = layoutTextBox(element.text, {
-      maxWidth: boxWidth,
-      lineHeight,
-      measureText: createNoteTextMeasure(measurement, style, fontSize)
-    });
+    const measureText = createNoteTextMeasure(measurement, style, fontSize);
+    // A text with colored parts keeps, for each line, where its characters
+    // came from (revision 12).
+    const runs = textElementColorRuns(element);
+    const lineRanges = runs.length ? layoutTextLineRanges(element.text, boxWidth, measureText) : null;
+    const layout = lineRanges
+      ? { lines: lineRanges.map(line => line.text), requiredHeight: Math.max(lineHeight, lineRanges.length * lineHeight) }
+      : layoutTextBox(element.text, { maxWidth: boxWidth, lineHeight, measureText });
+    const characterColors = lineRanges ? textCharacterColors(String(element.text ?? "").length, runs) : null;
     const top = metrics.y(element.bounds.y);
     // Absolute baselines (not accumulated dy) keep blank lines and match the
     // editor textarea, which places each line with CSS half-leading.
@@ -3828,6 +3854,18 @@ export function createStudyNotes(dependencies) {
     node.style.setProperty("font-family", noteTextFontStack(style.fontFamily));
     node.style.setProperty("white-space", "pre");
     layout.lines.forEach((line, index) => {
+      if (lineRanges) {
+        // One tspan per color; the parts after the first continue the line
+        // (and its alignment) where the previous part ends.
+        textLineColorSegments(lineRanges[index], characterColors, style.color || "#111111").forEach((segment, segmentIndex) => {
+          const span = createSvgElement("tspan", segmentIndex
+            ? { fill: segment.color }
+            : { x: anchorX, y: baselines[index], fill: segment.color });
+          span.textContent = segment.text;
+          node.append(span);
+        });
+        return;
+      }
       const visible = renderableTextLine(line);
       if (!visible) return;
       const span = createSvgElement("tspan", { x: anchorX, y: baselines[index] });
@@ -3839,14 +3877,73 @@ export function createStudyNotes(dependencies) {
 
   function normalizeTextElementHeight(element) {
     if (element?.type !== "text") return element;
+    return ensureTextElementHeight(element, textMeasureOptions(element));
+  }
+
+  // Page size and text measuring for laying out a text element on the
+  // current page, as the page draws it.
+  function textMeasureOptions(element) {
     const metrics = notePageMetrics(pages[currentPageIndex]?.size);
-    const style = element.style || {};
+    const style = element?.style || {};
     const fontSize = Math.max(8, metrics.heightRatio(style.fontSizeRatio || .025));
-    return ensureTextElementHeight(element, {
+    return {
       pageWidth: metrics.width,
       pageHeight: metrics.height,
       measureText: createNoteTextMeasure(textMeasurement(style, fontSize), style, fontSize)
-    });
+    };
+  }
+
+  // A text element with its box fitted to its text (revision 12); other
+  // elements as they are.
+  function fitTextElement(element) {
+    return element?.type === "text" ? fitTextElementToContent(element, textMeasureOptions(element)) : element;
+  }
+
+  // What a text shows, cached per element object (picking runs on every
+  // move of the object eraser).
+  const textContentBoxCache = new WeakMap();
+  function textContentBox(element) {
+    const size = pages[currentPageIndex]?.size;
+    const key = JSON.stringify([element.text, element.bounds, element.style, size?.width, size?.height]);
+    const cached = textContentBoxCache.get(element);
+    if (cached?.key === key) return cached.box;
+    const box = measureTextContentBox(element, textMeasureOptions(element));
+    textContentBoxCache.set(element, { key, box });
+    return box;
+  }
+
+  // The area that picks an element (tap, object eraser): a text by the
+  // characters it shows, not by the larger box it may have been typed in, so
+  // that another text can be written right beside it (revision 12).
+  function elementPickBounds(element, pageSize) {
+    if (element?.type === "text" && element.bounds && !Number(element.rotation || 0) && String(element.text ?? "")) {
+      const { x, y, width, height } = textContentBox(element);
+      return { x, y, width, height };
+    }
+    return elementBounds(element, pageSize);
+  }
+
+  // The selected elements as their frame shows them: texts fitted to what
+  // they show.
+  function selectedElementsForTransform() {
+    return selectedElements().filter(element => !element.locked).map(fitTextElement);
+  }
+
+  // The page's elements as a move of the selection starts from: selected
+  // texts fitted to what they show (the box changes only if the move does).
+  function movableElementsSnapshot() {
+    return clone(currentContent.elements.map(element =>
+      selectedIds.includes(element.id) && !element.locked ? fitTextElement(element) : element));
+  }
+
+  // How far a group may move: it stays on the page as a whole, so that its
+  // items keep their places relative to each other.
+  function clampGroupDelta(bounds, dx, dy) {
+    if (!bounds) return { dx, dy };
+    return {
+      dx: clamp(dx, Math.min(0, -bounds.x), Math.max(0, 1 - bounds.x - bounds.width)),
+      dy: clamp(dy, Math.min(0, -bounds.y), Math.max(0, 1 - bounds.y - bounds.height))
+    };
   }
 
   function appendTransformHandle(overlay, handle, label) {
@@ -3966,7 +4063,8 @@ export function createStudyNotes(dependencies) {
       renderCropOverlay();
       return;
     }
-    const items = currentTool === "mask" ? selectedMasks() : selectedElements().filter(element => !element.locked);
+    // A text's frame is what it shows (revision 12).
+    const items = currentTool === "mask" ? selectedMasks() : selectedElementsForTransform();
     if (!items.length) return;
     const page = pages[currentPageIndex];
     const bounds = selectionBounds(items, page?.size);
@@ -3992,7 +4090,31 @@ export function createStudyNotes(dependencies) {
         handle.style.top = `${(point.y - bounds.y) / bounds.height * 100}%`;
       });
     }
+    appendMoveHandle(overlay, bounds, items.length);
     ui.stage.append(overlay);
+  }
+
+  // A handle diagonally beyond the frame's top right corner moves the
+  // selection (revision 12): a small item is hard to grab, and its frame is
+  // covered by the size handles. Several selected items share one handle.
+  // Where the page has no room there, it goes to the left or below (or inside
+  // the frame).
+  function appendMoveHandle(overlay, bounds, count) {
+    const handle = appendTransformHandle(overlay, "move", count > 1 ? `選択した${count}個をまとめて移動` : "選択した項目を移動");
+    handle.title = "ドラッグして移動";
+    handle.insertAdjacentHTML("beforeend", '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3 9.5 5.5M12 3l2.5 2.5M12 21l-2.5-2.5M12 21l2.5-2.5M3 12l2.5-2.5M3 12l2.5 2.5M21 12l-2.5-2.5M21 12l-2.5 2.5"/></svg>');
+    const width = Number(ui.stage.clientWidth) || 0;
+    const height = Number(ui.stage.clientHeight) || 0;
+    const room = MOVE_HANDLE_OFFSET_PX + 22;
+    const roomRight = (1 - bounds.x - bounds.width) * width >= room;
+    const roomLeft = bounds.x * width >= room;
+    const roomAbove = bounds.y * height >= room;
+    const roomBelow = (1 - bounds.y - bounds.height) * height >= room;
+    handle.classList.toggle("move-x-left", !roomRight && roomLeft);
+    handle.classList.toggle("move-x-inside", !roomRight && !roomLeft);
+    handle.classList.toggle("move-y-below", !roomAbove && roomBelow);
+    handle.classList.toggle("move-y-inside", !roomAbove && !roomBelow);
+    return handle;
   }
 
   function clearInteractiveLayers() {
@@ -4885,7 +5007,7 @@ export function createStudyNotes(dependencies) {
           const [start, end] = lineEndpoints(element, pageSize);
           return distanceToSegment(point, start, end, pageSize) <= tolerance;
         }
-        const bounds = elementBounds(element, pageSize);
+        const bounds = elementPickBounds(element, pageSize);
         return point.x >= bounds.x - toleranceAxes.x && point.x <= bounds.x + bounds.width + toleranceAxes.x &&
           point.y >= bounds.y - toleranceAxes.y && point.y <= bounds.y + bounds.height + toleranceAxes.y;
       })?.element?.id || "";
@@ -4950,7 +5072,7 @@ export function createStudyNotes(dependencies) {
       return distanceToSegment(point, start, end, pageSize) <= radius;
     }
     if (!["shape", "text"].includes(element.type) || !element.bounds) return false;
-    const bounds = element.bounds;
+    const bounds = element.type === "text" ? elementPickBounds(element, pageSize) : element.bounds;
     const axes = pageWidthRadiusToNormalizedAxes(radius, pageSize);
     return point.x >= bounds.x - axes.x && point.x <= bounds.x + bounds.width + axes.x &&
       point.y >= bounds.y - axes.y && point.y <= bounds.y + bounds.height + axes.y;
@@ -5119,6 +5241,12 @@ export function createStudyNotes(dependencies) {
       return;
     }
     if (transformHandle) {
+      // A finger on a handle drags the handle: the page does not slide to the
+      // next page under it.
+      if (event.pointerType === "touch" && swipeGesture?.pointerId === event.pointerId) {
+        swipeGesture.blocked = true;
+        clearSwipeVisual({ immediate: true });
+      }
       if (transformHandle.startsWith("crop-")) {
         const image = currentContent.elements.find(element => element.id === cropSession?.elementId);
         if (!image) return;
@@ -5135,9 +5263,26 @@ export function createStudyNotes(dependencies) {
           endpoint: transformHandle === "line-start" ? 0 : 1,
           original: clone(line), before: clone(currentContent)
         };
+      } else if (transformHandle === "move") {
+        // Everything selected moves together (revision 12).
+        const masks = currentTool === "mask" ? selectedMasks() : [];
+        const items = masks.length ? masks : selectedElementsForTransform();
+        const bounds = selectionBounds(items, pages[currentPageIndex]?.size);
+        if (!bounds) return;
+        activeGesture = masks.length
+          ? {
+            type: "move-masks", pointerId: event.pointerId, pointerType: event.pointerType,
+            start: point, bounds, original: clone(masks), before: clone(currentContent)
+          }
+          : {
+            type: "move-elements", pointerId: event.pointerId, pointerType: event.pointerType,
+            start: point, bounds, original: movableElementsSnapshot(), before: clone(currentContent)
+          };
       } else {
         if (transformHandle === "rotate" && selectedMasks().length) return;
-        const items = currentTool === "mask" ? selectedMasks() : selectedElements().filter(element => !element.locked);
+        // A text is resized and turned by what it shows (revision 12); its box
+        // is fitted when the gesture changes it.
+        const items = currentTool === "mask" ? selectedMasks() : selectedElementsForTransform();
         const bounds = selectionBounds(items, pages[currentPageIndex]?.size);
         if (!bounds) return;
         activeGesture = {
@@ -5173,6 +5318,9 @@ export function createStudyNotes(dependencies) {
       return;
     } else if (currentTool === "text" && elementId) {
       openTextEditor(point, elementId);
+      // The page must not take the focus from the opened text (the mouse
+      // down that follows would focus the page).
+      event.preventDefault();
       return;
     } else if (currentTool === "eraser-object") {
       activeGesture = { type: "eraser-object", pointerId: event.pointerId, pointerType: event.pointerType, changed: false, before: clone(currentContent) };
@@ -5182,7 +5330,11 @@ export function createStudyNotes(dependencies) {
       if (target?.locked) return;
       if (!event.shiftKey && !selectedIds.includes(elementId)) selectedIds = [elementId];
       else if (event.shiftKey && !selectedIds.includes(elementId)) selectedIds.push(elementId);
-      activeGesture = { type: "move-elements", pointerId: event.pointerId, pointerType: event.pointerType, start: point, original: clone(currentContent.elements), before: clone(currentContent) };
+      activeGesture = {
+        type: "move-elements", pointerId: event.pointerId, pointerType: event.pointerType, start: point,
+        bounds: selectionBounds(selectedElementsForTransform(), pages[currentPageIndex]?.size),
+        original: movableElementsSnapshot(), before: clone(currentContent)
+      };
       showSelectionContext();
       renderPage();
     } else if (currentTool === "mask" && maskId) {
@@ -5360,11 +5512,20 @@ export function createStudyNotes(dependencies) {
     } else if (activeGesture.type === "eraser-object") {
       eraseObjectsAt(point, activeGesture);
     } else if (activeGesture.type === "move-elements") {
-      const dx = point.x - activeGesture.start.x;
-      const dy = point.y - activeGesture.start.y;
-      currentContent.elements = activeGesture.original.map(element => selectedIds.includes(element.id)
+      const { dx, dy } = clampGroupDelta(activeGesture.bounds, point.x - activeGesture.start.x, point.y - activeGesture.start.y);
+      // Locked items stay where they are.
+      currentContent.elements = activeGesture.original.map(element => selectedIds.includes(element.id) && !element.locked
         ? translateElement(element, dx, dy, pages[currentPageIndex]?.size)
         : element);
+      renderPage();
+    } else if (activeGesture.type === "move-masks") {
+      const { dx, dy } = clampGroupDelta(activeGesture.bounds, point.x - activeGesture.start.x, point.y - activeGesture.start.y);
+      const moved = new Map(activeGesture.original.map(mask => [mask.id, {
+        ...mask,
+        x: clamp(mask.x + dx, 0, 1 - mask.width),
+        y: clamp(mask.y + dy, 0, 1 - mask.height)
+      }]));
+      currentContent.noteMasks = currentContent.noteMasks.map(mask => moved.get(mask.id) || mask);
       renderPage();
     } else if (activeGesture.type === "move-mask") {
       const dx = point.x - activeGesture.start.x;
@@ -5574,8 +5735,9 @@ export function createStudyNotes(dependencies) {
       if (gesture.changed) commitChange(gesture.before, "オブジェクト消去");
       return;
     }
-    if (gesture.type === "move-elements" || gesture.type === "move-mask") {
-      commitChange(gesture.before, gesture.type === "move-mask" ? "マスク移動" : "オブジェクト移動");
+    if (["move-elements", "move-mask", "move-masks"].includes(gesture.type)) {
+      showSelectionContext();
+      commitChange(gesture.before, gesture.type === "move-elements" ? "オブジェクト移動" : "マスク移動");
       return;
     }
     const end = gesture.end || gesture.start;
@@ -5617,7 +5779,7 @@ export function createStudyNotes(dependencies) {
       commitChange(gesture.before, "暗記マスク追加");
     } else if (gesture.type === "lasso") {
       const hits = currentContent.elements
-        .filter(element => lassoContainsElement(gesture.points, element, pages[currentPageIndex]?.size))
+        .filter(element => lassoContainsElement(gesture.points, fitTextElement(element), pages[currentPageIndex]?.size))
         .map(element => element.id);
       selectedIds = gesture.additive ? [...new Set([...selectedIds, ...hits])] : hits;
       showSelectionContext();
@@ -5689,18 +5851,40 @@ export function createStudyNotes(dependencies) {
     ui.stage.append(svg);
   }
 
+  // A box made wider for writing more on a line: from where its text is
+  // aligned, so that the text stays in place.
+  function widenTextBox(bounds, width, align) {
+    const extra = Math.max(0, width - bounds.width);
+    const right = bounds.x + bounds.width;
+    if (align === "right") {
+      const x = Math.max(0, bounds.x - extra);
+      return { ...bounds, x, width: right - x };
+    }
+    if (align === "center") {
+      const side = Math.min(extra / 2, bounds.x, Math.max(0, 1 - right));
+      return { ...bounds, x: bounds.x - side, width: bounds.width + 2 * side };
+    }
+    return { ...bounds, width: Math.max(bounds.width, Math.min(1 - bounds.x, bounds.width + extra)) };
+  }
+
   function openTextEditor(point, existingId = "", requestedBounds = null, { deferFocus = false } = {}) {
     if (textEditorSession && !textEditorSession.finish()) return;
     const existing = currentContent.elements.find(element => element.id === existingId && element.type === "text");
     const before = clone(currentContent);
     const fallback = requestedBounds || { x: point.x, y: point.y, ...NOTE_TEXT_DEFAULT_BOX };
-    const existingBounds = existing?.bounds ? { ...existing.bounds } : null;
+    let existingBounds = existing?.bounds ? { ...existing.bounds } : null;
     // Older builds could store a box a few pixels wide when a Pencil tap
     // moved slightly; such text rendered one character per line. Reopening it
     // restores a usable width instead of editing inside an invisible column.
     if (existingBounds && Number(existingBounds.width) < NOTE_TEXT_MIN_DRAG_WIDTH) {
       existingBounds.width = Math.min(1, NOTE_TEXT_DEFAULT_BOX.width);
       existingBounds.x = clamp(Number(existingBounds.x), 0, 1 - existingBounds.width);
+    } else if (existingBounds && Math.abs(Number(existing.rotation || 0)) < 0.001 && existingBounds.width < NOTE_TEXT_DEFAULT_BOX.width) {
+      // A text is kept as narrow as its widest line (revision 12). When no
+      // line wraps, it opens as wide as a new box so that more can be written
+      // on a line; when lines wrap, it keeps its width and so its line breaks.
+      const content = measureTextContentBox(existing, textMeasureOptions(existing));
+      if (!content.softWrapped) existingBounds = widenTextBox(existingBounds, NOTE_TEXT_DEFAULT_BOX.width, existing.style?.textAlign);
     }
     const width = clamp(Number(existingBounds?.width || fallback.width), existing ? .01 : NOTE_TEXT_MIN_BOX_WIDTH, 1);
     const height = clamp(Number(existingBounds?.height || fallback.height), existing ? .01 : .04, 1);
@@ -5721,6 +5905,7 @@ export function createStudyNotes(dependencies) {
       color: toolSettings.textColor,
       opacity: Number(toolSettings.textOpacity) / 100
     };
+    const baseColor = String(style.color || "#111111").toLowerCase();
     const editor = document.createElement("textarea");
     editor.className = "note-text-editor";
     editor.classList.toggle("is-sizing", deferFocus);
@@ -5729,13 +5914,22 @@ export function createStudyNotes(dependencies) {
     editor.setAttribute("wrap", "soft");
     editor.spellcheck = false;
     editor.value = existing?.text || "";
-    editor.style.fontFamily = noteTextFontStack(style.fontFamily);
-    editor.style.fontWeight = style.fontWeight === "bold" ? "bold" : "normal";
-    editor.style.fontStyle = style.fontStyle === "italic" ? "italic" : "normal";
-    editor.style.setProperty("--note-text-editor-line-height", String(style.lineHeight || 1.25));
-    editor.style.setProperty("--note-text-editor-align", style.textAlign || "left");
-    editor.style.setProperty("--note-text-editor-color", style.color || "#111111");
-    editor.style.setProperty("--note-text-editor-opacity", String(style.opacity ?? 1));
+    // Parts of the text in other colors (revision 12) are drawn by a layer
+    // under the editor, which lays out the same text with the same rules; the
+    // editor's own text is then transparent and only its caret and selection
+    // show.
+    const mirror = document.createElement("div");
+    mirror.className = "note-text-editor-mirror hidden";
+    mirror.setAttribute("aria-hidden", "true");
+    [editor, mirror].forEach(node => {
+      node.style.fontFamily = noteTextFontStack(style.fontFamily);
+      node.style.fontWeight = style.fontWeight === "bold" ? "bold" : "normal";
+      node.style.fontStyle = style.fontStyle === "italic" ? "italic" : "normal";
+      node.style.setProperty("--note-text-editor-line-height", String(style.lineHeight || 1.25));
+      node.style.setProperty("--note-text-editor-align", style.textAlign || "left");
+      node.style.setProperty("--note-text-editor-color", baseColor);
+      node.style.setProperty("--note-text-editor-opacity", String(style.opacity ?? 1));
+    });
 
     // The overlay must wrap and place text exactly like the committed SVG
     // text. Its font is kept at 16px or larger (iPad Safari input rules) and
@@ -5746,20 +5940,137 @@ export function createStudyNotes(dependencies) {
       const actualFontPx = Math.max(1, Number(style.fontSizeRatio || .025) * stageHeight);
       const editorFontPx = Math.max(NOTE_TEXT_EDITOR_MIN_FONT_PX, actualFontPx);
       editorScale = actualFontPx / editorFontPx;
-      editor.style.setProperty("--note-text-editor-font-size", `${editorFontPx}px`);
-      editor.style.left = `${bounds.x * 100}%`;
-      editor.style.top = `${bounds.y * 100}%`;
-      editor.style.width = `${bounds.width * 100 / editorScale}%`;
-      editor.style.height = `${bounds.height * 100 / editorScale}%`;
-      editor.style.transform = editorScale < 0.9999 ? `scale(${editorScale})` : "";
+      [editor, mirror].forEach(node => {
+        node.style.setProperty("--note-text-editor-font-size", `${editorFontPx}px`);
+        node.style.left = `${bounds.x * 100}%`;
+        node.style.top = `${bounds.y * 100}%`;
+        node.style.width = `${bounds.width * 100 / editorScale}%`;
+        node.style.height = `${bounds.height * 100 / editorScale}%`;
+        node.style.transform = editorScale < 0.9999 ? `scale(${editorScale})` : "";
+      });
     };
     applyEditorGeometry();
-    ui.stage.append(editor);
+    ui.stage.append(mirror, editor);
 
     let composing = false;
     let pendingFinish = false;
     let finished = false;
     let cancelled = false;
+    // The color of every character (null: the text's color), and a color
+    // chosen for the next characters written at the caret.
+    let characterColors = textCharacterColors(editor.value.length, existing ? textElementColorRuns(existing) : []);
+    let previousValue = editor.value;
+    let pendingColor = null;
+    let pendingAt = -1;
+    let paletteInteractionUntil = 0;
+    const palette = document.createElement("div");
+    palette.className = "note-text-palette";
+    // Part of the text being written: taps on it do not reach the page.
+    palette.dataset.noteTextPalette = "true";
+    palette.setAttribute("role", "toolbar");
+    palette.setAttribute("aria-label", "文字色");
+    NOTE_TEXT_PALETTE_COLORS.forEach(([color, name]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.tabIndex = -1;
+      button.dataset.textColor = color;
+      button.style.setProperty("--note-text-swatch", color);
+      button.setAttribute("aria-label", `文字色 ${name}`);
+      button.title = name;
+      palette.append(button);
+    });
+    // The caret's color and the palette's current color follow the caret.
+    const syncColorControls = () => {
+      if (finished) return;
+      const start = editor.selectionStart;
+      const collapsed = start === editor.selectionEnd;
+      const current = pendingColor || textColorAtCaret(characterColors, start, baseColor);
+      editor.style.setProperty("--note-text-editor-caret", current);
+      palette.querySelectorAll("[data-text-color]").forEach(button => {
+        button.classList.toggle("active", collapsed && button.dataset.textColor === current);
+      });
+    };
+    const syncColors = () => {
+      if (finished) return;
+      const colored = Boolean(pendingColor) || characterColors.some(Boolean);
+      editor.classList.toggle("has-color-mirror", colored);
+      mirror.classList.toggle("hidden", !colored);
+      if (colored) {
+        const nodes = textColorSegments(editor.value, characterColors, baseColor).map(segment => {
+          const span = document.createElement("span");
+          span.style.color = segment.color;
+          span.textContent = segment.text;
+          return span;
+        });
+        // An empty last line shows only with something after the line break.
+        if (editor.value.endsWith("\n")) nodes.push(document.createTextNode("\u200b"));
+        mirror.replaceChildren(...nodes);
+      }
+      syncColorControls();
+    };
+    // The palette above the box (below it near the page's top), at the same
+    // size at any zoom.
+    const positionPalette = () => {
+      if (finished || !palette.isConnected) return;
+      const zoom = Math.max(.1, Number(zoomController?.zoom) || 1);
+      const stageWidth = Math.max(1, ui.stage.clientWidth || 1);
+      const stageHeight = Math.max(1, ui.stage.clientHeight || 1);
+      const paletteWidth = palette.offsetWidth / zoom;
+      const paletteHeight = palette.offsetHeight / zoom;
+      const gap = 8 / zoom;
+      const top = bounds.y * stageHeight;
+      const bottom = (bounds.y + bounds.height) * stageHeight;
+      palette.style.left = `${clamp(bounds.x * stageWidth, 0, Math.max(0, stageWidth - paletteWidth))}px`;
+      palette.style.top = `${top >= paletteHeight + gap ? top - paletteHeight - gap : Math.min(bottom + gap, Math.max(0, stageHeight - paletteHeight))}px`;
+      palette.style.transform = Math.abs(zoom - 1) > 0.0001 ? `scale(${1 / zoom})` : "";
+    };
+    const trackValueChange = () => {
+      if (editor.value === previousValue) return;
+      characterColors = applyTextValueChange(characterColors, previousValue, editor.value, {
+        caret: editor.selectionEnd,
+        pendingColor,
+        pendingAt
+      }).colors;
+      previousValue = editor.value;
+      // A chosen color applies to what is written next at that place.
+      pendingColor = null;
+      pendingAt = -1;
+    };
+    const chooseColor = color => {
+      if (finished) return;
+      const start = Math.min(editor.selectionStart, editor.selectionEnd);
+      const end = Math.max(editor.selectionStart, editor.selectionEnd);
+      if (end > start) {
+        characterColors = setTextColorRange(characterColors, start, end, color);
+        pendingColor = null;
+        pendingAt = -1;
+      } else {
+        pendingColor = color;
+        pendingAt = start;
+      }
+      // The next text starts in the last chosen color.
+      persistToolSettings({ textColor: color });
+      syncColors();
+      if (document.activeElement !== editor) {
+        editor.focus({ preventScroll: true });
+        editor.setSelectionRange(start, end);
+      }
+    };
+    // Tapping a color must not end the writing (the editor would lose focus).
+    const holdEditorFocus = event => {
+      paletteInteractionUntil = performance.now() + 800;
+      event.preventDefault();
+    };
+    palette.addEventListener("pointerdown", holdEditorFocus);
+    palette.addEventListener("mousedown", holdEditorFocus);
+    palette.addEventListener("click", event => {
+      const color = event.target?.closest?.("[data-text-color]")?.dataset.textColor;
+      if (color) chooseColor(color);
+    });
+    const onSelectionChange = () => {
+      if (document.activeElement === editor) syncColorControls();
+    };
+    const onZoomEnd = () => requestAnimationFrame(positionPalette);
     const updateAutomaticHeight = () => {
       if (finished || !editor.isConnected) return;
       const stageHeight = Math.max(1, ui.stage.clientHeight || 1);
@@ -5768,6 +6079,7 @@ export function createStudyNotes(dependencies) {
       const normalizedHeight = clamp(contentHeight / stageHeight, .01, Math.max(.01, 1 - bounds.y));
       bounds = { ...bounds, height: Math.max(bounds.height, normalizedHeight) };
       applyEditorGeometry();
+      positionPalette();
     };
     const setEditorBounds = nextBounds => {
       if (finished || existing || !nextBounds) return;
@@ -5780,6 +6092,7 @@ export function createStudyNotes(dependencies) {
         height: nextHeight
       };
       applyEditorGeometry();
+      positionPalette();
     };
     const resizeObserver = typeof ResizeObserver === "function"
       ? new ResizeObserver(() => {
@@ -5800,13 +6113,18 @@ export function createStudyNotes(dependencies) {
     const finish = ({ cancel = false, force = false } = {}) => {
       if (finished) return true;
       if (composing && !force) { pendingFinish = true; cancelled ||= cancel; return false; }
+      trackValueChange();
       finished = true;
       cancelled ||= cancel;
       resizeObserver?.disconnect();
       globalThis.visualViewport?.removeEventListener?.("resize", keepVisible);
       globalThis.visualViewport?.removeEventListener?.("scroll", keepVisible);
+      document.removeEventListener("selectionchange", onSelectionChange);
+      ui.viewport.removeEventListener("pagezoomend", onZoomEnd);
       const value = cancelled ? "" : editor.value.trimEnd();
       editor.remove();
+      mirror.remove();
+      palette.remove();
       textEditorSession = null;
       // The page may have been re-rendered while the keyboard was open; edit
       // the element that is live now rather than a stale reference.
@@ -5823,23 +6141,35 @@ export function createStudyNotes(dependencies) {
         renderPage();
         return true;
       }
+      // One color stays the text's color; parts in other colors are stored as
+      // runs (revision 12).
+      const colors = textColorsForStorage(value, characterColors.slice(0, value.length), baseColor);
+      // The box is fitted to what is written, so that its frame is no larger
+      // than the text (revision 12).
       if (target) {
         target.text = value;
         target.autoHeight = true;
-        target.bounds = normalizeTextElementHeight({ ...target, text: value, bounds }).bounds;
-      } else currentContent.elements.push(normalizeTextElementHeight({
+        target.style = { ...(target.style || {}), color: colors.color };
+        if (colors.textColors) target.textColors = colors.textColors;
+        else delete target.textColors;
+        target.bounds = fitTextElement(normalizeTextElementHeight({ ...target, bounds })).bounds;
+      } else currentContent.elements.push(fitTextElement(normalizeTextElementHeight({
         id: randomId(), type: "text", bounds, rotation: 0, text: value, autoHeight: true,
-        style: clone(style),
+        style: { ...clone(style), color: colors.color },
+        ...(colors.textColors ? { textColors: colors.textColors } : {}),
         zIndex: elementZIndex(currentContent.elements)
-      }));
+      })));
       commitChange(before, target ? "テキスト編集" : "テキスト追加");
       return true;
     };
     const activate = () => {
       if (finished || !editor.isConnected) return false;
       editor.classList.remove("is-sizing");
+      if (!palette.isConnected) ui.stage.append(palette);
       editor.focus({ preventScroll: true });
       editor.setSelectionRange(editor.value.length, editor.value.length);
+      syncColors();
+      positionPalette();
       requestAnimationFrame(keepVisible);
       return true;
     };
@@ -5848,25 +6178,44 @@ export function createStudyNotes(dependencies) {
       finish,
       setBounds: setEditorBounds,
       activate,
+      chooseColor,
       get bounds() { return { ...bounds }; },
       get isComposing() { return composing; }
     };
     editor.addEventListener("compositionstart", () => { composing = true; });
     editor.addEventListener("compositionend", () => {
       composing = false;
+      trackValueChange();
       updateAutomaticHeight();
+      syncColors();
       if (pendingFinish) queueMicrotask(() => finish({ cancel: cancelled }));
     });
-    editor.addEventListener("input", updateAutomaticHeight);
+    editor.addEventListener("input", () => {
+      trackValueChange();
+      updateAutomaticHeight();
+      syncColors();
+    });
     editor.addEventListener("paste", () => requestAnimationFrame(updateAutomaticHeight));
-    editor.addEventListener("blur", () => { if (!composing) finish(); else pendingFinish = true; });
+    editor.addEventListener("blur", () => {
+      // A tap on the color palette keeps the text open.
+      if (performance.now() < paletteInteractionUntil) {
+        setTimeout(() => {
+          if (!finished && document.activeElement !== editor) editor.focus({ preventScroll: true });
+        }, 0);
+        return;
+      }
+      if (!composing) finish(); else pendingFinish = true;
+    });
     editor.addEventListener("keydown", event => {
       if (event.key === "Escape" && !composing) { event.preventDefault(); finish({ cancel: true }); }
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && !composing) { event.preventDefault(); finish(); }
     });
+    document.addEventListener("selectionchange", onSelectionChange);
+    ui.viewport.addEventListener("pagezoomend", onZoomEnd);
     globalThis.visualViewport?.addEventListener?.("resize", keepVisible);
     globalThis.visualViewport?.addEventListener?.("scroll", keepVisible);
     updateAutomaticHeight();
+    syncColors();
     if (!deferFocus) activate();
     return textEditorSession;
   }
@@ -6198,11 +6547,12 @@ export function createStudyNotes(dependencies) {
     if (ui.textOpacityValue) ui.textOpacityValue.value = `${Math.round(Number(ui.textOpacity.value))}%`;
   }
 
-  function applySelectedTextStyle() {
+  function applySelectedTextStyle({ colorChanged = false } = {}) {
     const texts = selectedElements().filter(element => element.type === "text");
     if (!texts.length || currentTool !== "select") return;
     const before = clone(currentContent);
     texts.forEach(element => {
+      const wrapped = measureTextContentBox(element, textMeasureOptions(element)).softWrapped;
       element.style = {
         ...(element.style || {}),
         fontFamily: ui.fontFamily.value,
@@ -6214,7 +6564,15 @@ export function createStudyNotes(dependencies) {
         color: ui.textColor.value,
         opacity: Number(ui.textOpacity.value) / 100
       };
-      const normalized = normalizeTextElementHeight(element);
+      // A color chosen for the whole text replaces its colored parts.
+      if (colorChanged) delete element.textColors;
+      // A text whose lines did not wrap grows so that a larger or bolder font
+      // does not break its lines; then its box is fitted again (revision 12).
+      if (!wrapped && Math.abs(Number(element.rotation || 0)) < 0.001) {
+        const needed = measureTextContentBox({ ...element, bounds: { ...element.bounds, x: 0, width: 1 } }, textMeasureOptions(element));
+        if (needed.width > element.bounds.width) element.bounds = widenTextBox(element.bounds, needed.width, element.style.textAlign);
+      }
+      const normalized = fitTextElement(normalizeTextElementHeight(element));
       element.bounds = normalized.bounds;
       element.autoHeight = normalized.autoHeight;
     });
@@ -7494,7 +7852,7 @@ export function createStudyNotes(dependencies) {
       else if (currentTool.startsWith("eraser")) persistToolSettings({ eraserSize: value });
       else persistToolSettings({ penWidth: value });
     });
-    const persistSelectedTextDefaults = () => {
+    const persistSelectedTextDefaults = event => {
       persistToolSettings({
         textFontFamily: ui.fontFamily.value,
         textFontSize: Number(ui.fontSize.value),
@@ -7505,7 +7863,7 @@ export function createStudyNotes(dependencies) {
         textColor: ui.textColor.value,
         textOpacity: Number(ui.textOpacity.value)
       });
-      applySelectedTextStyle();
+      applySelectedTextStyle({ colorChanged: event?.target === ui.textColor });
     };
     [ui.textColor, ui.textOpacity, ui.fontFamily, ui.fontSize, ui.fontBold, ui.fontItalic, ui.textAlign, ui.lineHeight]
       .forEach(control => control.addEventListener("change", persistSelectedTextDefaults));

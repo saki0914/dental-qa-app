@@ -99,6 +99,24 @@ function validateBounds(bounds, path, { allowZeroSize = false } = {}) {
   }
 }
 
+// Colors of parts of a text (revision 12): runs of offsets into the text, in
+// order and not overlapping, within `length`. A build without colors may
+// change the text later; the runs are then ignored when drawing.
+function validateTextColors(textColors, path) {
+  if (typeof textColors !== "object" || Array.isArray(textColors)) throw new Error(`${path}が不正です。`);
+  if (!Number.isInteger(textColors.length) || textColors.length < 0) throw new Error(`${path}.lengthが不正です。`);
+  if (!Array.isArray(textColors.runs)) throw new Error(`${path}.runsが配列ではありません。`);
+  let previousEnd = 0;
+  textColors.runs.forEach((run, index) => {
+    const runPath = `${path}.runs[${index}]`;
+    if (!Number.isInteger(run?.start) || !Number.isInteger(run?.end) || run.start < previousEnd || run.end <= run.start || run.end > textColors.length) {
+      throw new Error(`${runPath}の範囲が不正です。`);
+    }
+    if (!/^#[0-9a-f]{6}$/i.test(String(run.color ?? ""))) throw new Error(`${runPath}.colorが不正です。`);
+    previousEnd = run.end;
+  });
+}
+
 export function validateNormalizedNoteContent(content, { strict = false } = {}) {
   content.elements.forEach((element, elementIndex) => {
     const path = `elements[${elementIndex}]`;
@@ -140,6 +158,8 @@ export function validateNormalizedNoteContent(content, { strict = false } = {}) 
     if (element.type === "text" && element.style?.fontSizeRatio != null) {
       assertNormalized(element.style.fontSizeRatio, `${path}.style.fontSizeRatio`, { positive: true });
     }
+    // Checked when saving; a page that has odd runs still opens (they are not drawn).
+    if (strict && element.type === "text" && element.textColors != null) validateTextColors(element.textColors, `${path}.textColors`);
   });
   content.noteMasks.forEach((mask, index) => validateBounds(mask, `noteMasks[${index}]`));
   return content;

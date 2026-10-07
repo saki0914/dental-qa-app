@@ -684,3 +684,102 @@ body.note-editor-dedicated .local-environment-details{
   border-radius:calc(var(--mask-px) * 6);
   background:rgba(17,24,39,.55);
 }
+
+/* Revision 12: a text with parts in other colors is drawn while it is
+   written by a layer under the editor. Both lay out the same text with the
+   same rules (see .note-text-editor above); the editor's own text is then
+   transparent, so that only its caret and selection show over the layer. */
+.note-text-editor-mirror{
+  position:absolute;
+  z-index:99;
+  box-sizing:border-box;
+  margin:0;
+  border:0;
+  padding:0;
+  overflow:hidden;
+  transform-origin:0 0;
+  pointer-events:none;
+  background:rgba(255,255,255,.94);
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  word-break:normal;
+  line-break:normal;
+  tab-size:4;
+  text-spacing-trim:space-all;
+  text-autospace:no-autospace;
+  font-kerning:none;
+  -webkit-text-size-adjust:100%;
+  text-size-adjust:100%;
+  font-size:max(16px,var(--note-text-editor-font-size,16px));
+  line-height:var(--note-text-editor-line-height,1.25);
+  text-align:var(--note-text-editor-align,left);
+  color:var(--note-text-editor-color,#111);
+  opacity:var(--note-text-editor-opacity,1);
+}
+.note-text-editor[data-note-text-editor="true"].has-color-mirror{
+  color:transparent;
+  -webkit-text-fill-color:transparent;
+  background:transparent;
+  caret-color:var(--note-text-editor-caret,#111);
+}
+/* The colors offered while a text is written, above its box. It keeps its
+   size at any zoom (scaled by 1 / zoom in study-notes.js). */
+.note-text-palette{
+  position:absolute;
+  z-index:101;
+  display:flex;
+  gap:4px;
+  align-items:center;
+  padding:5px;
+  border:1px solid #cbd5e1;
+  border-radius:12px;
+  background:#fff;
+  box-shadow:0 8px 24px rgba(15,23,42,.2);
+  transform-origin:0 0;
+  white-space:nowrap;
+  touch-action:manipulation;
+  -webkit-user-select:none;
+  user-select:none;
+  -webkit-touch-callout:none;
+}
+.note-text-palette button{
+  flex:0 0 auto;
+  inline-size:36px;
+  block-size:36px;
+  min-inline-size:36px;
+  padding:0;
+  border:3px solid #fff;
+  border-radius:50%;
+  background:var(--note-text-swatch,#111);
+  box-shadow:0 0 0 1px #94a3b8;
+  cursor:pointer;
+  touch-action:manipulation;
+}
+.note-text-palette button.active{box-shadow:0 0 0 3px #2563eb}
+/* Revision 12: the move handle, diagonally beyond the selection frame's top
+   right corner (or the nearest corner with room on the page). */
+.note-transform-handle.handle-move{left:calc(100% + 32px);top:-32px}
+.note-transform-handle.handle-move.move-x-left{left:-32px}
+.note-transform-handle.handle-move.move-x-inside{left:calc(100% - 32px)}
+.note-transform-handle.handle-move.move-y-below{top:calc(100% + 32px)}
+.note-transform-handle.handle-move.move-y-inside{top:32px}
+.note-transform-handle.handle-move::after{display:none}
+.note-transform-handle.handle-move svg{
+  position:absolute;
+  left:7px;
+  top:7px;
+  inline-size:30px;
+  block-size:30px;
+  box-sizing:border-box;
+  padding:5px;
+  border:2px solid #fff;
+  border-radius:50%;
+  background:#2563eb;
+  box-shadow:0 2px 8px rgba(15,23,42,.35);
+  fill:none;
+  stroke:#fff;
+  stroke-width:2.2;
+  stroke-linecap:round;
+  stroke-linejoin:round;
+  pointer-events:none;
+}
