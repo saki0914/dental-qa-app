@@ -1662,7 +1662,8 @@ test("@authenticated @ipad-v-next 選択枠の右上の取手で移動でき、�
     expect(Math.abs(end.y - start.y - 30)).toBeLessThan(3);
   }
   await page.locator("#noteUndoBtn").click();
-  await expect.poll(async () => Math.round((await masks.nth(0).boundingBox()).x)).toBe(Math.round(maskA.x));
+  // The masks are drawn again after Undo: keep polling while the element is replaced.
+  await expect.poll(async () => Math.round((await masks.nth(0).boundingBox())?.x ?? Number.NaN)).toBe(Math.round(maskA.x));
   await expect(page.locator("#noteSaveStatus")).toContainText("保存済み", { timeout: 20_000 });
 
   // The input settings tell which build of the app the tab runs (revision 13).

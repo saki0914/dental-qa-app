@@ -25,6 +25,11 @@ import {
   normalizeAnswerForComparison
 } from "./core/answer-comparison.js";
 import {
+  choiceRequirementText,
+  isCorrectChoiceSelection,
+  parseChoiceQuestion
+} from "./core/question-choices.js";
+import {
   calculateStudyCounters,
   filterQuestionsForStudy,
   getStudyPrimaryCategories,
@@ -109,6 +114,10 @@ let isApplyingCloudState = false;
 let authEpoch = 0;
 let syncPhase = "signed-out";
 let activeSyncSession = null;
+// The question shown on the study card, and its choices while it is a choice
+// question: { questionId, choice, selected, result, revealed } (revision 14).
+let studyCardQuestion = null;
+let studyChoiceState = null;
 
 const el = {
   cloudStatus: document.getElementById("cloudStatus"),
@@ -220,13 +229,61 @@ const el = {
   selectAllMasksBtn: document.getElementById("selectAllMasksBtn"),
   markWeakMaskBtn: document.getElementById("markWeakMaskBtn"),
   showAllMasksBtn: document.getElementById("showAllMasksBtn"),
-  studyCard: document.querySelector(".card"),
+  studyCard: document.getElementById("studyCard") || document.querySelector(".card"),
+  studyQuestionHead: document.getElementById("studyQuestionHead"),
+  studyQuestionNo: document.getElementById("studyQuestionNo"),
+  studyQuestionTags: document.getElementById("studyQuestionTags"),
+  studyChoices: document.getElementById("studyChoices"),
+  studyChoiceActions: document.getElementById("studyChoiceActions"),
+  choiceSubmitBtn: document.getElementById("choiceSubmitBtn"),
+  choiceRetryBtn: document.getElementById("choiceRetryBtn"),
+  judgeBtn: document.getElementById("judgeBtn"),
   studyActions: document.getElementById("studyActions"),
   prevBtn: document.getElementById("prevBtn"),
   prevBtnIpad: document.getElementById("prevBtnIpad"),
   nextBtn: document.getElementById("nextBtn"),
   nextBtnIpad: document.getElementById("nextBtnIpad")
 };
+ensureStudyCardElements();
+
+// 学習カードの選択問題の表示に使う要素（改訂14）。公開直後に前版のindex.htmlが
+// 残っていても動くよう、無ければ作る。
+// Elements of the study card for choice questions (revision 14), created when
+// a cached index.html of the previous release does not have them.
+function ensureStudyCardElements() {
+  const card = el.studyCard;
+  if (!card || !el.question) return;
+  card.classList.add("study-card");
+  const create = (tag, id, className, text = "") => {
+    const node = document.createElement(tag);
+    node.id = id;
+    node.className = className;
+    if (text) node.textContent = text;
+    return node;
+  };
+  if (!el.studyQuestionHead) {
+    el.studyQuestionHead = create("div", "studyQuestionHead", "study-qhead hidden");
+    el.studyQuestionNo = create("span", "studyQuestionNo", "study-qno");
+    el.studyQuestionTags = create("span", "studyQuestionTags", "study-qtags");
+    el.studyQuestionHead.append(el.studyQuestionNo, el.studyQuestionTags);
+    card.prepend(el.studyQuestionHead);
+  }
+  if (!el.studyChoices) {
+    el.studyChoices = create("div", "studyChoices", "study-choices hidden");
+    el.studyChoices.setAttribute("role", "group");
+    el.studyChoices.setAttribute("aria-label", "選択肢");
+    el.question.after(el.studyChoices);
+  }
+  if (!el.studyChoiceActions) {
+    el.studyChoiceActions = create("div", "studyChoiceActions", "study-choice-actions hidden");
+    el.choiceSubmitBtn = create("button", "choiceSubmitBtn", "study-drill-btn", "解答する");
+    el.choiceRetryBtn = create("button", "choiceRetryBtn", "study-drill-btn ghost", "解き直す");
+    el.choiceSubmitBtn.type = "button";
+    el.choiceRetryBtn.type = "button";
+    el.studyChoiceActions.append(el.choiceSubmitBtn, el.choiceRetryBtn);
+    el.studyChoices.after(el.studyChoiceActions);
+  }
+}
 
 function isSyncSessionCurrent(session) {
   return !!session &&
@@ -823,32 +880,211 @@ function renderStudy({ reshuffle = false } = {}) {
       : "";
   el.studyMeta.textContent = `${deviceMode === "iphone" ? "iPhone版" : "iPad版"} / ${rangeText}${subcatText} / ${orderText}${modeText}`;
 
-  const q = currentQuestion();
+  renderStudyQuestionCard(currentQuestion());
+  updateStudyNavigationButtons();
+}
+
+// 問題カードの中身（renderStudyとrenderStudyCurrentOnlyで共通）。選択問題は
+// 問題文と選択肢のボタンに分けて表示する（改訂14）。
+// The contents of the study card. A choice question shows the question text
+// and its options as buttons (revision 14).
+function renderStudyQuestionCard(q) {
+  const choice = q ? parseChoiceQuestion(q) : null;
+  studyCardQuestion = q || null;
+  studyChoiceState = choice
+    ? { questionId: q.id, choice, selected: [], result: null, revealed: false }
+    : null;
+  renderStudyQuestionHead(q, choice);
+
   if (!q) {
     el.question.textContent = allQuestions.length ? "条件に合う問題がありません。" : "問題がありません。";
     renderQuestionImage(null);
+    el.answerBox.innerHTML = "";
+    el.explainBox.innerHTML = "";
     el.answerBox.style.display = "none";
     el.explainBox.style.display = "none";
     clearIpadAnswerInputs();
     clearJudgeStatus();
-    updateStudyNavigationButtons();
+    renderStudyChoices();
     return;
   }
 
-  el.question.textContent = formatDisplayText(q.question);
+  el.question.textContent = choice ? choice.stem : formatDisplayText(q.question);
   renderQuestionImage(q);
-  el.answerBox.innerHTML = `<b>正解</b><br>${ensureCurrentQuestionAnswers(q).map(escapeDisplayText).join("\n")}`;
-  el.explainBox.innerHTML = `<b>解説</b><br>${escapeDisplayText(q.explanation || "解説なし")}`;
+  if (choice) {
+    // Filled with the verdict and the correct options when they are shown.
+    el.answerBox.innerHTML = "";
+    el.explainBox.innerHTML = escapeDisplayText(q.explanation || "解説なし");
+  } else {
+    el.answerBox.innerHTML = `<b>正解</b><br>${ensureCurrentQuestionAnswers(q).map(escapeDisplayText).join("\n")}`;
+    el.explainBox.innerHTML = `<b>解説</b><br>${escapeDisplayText(q.explanation || "解説なし")}`;
+  }
   el.answerBox.style.display = "none";
   el.explainBox.style.display = "none";
   if (el.studyActions) el.studyActions.classList.remove("is-floating");
-  renderIpadAnswerInputs(q);
+  if (choice) hideIpadAnswerInputs();
+  else renderIpadAnswerInputs(q);
   clearJudgeStatus();
+  renderStudyChoices();
+}
 
-  updateStudyNavigationButtons();
+function renderStudyQuestionHead(q, choice) {
+  if (!el.studyQuestionHead) return;
+  el.studyQuestionHead.classList.toggle("hidden", !q);
+  if (!q) return;
+  if (el.studyQuestionNo) el.studyQuestionNo.textContent = `Q${String(currentIndex + 1).padStart(2, "0")}`;
+  if (el.studyQuestionTags) {
+    const category = Array.isArray(q.subcategories) ? q.subcategories[0] : "";
+    el.studyQuestionTags.textContent = [q.subject, category, choiceRequirementText(choice)]
+      .filter(Boolean)
+      .join("・");
+  }
+}
+
+function createStudyChoiceButton(option) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "study-option";
+  button.dataset.choiceLabel = option.label;
+  const key = document.createElement("span");
+  key.className = "study-option-key";
+  key.textContent = option.label;
+  const text = document.createElement("span");
+  text.className = "study-option-text";
+  text.textContent = option.text;
+  // The order of the selected options, for questions answered in order.
+  const order = document.createElement("span");
+  order.className = "study-option-order hidden";
+  order.setAttribute("aria-hidden", "true");
+  // "（正答）" or "（誤り）" for screen readers once the answer is shown.
+  const note = document.createElement("span");
+  note.className = "study-sr-only";
+  button.append(key, text, order, note);
+  return button;
+}
+
+function renderStudyChoices() {
+  const state = studyChoiceState;
+  if (el.studyChoices) {
+    el.studyChoices.replaceChildren(...(state ? state.choice.choices.map(createStudyChoiceButton) : []));
+    el.studyChoices.classList.toggle("hidden", !state);
+  }
+  el.judgeBtn?.classList.toggle("hidden", !!state);
+  updateStudyChoiceView();
+}
+
+function updateStudyChoiceView() {
+  const state = studyChoiceState;
+  el.studyCard?.classList.toggle("is-choice", !!state);
+  el.studyCard?.classList.toggle("is-correct", state?.result?.correct === true);
+  el.studyCard?.classList.toggle("is-incorrect", state?.result?.correct === false);
+  if (!state) {
+    el.studyChoiceActions?.classList.add("hidden");
+    return;
+  }
+
+  const { choice, selected, result, revealed } = state;
+  const settled = !!result || revealed;
+  const picked = result ? result.selected : selected;
+  el.studyChoices?.querySelectorAll("[data-choice-label]").forEach(button => {
+    const label = button.dataset.choiceLabel;
+    const order = picked.indexOf(label);
+    const isAnswer = choice.answers.includes(label);
+    button.disabled = settled;
+    button.classList.toggle("is-selected", !settled && order >= 0);
+    button.classList.toggle("is-right", settled && isAnswer);
+    button.classList.toggle("is-wrong", settled && !isAnswer && order >= 0);
+    if (settled) button.removeAttribute("aria-pressed");
+    else button.setAttribute("aria-pressed", String(order >= 0));
+    const badge = button.querySelector(".study-option-order");
+    if (badge) {
+      badge.textContent = order >= 0 ? String(order + 1) : "";
+      badge.classList.toggle("hidden", !(choice.ordered && !settled && order >= 0));
+    }
+    const note = button.querySelector(".study-sr-only");
+    if (note) note.textContent = !settled ? "" : isAnswer ? "（正答）" : order >= 0 ? "（誤り）" : "";
+  });
+
+  const showSubmit = choice.multiple && !settled;
+  if (el.choiceSubmitBtn) {
+    el.choiceSubmitBtn.classList.toggle("hidden", !showSubmit);
+    el.choiceSubmitBtn.disabled = selected.length !== choice.answers.length;
+  }
+  el.choiceRetryBtn?.classList.toggle("hidden", !settled);
+  el.studyChoiceActions?.classList.toggle("hidden", !showSubmit && !settled);
+
+  const correctLabels = escapeHtml(choice.answers.join("、"));
+  if (result) {
+    el.answerBox.innerHTML = `<span class="study-verdict ${result.correct ? "is-ok" : "is-ng"}">${result.correct ? "正解" : "不正解"}</span>　正答：${correctLabels}`;
+  } else if (revealed) {
+    el.answerBox.innerHTML = `正答：${correctLabels}`;
+  } else {
+    el.answerBox.innerHTML = "";
+  }
+}
+
+function handleStudyChoiceClick(event) {
+  const button = event.target.closest?.("[data-choice-label]");
+  const state = studyChoiceState;
+  if (!button || button.disabled || !state || state.result || state.revealed) return;
+  const label = button.dataset.choiceLabel;
+  if (!state.choice.multiple) {
+    answerStudyChoice([label]);
+    return;
+  }
+  const index = state.selected.indexOf(label);
+  if (index >= 0) state.selected.splice(index, 1);
+  else if (state.selected.length < state.choice.answers.length) state.selected.push(label);
+  updateStudyChoiceView();
+}
+
+function submitStudyChoices() {
+  const state = studyChoiceState;
+  if (!state || state.result || state.revealed) return;
+  if (state.selected.length !== state.choice.answers.length) return;
+  answerStudyChoice(state.selected);
+}
+
+// 選んだ選択肢を判定し、iPad版の判定と同じく「できる／まだ」に記録する。
+// Judge the selected options and record the result like the iPad judgement.
+function answerStudyChoice(selectedLabels) {
+  const state = studyChoiceState;
+  if (!state || state.result || state.revealed || !isInteractionReady()) return;
+  const correct = isCorrectChoiceSelection(state.choice, selectedLabels);
+  state.selected = [...selectedLabels];
+  state.result = { selected: [...selectedLabels], correct };
+  setQuestionState(state.questionId, correct ? 1 : 2);
+  recalcProgressFromQuestionStates();
+  updateStudyChoiceView();
+  showAnswerAndExplanation();
+  renderProgressTable();
+  buildFilteredQuestions();
+  updateStudyStatsOnly();
+  autoSaveToCloud();
+}
+
+// 解き直す: 表示だけを戻す。記録は次に解答したときに上書きする。
+// Answer again: only the display is reset; the next answer replaces the record.
+function retryStudyChoice() {
+  const state = studyChoiceState;
+  if (!state || (!state.result && !state.revealed)) return;
+  state.selected = [];
+  state.result = null;
+  state.revealed = false;
+  el.answerBox.style.display = "none";
+  el.explainBox.style.display = "none";
+  updateStudyChoiceView();
+  requestAnimationFrame(updateFloatingStudyActions);
 }
 
 function showAnswerAndExplanation() {
+  if (!studyCardQuestion) return;
+  const state = studyChoiceState;
+  if (state && !state.result && !state.revealed) {
+    // Showing the answer first does not record the question.
+    state.revealed = true;
+    updateStudyChoiceView();
+  }
   el.answerBox.style.display = "block";
   el.explainBox.style.display = "block";
   requestAnimationFrame(updateFloatingStudyActions);
@@ -978,15 +1214,7 @@ function renderStudyCurrentOnly() {
   const q = currentQuestion();
   if (!q) return;
   el.studyMeta.textContent = `${deviceMode === "iphone" ? "iPhone版" : "iPad版"} / 苦手復習`;
-  el.question.textContent = formatDisplayText(q.question);
-  renderQuestionImage(q);
-  el.answerBox.innerHTML = `<b>正解</b><br>${ensureCurrentQuestionAnswers(q).map(escapeDisplayText).join("\n")}`;
-  el.explainBox.innerHTML = `<b>解説</b><br>${escapeDisplayText(q.explanation || "解説なし")}`;
-  el.answerBox.style.display = "none";
-  el.explainBox.style.display = "none";
-  if (el.studyActions) el.studyActions.classList.remove("is-floating");
-  renderIpadAnswerInputs(q);
-  clearJudgeStatus();
+  renderStudyQuestionCard(q);
 }
 
 function getAnswerLabel(index, orderSensitive) {
@@ -1040,6 +1268,15 @@ function clearIpadAnswerInputs() {
   }
 }
 
+// Choice questions are answered with their options, not written.
+function hideIpadAnswerInputs() {
+  if (el.multiAnswerArea) el.multiAnswerArea.innerHTML = "";
+  if (el.userAnswer) {
+    el.userAnswer.value = "";
+    el.userAnswer.style.display = "none";
+  }
+}
+
 function getIpadAnswerInputs() {
   return el.multiAnswerArea
     ? [...el.multiAnswerArea.querySelectorAll(".multi-answer-input")]
@@ -1056,6 +1293,8 @@ function collectIpadAnswerValues() {
 
 
 function judgeIpadAnswer() {
+  // A choice question is answered by pressing its options.
+  if (studyChoiceState) return;
   const q = currentQuestion();
   if (!q) return;
 
@@ -1946,6 +2185,9 @@ if (nextBtn) nextBtn.addEventListener("click", nextQuestion);
 const nextBtnIpad = document.getElementById("nextBtnIpad");
 if (nextBtnIpad) nextBtnIpad.addEventListener("click", nextQuestion);
 document.getElementById("judgeBtn").addEventListener("click", judgeIpadAnswer);
+el.studyChoices?.addEventListener("click", handleStudyChoiceClick);
+el.choiceSubmitBtn?.addEventListener("click", submitStudyChoices);
+el.choiceRetryBtn?.addEventListener("click", retryStudyChoice);
 document.getElementById("knownBtn").addEventListener("click", markKnown);
 document.getElementById("unknownBtn").addEventListener("click", markUnknown);
 document.getElementById("reviewWrongBtn").addEventListener("click", reviewWrongOnly);

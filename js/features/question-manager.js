@@ -22,6 +22,7 @@ import {
   deleteQuestionImageFiles,
   restoreFailedQuestionDeletes
 } from "../core/question-image-delete.js";
+import { choiceQuestionFormatProblem } from "../core/question-choices.js";
 import { assertNonEmptyBlob } from "../core/file-validator.js";
 import { randomId } from "../core/id.js";
 
@@ -134,6 +135,9 @@ function validateBulkImportItems(rawItems) {
     if (raw.orderedAnswers !== undefined && typeof raw.orderedAnswers !== "boolean") {
       issues.push(`行${rowNo}: orderedAnswers は true または false で指定してください。`);
     }
+    // 選択問題のつもりで形が崩れているものは、記述式で出題されることを知らせる（改訂14）。
+    const choiceProblem = choiceQuestionFormatProblem({ question, answers, orderedAnswers: raw.orderedAnswers === true });
+    if (choiceProblem) warnings.push(`行${rowNo}: ${choiceProblem}`);
 
     const imageFileReference = String(raw.imageFile || "").trim();
     const resolvedImage = resolveImportImageFile(imageFileReference, imageFiles);

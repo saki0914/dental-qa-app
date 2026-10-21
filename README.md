@@ -52,7 +52,7 @@ Cloud Storage for Firebaseを利用するには、FirebaseプロジェクトのB
 - `js/features/`: 問題管理と画像暗記の画面・状態・操作
 - `js/services/`: Firestoreの読込・書込
 
-画像付き問題の一括登録形式とMac/iPhone/iPadでの運用は、[`docs/QUESTION_IMPORT.md`](docs/QUESTION_IMPORT.md)を参照してください。
+問題JSONの形式（選択問題の書き方を含む）、画像付き問題の一括登録とMac/iPhone/iPadでの運用は、[`docs/QUESTION_IMPORT.md`](docs/QUESTION_IMPORT.md)を参照してください。
 
 ノートから生成するPDFは端末へのダウンロードまたは対応端末の共有シートにだけ渡し、Firebase Storageには保存しません。PDF出力用のpdf-libはリポジトリ内へ固定していますが、PDF取込用のpdf.jsは別ライブラリで、現在は外部CDNから読み込みます。
 

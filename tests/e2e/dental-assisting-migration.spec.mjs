@@ -16,6 +16,7 @@ import {
 import {
   loadMigrationBundle
 } from "../../scripts/lib/dental-assisting-migration-core.mjs";
+import { parseChoiceQuestion } from "../../js/core/question-choices.js";
 
 const REPORT_DIRECTORY = process.env.MIGRATION_REPORT_DIR
   ? resolve(process.env.MIGRATION_REPORT_DIR)
@@ -31,13 +32,27 @@ async function saveJson(name, value) {
   );
 }
 
+// What the study card shows for a question: a choice question shows the text
+// before its options as the question and the options as buttons (revision 14).
+function expectedCard(question) {
+  const choice = parseChoiceQuestion(question);
+  return {
+    text: (choice ? choice.stem : question.question).trim(),
+    options: choice ? choice.choices.map(option => option.text) : []
+  };
+}
+
 async function goToQuestion(page, targetQuestion, limit = 350) {
+  const expected = expectedCard(targetQuestion);
   for (let index = 0; index < limit; index += 1) {
     const current = await page.locator("#question").textContent();
-    if (current?.trim() === targetQuestion.trim()) return index;
+    if (current?.trim() === expected.text) {
+      const options = await page.locator("#studyChoices .study-option-text").allTextContents();
+      if (JSON.stringify(options) === JSON.stringify(expected.options)) return index;
+    }
     await page.locator("#nextBtnIpad").click();
   }
-  throw new Error(`UI上で対象問題を見つけられません: ${targetQuestion}`);
+  throw new Error(`UI上で対象問題を見つけられません: ${targetQuestion.question}`);
 }
 
 function findMigrationQuestion(bundle, classification) {
@@ -53,7 +68,8 @@ function findMigrationQuestion(bundle, classification) {
 
 test("@authenticated @migration 345→350移行後のiPad表示と回答判定を確認する", async ({ page }) => {
   test.skip(!existsSync(DEFAULT_FORMALIZATION_REPORT), "移行元の正式化レポート（iCloud Drive上のデータ）がこの環境にないためスキップ");
-  test.setTimeout(180_000);
+  // Walks the 350 questions with the next button: 3.5 to 4 minutes in Linux Chromium.
+  test.setTimeout(300_000);
   const blockedRequests = await guardProductionFirebase(page);
   const pageErrors = [];
   page.on("pageerror", error => pageErrors.push(error.message));
@@ -147,7 +163,7 @@ test("@authenticated @migration 345→350移行後のiPad表示と回答判定�
     const imageQuestions = bundle.newQuestions.filter(question => question.imageFile);
     const displayedImageFiles = new Set();
     for (const question of imageQuestions) {
-      await goToQuestion(page, question.question);
+      await goToQuestion(page, question);
       const image = page.locator("#questionImage");
       await expect(image).toBeVisible();
       await expect.poll(() => image.evaluate(element => element.naturalWidth))
@@ -160,47 +176,49 @@ test("@authenticated @migration 345→350移行後のiPad表示と回答判定�
     expect(displayedImageFiles.size).toBe(17);
     uiChecks.push("画像問題21問・画像17件の実表示");
 
+    // 選択問題は選択肢のボタンで解答する（改訂14）。
     const unorderedChoice = bundle.newQuestions.find(question =>
       question.answers.length === 2 &&
       question.answers.every(answer => /^[a-d]$/.test(answer)) &&
-      question.orderedAnswers !== true
+      question.orderedAnswers !== true &&
+      parseChoiceQuestion(question)
     );
     expect(unorderedChoice).toBeTruthy();
-    await goToQuestion(page, unorderedChoice.question);
-    const choiceInputs = page.locator(".multi-answer-input");
-    await expect(choiceInputs).toHaveCount(2);
-    await choiceInputs.nth(0).fill(unorderedChoice.answers[1].toUpperCase());
-    await choiceInputs.nth(1).fill(` ${unorderedChoice.answers[0]} `);
-    await page.locator("#judgeBtn").click();
-    await expect(page.locator("#judgeStatus")).toHaveText("正解です。");
-    uiChecks.push("4肢択2逆順・NFKC/大小文字正規化");
-    await choiceInputs.nth(0).fill(unorderedChoice.answers[0]);
-    await choiceInputs.nth(1).fill(unorderedChoice.answers[0]);
-    await page.locator("#judgeBtn").click();
-    await expect(page.locator("#judgeStatus")).not.toHaveText("正解です。");
-    uiChecks.push("4肢択2重複入力拒否");
+    await goToQuestion(page, unorderedChoice);
+    await expect(page.locator("#studyChoices .study-option"))
+      .toHaveCount(parseChoiceQuestion(unorderedChoice).choices.length);
+    await expect(page.locator(".multi-answer-input")).toHaveCount(0);
+    const choiceSubmit = page.locator("#choiceSubmitBtn");
+    await page.locator(`[data-choice-label="${unorderedChoice.answers[0]}"]`).click();
+    await page.locator(`[data-choice-label="${unorderedChoice.answers[0]}"]`).click();
+    await expect(choiceSubmit).toBeDisabled();
+    uiChecks.push("4肢択2同じ選択肢を2つに数えない");
+    await page.locator(`[data-choice-label="${unorderedChoice.answers[1]}"]`).click();
+    await page.locator(`[data-choice-label="${unorderedChoice.answers[0]}"]`).click();
+    await choiceSubmit.click();
+    await expect(page.locator("#answerBox")).toHaveText(`正解　正答：${unorderedChoice.answers.join("、")}`);
+    uiChecks.push("4肢択2逆順の選択");
 
     const singleChoice = bundle.newQuestions.find(question =>
       question.answers.length === 1 &&
       /^[a-d]$/.test(question.answers[0]) &&
-      question.subcategories?.[3] === "国家試験形式"
+      question.subcategories?.[3] === "国家試験形式" &&
+      parseChoiceQuestion(question)
     );
     expect(singleChoice).toBeTruthy();
-    await goToQuestion(page, singleChoice.question);
-    const singleChoiceInput = page.locator(".multi-answer-input");
-    await expect(singleChoiceInput).toHaveCount(1);
-    await singleChoiceInput.fill(singleChoice.answers[0].toUpperCase());
-    await page.locator("#judgeBtn").click();
-    await expect(page.locator("#judgeStatus")).toHaveText("正解です。");
+    await goToQuestion(page, singleChoice);
+    await page.locator(`[data-choice-label="${singleChoice.answers[0]}"]`).click();
+    await expect(page.locator("#answerBox")).toHaveText(`正解　正答：${singleChoice.answers[0]}`);
     uiChecks.push("4肢択1");
 
     const orderedQuestion = bundle.newQuestions.find(question =>
       question.answers.length === 2 &&
       question.orderedAnswers === true &&
-      question.answers[0] !== question.answers[1]
+      question.answers[0] !== question.answers[1] &&
+      !parseChoiceQuestion(question)
     );
     expect(orderedQuestion).toBeTruthy();
-    await goToQuestion(page, orderedQuestion.question);
+    await goToQuestion(page, orderedQuestion);
     const orderedInputs = page.locator(".multi-answer-input");
     await expect(orderedInputs).toHaveCount(2);
     await orderedInputs.nth(0).fill(orderedQuestion.answers[1]);
@@ -214,9 +232,9 @@ test("@authenticated @migration 345→350移行後のiPad表示と回答判定�
     uiChecks.push("orderedAnswers=true順序維持");
 
     const singleQuestion = bundle.newQuestions.find(question =>
-      question.answers.length === 1 && !question.imageFile
+      question.answers.length === 1 && !question.imageFile && !parseChoiceQuestion(question)
     );
-    await goToQuestion(page, singleQuestion.question);
+    await goToQuestion(page, singleQuestion);
     const singleInputs = page.locator(".multi-answer-input");
     await expect(singleInputs).toHaveCount(1);
     await singleInputs.fill(singleQuestion.answers[0]);
@@ -231,8 +249,8 @@ test("@authenticated @migration 345→350移行後のiPad表示と回答判定�
       question.subcategories?.[3] !== "国家試験形式"
     );
     expect(scenarioQuestion).toBeTruthy();
-    await goToQuestion(page, scenarioQuestion.question);
-    await expect(page.locator("#question")).toHaveText(scenarioQuestion.question);
+    await goToQuestion(page, scenarioQuestion);
+    await expect(page.locator("#question")).toHaveText(expectedCard(scenarioQuestion).text);
     await page.locator("#showAnswerBtnIpad").click();
     await expect(page.locator("#explainBox")).toContainText(scenarioQuestion.explanation);
     uiChecks.push("状況設定問題");
@@ -247,7 +265,7 @@ test("@authenticated @migration 345→350移行後のiPad表示と回答判定�
     expect(reusedQuestions).toHaveLength(2);
     const imageSources = [];
     for (const question of reusedQuestions) {
-      await goToQuestion(page, question.question);
+      await goToQuestion(page, question);
       const image = page.locator("#questionImage");
       await expect(image).toBeVisible();
       await expect.poll(() => image.evaluate(element => element.naturalWidth))
@@ -259,14 +277,19 @@ test("@authenticated @migration 345→350移行後のiPad表示と回答判定�
     uiChecks.push("画像表示・同一画像の別観点再利用");
 
     const merged = findMigrationQuestion(bundle, "MERGED");
-    await goToQuestion(page, merged.question.question);
-    await expect(page.locator("#question")).toHaveText(merged.question.question);
+    await goToQuestion(page, merged.question);
+    await expect(page.locator("#question")).toHaveText(expectedCard(merged.question).text);
     uiChecks.push(`統合後問題 ${merged.record.newQuestionId}`);
 
     const answersChanged = findMigrationQuestion(bundle, "SAME_ID_ANSWERS_CHANGED");
-    await goToQuestion(page, answersChanged.question.question);
-    await expect(page.locator(".multi-answer-input"))
-      .toHaveCount(answersChanged.question.answers.length);
+    await goToQuestion(page, answersChanged.question);
+    const answersChangedChoice = parseChoiceQuestion(answersChanged.question);
+    if (answersChangedChoice) {
+      await expect(page.locator("#studyChoices .study-option")).toHaveCount(answersChangedChoice.choices.length);
+    } else {
+      await expect(page.locator(".multi-answer-input"))
+        .toHaveCount(answersChanged.question.answers.length);
+    }
     uiChecks.push(`answers修正問題 ${answersChanged.record.newQuestionId}`);
 
     const currentBeforeNext = await page.locator("#question").textContent();

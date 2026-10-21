@@ -6,7 +6,22 @@
   <script>
     (() => {
       const params = new URLSearchParams(location.search);
-      if (params.get("noteEditor") !== "1") return;
+      if (params.get("noteEditor") !== "1") {
+        // Fonts of the study card (revision 14), loaded without delaying the first paint.
+        // Until they arrive, or when they cannot be loaded, the card uses the system fonts.
+        const preconnect = document.createElement("link");
+        preconnect.rel = "preconnect";
+        preconnect.href = "https://fonts.gstatic.com";
+        preconnect.crossOrigin = "";
+        const fonts = document.createElement("link");
+        fonts.id = "studyCardFonts";
+        fonts.rel = "stylesheet";
+        fonts.href = "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=Zen+Kaku+Gothic+New:wght@400;700&display=swap";
+        fonts.media = "print";
+        fonts.onload = () => { fonts.media = "all"; };
+        document.head.append(preconnect, fonts);
+        return;
+      }
       document.documentElement.classList.add("note-editor-dedicated");
       // Safari gesture events do not cover input-focus auto zoom or every browser zoom entry point.
       // Limit page zoom only on the dedicated editor route; the canvas keeps its own 0.8–5x zoom.
@@ -18,11 +33,11 @@
   </script>
   <title>Dental QA Ultimate</title>
   <!-- asset-versions:start (npm run stamp) -->
-  <meta name="app-build" content="ea24dfe091">
+  <meta name="app-build" content="0a75e9a800">
   <script type="importmap">
   {
     "imports": {
-      "./js/app.js": "./js/app.js?v=1a2dcb29f5",
+      "./js/app.js": "./js/app.js?v=fb0cfe1b35",
       "./js/config/firebase.js": "./js/config/firebase.js?v=a5ae88cb06",
       "./js/core/answer-comparison.js": "./js/core/answer-comparison.js?v=fdb54e842d",
       "./js/core/bounded-concurrency.js": "./js/core/bounded-concurrency.js?v=2a5884e716",
@@ -70,6 +85,7 @@
       "./js/core/pdf-creation-progress.js": "./js/core/pdf-creation-progress.js?v=4c659c0e3a",
       "./js/core/pdf-lib-loader.js": "./js/core/pdf-lib-loader.js?v=6872a028ea",
       "./js/core/pdf-scanned-page.js": "./js/core/pdf-scanned-page.js?v=88305500d3",
+      "./js/core/question-choices.js": "./js/core/question-choices.js?v=872a93e11a",
       "./js/core/question-image-delete.js": "./js/core/question-image-delete.js?v=6e40cc95a0",
       "./js/core/question-import.js": "./js/core/question-import.js?v=743773d067",
       "./js/core/save-coordinator.js": "./js/core/save-coordinator.js?v=53527be3d4",
@@ -78,7 +94,7 @@
       "./js/core/study-filters.js": "./js/core/study-filters.js?v=e2b83af035",
       "./js/core/text-utils.js": "./js/core/text-utils.js?v=262e6e686d",
       "./js/features/image-memory.js": "./js/features/image-memory.js?v=eb1f7db7f6",
-      "./js/features/question-manager.js": "./js/features/question-manager.js?v=acbfa3b67c",
+      "./js/features/question-manager.js": "./js/features/question-manager.js?v=c65a31b6f2",
       "./js/features/study-notes.js": "./js/features/study-notes.js?v=9e3e61803c",
       "./js/services/cloud-store.js": "./js/services/cloud-store.js?v=bcde239f2a",
       "./js/services/note-store.js": "./js/services/note-store.js?v=b780c72475"
@@ -86,7 +102,7 @@
   }
   </script>
   <!-- asset-versions:end -->
-  <link rel="stylesheet" href="./css/app.css?v=565c4fe9ae">
+  <link rel="stylesheet" href="./css/app.css?v=34b77aaa29">
   <link rel="stylesheet" href="./css/study-notes.css?v=7d2b01deb4">
 </head>
 <body>
@@ -180,28 +196,37 @@
         <div class="stat"><span class="k">苦手</span><span class="v" id="wrongCount">0</span></div>
       </div>
 
-      <div class="card">
-        <div class="meta" id="studyMeta"></div>
+      <div class="meta study-session-meta" id="studyMeta"></div>
+      <div class="card study-card" id="studyCard">
+        <div class="study-qhead hidden" id="studyQuestionHead">
+          <span class="study-qno" id="studyQuestionNo"></span>
+          <span class="study-qtags" id="studyQuestionTags"></span>
+        </div>
         <div class="question-image-wrap" id="questionImageWrap"><img class="question-image" id="questionImage" alt="問題画像"></div>
         <div class="question" id="question">問題を読み込んで学習開始してください</div>
+        <div class="study-choices hidden" id="studyChoices" role="group" aria-label="選択肢"></div>
+        <div class="study-choice-actions hidden" id="studyChoiceActions">
+          <button class="study-drill-btn" id="choiceSubmitBtn" type="button" disabled>解答する</button>
+          <button class="study-drill-btn ghost" id="choiceRetryBtn" type="button">解き直す</button>
+        </div>
 
         <div id="ipadArea" class="hidden">
           <textarea id="userAnswer" placeholder="ここに解答を書いてください。"></textarea>
           <div id="multiAnswerArea" class="multi-answer-area"></div>
-          <div class="grid3" style="margin-top:10px;">
-            <button class="btn primary" id="judgeBtn" type="button">判定する</button>
-            <button class="btn" id="showAnswerBtnIpad" type="button">答えを見る</button>
-            <button class="btn" id="prevBtnIpad" type="button">戻る</button>
-            <button class="btn" id="nextBtnIpad" type="button">次へ</button>
-          </div>
+          <button class="study-drill-btn study-judge-btn" id="judgeBtn" type="button">判定する</button>
           <div class="status" id="judgeStatus"></div>
+          <div class="study-nav" role="group" aria-label="問題の操作">
+            <button class="study-nav-btn" id="prevBtnIpad" type="button" aria-label="戻る" title="戻る"><svg class="study-nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M15 18l-6-6 6-6"/></svg></button>
+            <button class="study-nav-btn is-reveal" id="showAnswerBtnIpad" type="button" aria-label="答えを見る" title="答えを見る"><svg class="study-nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button>
+            <button class="study-nav-btn" id="nextBtnIpad" type="button" aria-label="次へ" title="次へ"><svg class="study-nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 18l6-6-6-6"/></svg></button>
+          </div>
         </div>
 
         <div id="iphoneArea">
-          <div class="grid2">
-            <button class="btn primary" id="showAnswerBtn" type="button">答えを見る</button>
-            <button class="btn" id="prevBtn" type="button">戻る</button>
-            <button class="btn" id="nextBtn" type="button">次へ</button>
+          <div class="study-nav" role="group" aria-label="問題の操作">
+            <button class="study-nav-btn" id="prevBtn" type="button" aria-label="戻る" title="戻る"><svg class="study-nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M15 18l-6-6 6-6"/></svg></button>
+            <button class="study-nav-btn is-reveal" id="showAnswerBtn" type="button" aria-label="答えを見る" title="答えを見る"><svg class="study-nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button>
+            <button class="study-nav-btn" id="nextBtn" type="button" aria-label="次へ" title="次へ"><svg class="study-nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 18l6-6-6-6"/></svg></button>
           </div>
         </div>
 
@@ -218,6 +243,9 @@
       </div>
 
       <div class="helper" style="margin-top:12px;">
+        選択問題（問題文の最後に「a. 〜」の選択肢がある問題）<br>
+        - iPhone版・iPad版とも、選択肢を押すと正解・不正解と解説が表示され、「できる／まだ」に記録されます。<br>
+        - 2つ選ぶ問題は、2つ選んでから「解答する」を押します。目のボタン（答えを見る）を先に押した場合は記録しません。<br>
         iPad版の判定ルール<br>
         - 答えの数に応じて、解答欄が自動で分かれます。<br>
         - 通常の複数回答は順不同で判定します。<br>
@@ -232,7 +260,8 @@
       <h2>問題管理</h2>
       <div class="sub">
         検索・追加・更新・削除ができます。<br>
-        形式は「教科 / サブカテゴリ / 問題 / 答え / 解説」です。答えが複数あるときは改行、または「，」（全角カンマ）で区切ってください。サブカテゴリは従来通り読点などで区切れます。
+        形式は「教科 / サブカテゴリ / 問題 / 答え / 解説」です。答えが複数あるときは改行、または「，」（全角カンマ）で区切ってください。サブカテゴリは従来通り読点などで区切れます。<br>
+        選択問題は、問題文の最後に改行して「a. 選択肢」「b. 選択肢」…と1行ずつ書き、答えに選択肢の記号（例: c。2つなら a と d を改行で区切る）を入れると、学習画面で選択肢を押して解答できます。
       </div>
 
       <div class="grid2">
@@ -771,6 +800,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/app.js?v=1a2dcb29f5"></script>
+<script type="module" src="./js/app.js?v=fb0cfe1b35"></script>
 </body>
 </html>
