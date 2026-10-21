@@ -32,7 +32,9 @@ export const NOTE_TOOL_DEFAULTS = Object.freeze({
   quickSwitchAction: "eraser",
   // A two-finger tap runs the quick switch (the Apple Pencil double tap is
   // not reported to web pages).
-  twoFingerTapQuickSwitch: true
+  twoFingerTapQuickSwitch: true,
+  // A new mask gets a red underline (revision 15).
+  maskUnderline: true
 });
 
 const DOCKS = new Set(["top", "right", "bottom", "left"]);
@@ -80,7 +82,8 @@ export function normalizeNoteToolSettings(value = {}) {
     straightenEnabled: value.straightenEnabled !== false,
     pageNavigation: PAGE_NAVIGATION.has(value.pageNavigation) ? value.pageNavigation : NOTE_TOOL_DEFAULTS.pageNavigation,
     quickSwitchAction: QUICK_ACTIONS.has(value.quickSwitchAction) ? value.quickSwitchAction : NOTE_TOOL_DEFAULTS.quickSwitchAction,
-    twoFingerTapQuickSwitch: value.twoFingerTapQuickSwitch !== false
+    twoFingerTapQuickSwitch: value.twoFingerTapQuickSwitch !== false,
+    maskUnderline: value.maskUnderline !== false
   };
 }
 

@@ -30,6 +30,7 @@ test("各編集ツールを固有の設定パネルへ割り当てる", () => {
   assert.equal(settingsTransientType("eraser-object"), "eraser-settings");
   assert.equal(settingsTransientType("shape"), "shape-settings");
   assert.equal(settingsTransientType("text"), "text-settings");
+  assert.equal(settingsTransientType("mask"), "mask-settings", "赤い下線の設定（改訂15）");
   assert.equal(settingsTransientType("image"), null);
   assert.equal(transientUiIsSettings(openTransientUi("text-settings")), true);
 });

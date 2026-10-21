@@ -648,6 +648,73 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     return path;
   }
 
+  // Summary notes (revision 15). Every picture of a summary page gets a new
+  // path, so that a tab still showing the previous one keeps it until the
+  // page document names the new one. The path stays journaled until
+  // commitSummaryPages names it (or a failed upload removes it again).
+  async function uploadSummaryBackground(noteId, pageId, blob, expectedUid) {
+    requireExpectedUid(expectedUid);
+    validateImageBlob(blob, { label: "まとめページ画像", allowedTypes: ["image/jpeg"] });
+    const { uid, storage } = context(expectedUid);
+    const path = `users/${uid}/notes/${noteId}/sourcePages/${pageId}/summary-${randomId()}.jpg`;
+    context(expectedUid);
+    await journalStoragePath(noteId, path, expectedUid);
+    try {
+      context(expectedUid);
+      await uploadBytes(storageRef(storage, path), blob, { contentType: "image/jpeg" });
+    } catch (error) {
+      await clearJournalAfterFailedUpload(noteId, path, expectedUid, error);
+      throw error;
+    }
+    return path;
+  }
+
+  // Summary page documents and the journal entries of the pictures they now
+  // name, in one batch: no page names a picture that the cleanup of stale
+  // journal entries could still delete.
+  async function commitSummaryPages(noteId, updates, { journaledPaths = [], noteFields = null } = {}, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    const list = (Array.isArray(updates) ? updates : []).filter(update => update?.pageId);
+    if (list.length >= CREATION_BATCH_SIZE) throw new Error("一度に更新できるまとめページの数を超えています。");
+    const paths = [...new Set((journaledPaths || []).filter(path => typeof path === "string" && path))];
+    const batch = writeBatch(db);
+    list.forEach(({ pageId, fields }) => {
+      batch.update(pageRef(db, uid, noteId, pageId), { ...fields, updatedAt: serverTimestamp() });
+    });
+    batch.update(noteRef(db, uid, noteId), {
+      ...(noteFields || {}),
+      ...(paths.length ? { pendingStoragePaths: arrayRemove(...paths) } : {}),
+      updatedAt: serverTimestamp()
+    });
+    context(expectedUid);
+    await batch.commit();
+  }
+
+  // The summary notes (not deleted, not failed) that show pages of `noteId`.
+  async function listSummaryNotesUsing(noteId, { expectedUid } = {}) {
+    const { uid, db } = readContext(expectedUid);
+    const snapshots = await getDocs(query(
+      collection(db, "users", uid, "notes"),
+      where("summarySourceNoteIds", "array-contains", String(noteId))
+    ));
+    context(expectedUid);
+    return snapshots.docs
+      .map(snapshot => ({ id: snapshot.id, ...snapshot.data() }))
+      .filter(note => !note.deletedAt && note.status !== "failed");
+  }
+
+  // The "テストに出る" mark of a page (revision 15) is kept on the note, so
+  // that the summary creation finds the marked pages without reading every
+  // page of every note.
+  async function setPageTestMark(noteId, pageId, marked, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    context(expectedUid);
+    await updateDoc(noteRef(db, uid, noteId), {
+      testMarkedPageIds: marked ? arrayUnion(String(pageId)) : arrayRemove(String(pageId)),
+      updatedAt: serverTimestamp()
+    });
+  }
+
   async function deleteStoragePaths(paths, expectedUid) {
     const { storage } = writeContext(expectedUid);
     const failed = [];
@@ -1148,6 +1215,7 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     finalizeNoteCreation, abortCreatingNote, cleanupStuckCreatingNotes, markCreationFailed,
     journalSourcePages, uploadSourcePage, uploadRecoveredBackground, deleteStoragePaths, loadPageContent, savePageContent, enqueuePageContentSave, uploadAsset, getAsset,
     getStorageBlob, cleanupStoragePath, updatePageOrder, createPage, deletePage, updatePage, updatePages, updateNote,
-    deleteMaterialLinkedNotes, restoreNote, deleteNote
+    deleteMaterialLinkedNotes, restoreNote, deleteNote,
+    uploadSummaryBackground, commitSummaryPages, listSummaryNotesUsing, setPageTestMark
   };
 }

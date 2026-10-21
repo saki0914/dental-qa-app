@@ -786,3 +786,61 @@ body.note-editor-dedicated .local-environment-details{
 /* Revision 13: the build this tab runs (input settings). */
 .note-app-build{margin:8px 0 0;font-size:12px;color:#64748b}
 .note-app-build span{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+/* Revision 15: the mask tool's two modes, red underlines under masks, the
+   "テストに出る" mark of a page and summary notes. */
+.note-toolbar button.note-mask-mode-button{gap:0}
+.note-toolbar button .note-tool-label{font-size:.62rem;font-weight:700;line-height:1.1;letter-spacing:.02em}
+.note-toolbar button.note-mask-mode-button svg{width:21px;height:21px}
+.note-page-stage[data-tool="mask"][data-mask-mode="add"]{cursor:crosshair}
+.note-mask-underline{
+  position:absolute;
+  background:#dc2626;
+  min-height:calc(var(--mask-px) * 1.5);
+  pointer-events:none;
+}
+.note-page-stage.study-mode .note-mask-underline:not(.revealed){visibility:hidden}
+.note-mask.inherited{border-color:rgba(124,58,237,.7)}
+.note-mask.weak.inherited{border-color:#dc2626}
+.note-page-list li{position:relative}
+.note-page-test-badge{
+  display:none;
+  position:absolute;
+  z-index:1;
+  top:8px;
+  left:8px;
+  padding:2px 6px;
+  border-radius:6px;
+  background:#b91c1c;
+  color:#fff;
+  font-size:.66rem;
+  font-weight:700;
+  pointer-events:none;
+}
+.note-page-list li.test-marked .note-page-test-badge{display:block}
+.note-page-list button.note-page-test-mark{font-size:1rem;line-height:1;color:#64748b}
+.note-page-list button.note-page-test-mark[aria-pressed="true"]{color:#b45309;background:#fef3c7;border-color:#f59e0b}
+.note-setting-hint{margin:4px 0 8px;font-size:.75rem;line-height:1.5;color:#64748b}
+.note-setting-button-row.note-mask-underline-all{display:grid;gap:6px}
+.note-setting-button-row.note-mask-underline-all button{min-height:40px;padding:6px 10px;border:1px solid #cbd5e1;border-radius:10px;background:#fff;text-align:left}
+.note-summary-picker{display:grid;gap:14px;margin-top:14px}
+.note-summary-picker h4{margin:0 0 6px;font-size:.95rem}
+.note-summary-picker fieldset{margin:0;padding:8px 12px 10px;border:1px solid #cbd5e1;border-radius:12px;background:#fff}
+.note-summary-picker legend{padding:0 4px;font-weight:700}
+.note-summary-source{display:flex;flex-wrap:wrap;gap:6px 14px}
+.note-summary-source label,.note-summary-options label{display:inline-flex;align-items:center;gap:6px;min-height:40px;white-space:nowrap}
+.note-summary-picker input[type="checkbox"],.note-summary-picker input[type="radio"]{flex:0 0 auto;width:20px;height:20px;min-height:0;margin:0;padding:0;accent-color:#2563eb}
+.note-summary-sources{display:grid;gap:8px}
+.note-summary-order ol{margin:0;padding:0 0 0 1.6em;display:grid;gap:4px}
+.note-summary-order li span{display:inline-block;min-width:min(260px,50vw);margin-right:6px}
+.note-summary-order li button{min-width:40px;min-height:36px;margin-right:4px;border:1px solid #cbd5e1;border-radius:8px;background:#fff}
+.note-summary-options{display:flex;flex-wrap:wrap;gap:10px}
+.note-summary-options fieldset{flex:1 1 240px;display:flex;flex-wrap:wrap;gap:4px 18px}
+.note-summary-result{margin:0;color:#334155}
+.note-summary-error{margin:0;color:#b91c1c}
+.note-summary-dialog-hint{margin:0;font-size:.85rem;color:#475569}
+.note-summary-slot-list{margin:0;padding:0 0 0 1.4em;display:grid;gap:8px}
+.note-summary-slot{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.note-summary-slot-label{flex:1 1 180px;font-weight:700}
+.note-summary-slot-empty{color:#64748b}
+.note-summary-dialog-status{min-height:1.4em;margin:0;color:#1e3a8a}
+.note-summary-dialog.is-busy{cursor:progress}

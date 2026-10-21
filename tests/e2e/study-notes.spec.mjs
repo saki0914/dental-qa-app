@@ -697,6 +697,11 @@ test("@authenticated 白紙ノートへ描画・画像・マスクを保存し2�
   await stage.dispatchEvent("pointermove", { pointerId: 2, pointerType: "mouse", button: 0, clientX: box.x + box.width * .58, clientY: box.y + box.height * .25 });
   await stage.dispatchEvent("pointerup", { pointerId: 2, pointerType: "mouse", button: 0, clientX: box.x + box.width * .58, clientY: box.y + box.height * .25 });
   await expect(stage.locator(".note-mask")).toHaveCount(1);
+  // ＋追加 does not select the new mask (revision 15); 選択・編集 does.
+  await expect(stage.locator("[data-transform-handle]")).toHaveCount(0);
+  await expect(page.locator("#noteMaskAddModeBtn")).toHaveAttribute("aria-pressed", "true");
+  await page.locator("#noteMaskEditModeBtn").click();
+  await stage.locator(".note-mask").click();
   await expect(stage.locator('[data-transform-handle="resize-se"]')).toBeVisible();
   await expect(stage.locator('[data-transform-handle="rotate"]')).toHaveCount(0);
   await expect(page.locator('#noteSelectionActions [data-selection-action="rotate-left"]')).toBeDisabled();
@@ -1650,6 +1655,8 @@ test("@authenticated @ipad-v-next 選択枠の右上の取手で移動でき、�
   await drag(at(.4, .34), at(.55, .38));
   const masks = stage.locator(".note-mask");
   await expect(masks).toHaveCount(2);
+  await page.locator("#noteMaskEditModeBtn").click();
+  await masks.nth(1).click();
   await page.locator('#noteSelectionActions [data-selection-action="select-page-masks"]').click();
   await expect(stage.locator(".note-mask.note-selected")).toHaveCount(2);
   await expect(moveHandle, "選んだマスクにも取手は1つ").toHaveCount(1);
@@ -4163,6 +4170,8 @@ test("@authenticated @ipad-v-next ノートのマスクは暗記学習と同じ�
   await expect(mask, "編集中は暗記学習でめくったマスクと同じ細い破線").toHaveCSS("border-top-style", "dashed");
   await expect(mask).toHaveCSS("border-top-width", "1px");
   await expect(mask).toHaveCSS("border-top-color", "rgba(37, 99, 235, 0.55)");
+  await page.locator("#noteMaskEditModeBtn").click();
+  await mask.click();
   await expect(mask, "選択中は暗記学習と同じオレンジの枠").toHaveCSS("outline-color", "rgb(245, 158, 11)");
   await page.locator('[data-note-tool="pen"]').click();
 
@@ -5593,6 +5602,9 @@ test("@authenticated @ipad-input-core 横長PDFで背景・描画・入力・カ
   await stage.dispatchEvent("pointerup", { pointerId: 2303, pointerType: "mouse", button: 0, ...point(.55, .55) });
   const mask = stage.locator(".note-mask");
   const transformOverlay = stage.locator(".note-transform-overlay");
+  await expect(mask).toHaveCount(1);
+  await page.locator("#noteMaskEditModeBtn").click();
+  await mask.click();
   await expect(transformOverlay).toBeVisible();
   const maskBox = await mask.boundingBox();
   const transformBox = await transformOverlay.boundingBox();
@@ -6057,6 +6069,8 @@ test("@authenticated @ipad-writing-mask 交差する複数画・日本語IME・�
   await expect(capture).not.toHaveClass(/active/);
   await draw(at(.18, .42), at(.58, .52), { expectStroke: false });
   await expect(stage.locator(".note-mask")).toHaveCount(1);
+  await page.locator("#noteMaskEditModeBtn").click();
+  await stage.locator(".note-mask").click();
   await expect(page.locator("#noteSelectionActionsTitle")).toHaveText("1個選択中");
   await expect(page.locator('#noteSelectionActions [data-selection-action="crop"]')).toBeHidden();
   await page.locator('#noteSelectionActions [data-selection-action="weak-on"]').click();

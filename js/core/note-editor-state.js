@@ -8,6 +8,7 @@ export const NOTE_EDITOR_STARTUP_STATES = Object.freeze([
   "loading-content",
   "reconciling-local-draft",
   "loading-assets",
+  "syncing-summary",
   "ready",
   "recoverable-error",
   "fatal-error"

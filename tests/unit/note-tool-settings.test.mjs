@@ -91,3 +91,12 @@ test("2本指タップのクイック切替は既定で有効、明示的にオ�
   assert.equal(store.load().twoFingerTapQuickSwitch, false);
   assert.equal(store.load().quickSwitchAction, "previous");
 });
+
+test("新しいマスクの赤い下線は既定で付け、外した設定を保持する（改訂15）", () => {
+  const storage = memoryStorage();
+  const store = createNoteToolSettingsStore({ uid: "alice", storage });
+  assert.equal(store.load().maskUnderline, true);
+  store.save({ ...store.load(), maskUnderline: false });
+  assert.equal(store.load().maskUnderline, false);
+  assert.equal(normalizeNoteToolSettings({ maskUnderline: "no" }).maskUnderline, true);
+});

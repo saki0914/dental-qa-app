@@ -15,6 +15,7 @@ import {
   textLineColorSegments
 } from "./note-text-layout.js";
 import { maskVisibilityKey } from "./note-mask-adapter.js";
+import { MASK_UNDERLINE_COLOR, hasMaskUnderline, maskUnderlineRect } from "./note-mask-underline.js";
 
 function loadImage(blob) {
   assertNonEmptyBlob(blob, "描画画像");
@@ -242,7 +243,9 @@ export async function scaleImageBlobToCanvas(blob, width, height) {
 
 // `resolveBackgroundImage(page, width, height)`, when given, returns an image
 // (a canvas, for example) already scaled for this canvas; the background
-// blob is decoded only when it returns nothing.
+// blob is decoded only when it returns nothing. `drawUnderlines`: the red
+// lines of the underlined masks left open (revision 15); a summary page
+// draws its sources without them (it draws them from its own masks).
 export async function renderNotePageToCanvas({
   page,
   content,
@@ -255,6 +258,7 @@ export async function renderNotePageToCanvas({
   maskMode = "none",
   revealedMaskIds = new Set(),
   pageNumber = null,
+  drawUnderlines = true,
   signal
 }) {
   if (signal?.aborted) throw new DOMException("PDF生成をキャンセルしました。", "AbortError");
@@ -317,6 +321,15 @@ export async function renderNotePageToCanvas({
     ...materialMasks.map(mask => ({ mask, source: "material" })),
     ...(content.noteMasks || []).map(mask => ({ mask, source: "note" }))
   ];
+  if (drawUnderlines) {
+    // Only the lines of masks left open: a mask drawn closed hides its line,
+    // as in study mode.
+    masks.filter(({ mask, source }) => hasMaskUnderline(mask) && !shouldDrawMask(mask, source, { maskMode, revealedMaskIds })).forEach(({ mask }) => {
+      const line = maskUnderlineRect(mask, canvas.width, canvas.height);
+      context.fillStyle = MASK_UNDERLINE_COLOR;
+      context.fillRect(line.x, line.y, line.width, line.height);
+    });
+  }
   // The colors of the image memory screen's masks (.pdf-mask in app.css).
   masks.filter(({ mask, source }) => shouldDrawMask(mask, source, { maskMode, revealedMaskIds })).forEach(({ mask }) => {
     context.fillStyle = mask.weak ? "#b91c1c" : "#111827";

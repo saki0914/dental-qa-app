@@ -5,6 +5,7 @@ export const NOTE_TRANSIENT_UI_TYPES = Object.freeze([
   "eraser-settings",
   "shape-settings",
   "text-settings",
+  "mask-settings",
   "input-settings",
   "color-palette",
   "image-source-menu",
@@ -23,7 +24,8 @@ const SETTINGS_BY_TOOL = Object.freeze({
   "eraser-object": "eraser-settings",
   "eraser-pixel": "eraser-settings",
   shape: "shape-settings",
-  text: "text-settings"
+  text: "text-settings",
+  mask: "mask-settings"
 });
 
 const EXPLICIT_STROKE_DISCARD_REASONS = new Set([
