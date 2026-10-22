@@ -275,8 +275,11 @@ export function mergeSummarySlotMasks(content = {}, slot, entries = []) {
       noteMasks.push(mask);
       return;
     }
+    // Placed again from the source: what the summary had kept as its own
+    // (revision 16) no longer applies.
+    const { summaryLocal: _kept, ...placed } = mask;
     noteMasks.push({
-      ...mask,
+      ...placed,
       ...placeSourceBounds(source, slot.rect),
       weak: source.weak === true,
       underline: source.underline === true,
@@ -311,6 +314,281 @@ export function removeSummarySlotFromContent(content = {}, slotId) {
     noteMasks: (Array.isArray(content.noteMasks) ? content.noteMasks : []).filter(mask => mask?.origin?.slotId !== slotId),
     summaryRemovedMasks: (Array.isArray(content.summaryRemovedMasks) ? content.summaryRemovedMasks : []).filter(item => item?.slotId !== slotId)
   };
+}
+
+// ---- Reflecting a summary's changes in its sources (revision 16) ----
+//
+// The summary's changes to the masks of its source pages are not written
+// to the sources until the user reflects them ("元ノートに反映"). A change
+// is: an inherited mask moved, resized, underlined or made weak; an
+// inherited mask deleted; a mask made in the summary on a source page. Masks
+// of image materials are not reflected (they are edited in 教材管理). A
+// change the user keeps in the summary ("まとめだけの変更") is not asked
+// about again until it changes again.
+
+// Shares of the summary page within which a mask is where its source put it
+// (the drag of a mask moves it much further).
+const SAME_PLACE = 1e-5;
+
+function sameBounds(left, right, tolerance = SAME_PLACE) {
+  return ["x", "y", "width", "height"].every(field => Math.abs(Number(left?.[field] || 0) - Number(right?.[field] || 0)) <= tolerance);
+}
+
+function summaryMaskState(mask) {
+  return [round(mask?.x), round(mask?.y), round(mask?.width), round(mask?.height), mask?.weak === true, mask?.underline === true];
+}
+
+function summaryMaskStateFingerprint(mask) {
+  return summaryFingerprint(summaryMaskState(mask));
+}
+
+function keptAsSummaryOwn(mask) {
+  return typeof mask?.summaryLocal === "string" && mask.summaryLocal === summaryMaskStateFingerprint(mask);
+}
+
+// The id of the source mask a key names: a note mask with an id only.
+export function summarySourceMaskId(key) {
+  const text = String(key || "");
+  return text.startsWith("note:") && !text.startsWith("note:geo:") ? text.slice(5) : "";
+}
+
+// A summary mask in shares of the source page placed at `rect`: the part of
+// it on that page, or null when less than half of it is on the page.
+export function summarySourceBounds(mask, rect) {
+  const left = Math.max(Number(mask?.x || 0), Number(rect.x));
+  const top = Math.max(Number(mask?.y || 0), Number(rect.y));
+  const right = Math.min(Number(mask?.x || 0) + Number(mask?.width || 0), Number(rect.x) + Number(rect.width));
+  const bottom = Math.min(Number(mask?.y || 0) + Number(mask?.height || 0), Number(rect.y) + Number(rect.height));
+  const area = Number(mask?.width || 0) * Number(mask?.height || 0);
+  if (!(right > left) || !(bottom > top) || !(area > 0)) return null;
+  if ((right - left) * (bottom - top) < area * 0.5) return null;
+  const width = clamp01((right - left) / Number(rect.width));
+  const height = clamp01((bottom - top) / Number(rect.height));
+  return {
+    x: round(Math.min(clamp01((left - Number(rect.x)) / Number(rect.width)), 1 - width)),
+    y: round(Math.min(clamp01((top - Number(rect.y)) / Number(rect.height)), 1 - height)),
+    width: round(width),
+    height: round(height)
+  };
+}
+
+// The slot that more than half of a mask lies on, or null (the memo space).
+export function summarySlotUnderMask(slots = [], mask) {
+  let best = null;
+  let bestShare = 0.5;
+  (Array.isArray(slots) ? slots : []).forEach(slot => {
+    const bounds = slot?.rect ? summarySourceBounds(mask, slot.rect) : null;
+    if (!bounds) return;
+    const share = (bounds.width * slot.rect.width * bounds.height * slot.rect.height) / (Number(mask.width) * Number(mask.height));
+    if (share >= bestShare) {
+      best = slot;
+      bestShare = share;
+    }
+  });
+  return best;
+}
+
+// How an inherited mask differs from the source state it took, or null.
+function inheritedMaskDifference(mask, slot) {
+  const source = mask?.origin?.source;
+  if (!source || !slot?.rect) return null;
+  const place = !sameBounds(mask, placeSourceBounds(source, slot.rect));
+  const weak = (mask.weak === true) !== (source.weak === true);
+  const underline = (mask.underline === true) !== (source.underline === true);
+  return place || weak || underline ? { place, weak, underline } : null;
+}
+
+function changeBase(kind, page, slot, identity) {
+  return {
+    id: `${kind}|${page.pageId}|${slot.slotId}|${identity}`,
+    kind,
+    pageId: page.pageId,
+    slotId: slot.slotId,
+    noteId: String(slot.noteId || ""),
+    sourcePageId: String(slot.pageId || ""),
+    label: String(slot.label || "")
+  };
+}
+
+// The changes of one summary page not reflected in its sources (and not
+// kept as the summary's own), in page order.
+export function summaryPendingChanges(page, content = {}) {
+  const slots = Array.isArray(page?.summary?.slots) ? page.summary.slots : [];
+  if (!slots.length) return [];
+  const slotsById = new Map(slots.map(slot => [slot.slotId, slot]));
+  const changes = [];
+  (Array.isArray(content.noteMasks) ? content.noteMasks : []).forEach(mask => {
+    if (!mask || keptAsSummaryOwn(mask)) return;
+    if (isInheritedMask(mask)) {
+      const slot = slotsById.get(mask.origin.slotId);
+      const sourceMaskId = summarySourceMaskId(mask.origin.key);
+      if (!slot || !sourceMaskId) return;
+      const difference = inheritedMaskDifference(mask, slot);
+      if (!difference) return;
+      const bounds = difference.place ? summarySourceBounds(mask, slot.rect) : {
+        x: round(mask.origin.source.x), y: round(mask.origin.source.y),
+        width: round(mask.origin.source.width), height: round(mask.origin.source.height)
+      };
+      // Moved off its source page: the summary's own place for it.
+      if (!bounds) return;
+      changes.push({
+        ...changeBase("update", page, slot, mask.id),
+        maskId: String(mask.id),
+        key: mask.origin.key,
+        sourceMaskId,
+        snapshot: mask.origin.source,
+        bounds,
+        weak: mask.weak === true,
+        underline: mask.underline === true,
+        details: difference
+      });
+      return;
+    }
+    const slot = summarySlotUnderMask(slots, mask);
+    const bounds = slot ? summarySourceBounds(mask, slot.rect) : null;
+    if (!slot || !bounds) return;
+    changes.push({
+      ...changeBase("add", page, slot, mask.id),
+      maskId: String(mask.id),
+      bounds,
+      weak: mask.weak === true,
+      underline: mask.underline === true
+    });
+  });
+  (Array.isArray(content.summaryRemovedMasks) ? content.summaryRemovedMasks : []).forEach(tombstone => {
+    const slot = slotsById.get(tombstone?.slotId);
+    const sourceMaskId = summarySourceMaskId(tombstone?.key);
+    if (!slot || !sourceMaskId || tombstone.local === true) return;
+    changes.push({
+      ...changeBase("delete", page, slot, tombstone.key),
+      key: tombstone.key,
+      sourceMaskId,
+      snapshot: tombstone.source || null
+    });
+  });
+  return changes;
+}
+
+export function describeSummaryChange(change) {
+  if (change?.kind === "delete") return "マスクを削除";
+  if (change?.kind === "add") return "まとめで作ったマスクを追加";
+  const parts = [];
+  if (change?.details?.place) parts.push("位置・大きさ");
+  if (change?.details?.underline) parts.push(change.underline ? "下線を付けた" : "下線を外した");
+  if (change?.details?.weak) parts.push(change.weak ? "苦手にした" : "苦手を外した");
+  return `マスクを変更（${parts.join("、") || "変更"}）`;
+}
+
+// The changes kept as the summary's own: not asked about again until the
+// mask changes again (a deletion: until the source changes the mask).
+export function keepSummaryChangesLocal(content = {}, changes = []) {
+  const next = {
+    ...content,
+    noteMasks: (Array.isArray(content.noteMasks) ? content.noteMasks : []).map(mask => ({ ...mask })),
+    summaryRemovedMasks: (Array.isArray(content.summaryRemovedMasks) ? content.summaryRemovedMasks : []).map(item => ({ ...item }))
+  };
+  (Array.isArray(changes) ? changes : []).forEach(change => {
+    if (change.kind === "delete") {
+      next.summaryRemovedMasks.forEach(item => {
+        if (item.slotId === change.slotId && item.key === change.key) item.local = true;
+      });
+      return;
+    }
+    const mask = next.noteMasks.find(item => String(item.id) === change.maskId);
+    if (mask) mask.summaryLocal = summaryMaskStateFingerprint(mask);
+  });
+  return next;
+}
+
+function sourceMaskSnapshot(mask) {
+  return maskSnapshot({
+    x: clamp01(mask?.x), y: clamp01(mask?.y), width: clamp01(mask?.width), height: clamp01(mask?.height),
+    weak: mask?.weak === true, underline: mask?.underline === true
+  });
+}
+
+// A source page's content with `changes` (of its masks) made. A change to a
+// mask that the source changed or deleted since the summary took it is not
+// made (the source wins, as in mergeSummarySlotMasks). `applied` gives each
+// mask added in the source its id.
+export function applySummaryChangesToSource(sourceContent = {}, changes = [], { createId } = {}) {
+  if (typeof createId !== "function") throw new TypeError("元ノートへの反映にはIDの作成関数が必要です。");
+  const masks = (Array.isArray(sourceContent.noteMasks) ? sourceContent.noteMasks : []).map(mask => ({ ...mask }));
+  const applied = [];
+  const skipped = [];
+  (Array.isArray(changes) ? changes : []).forEach(change => {
+    if (change.kind === "add") {
+      const id = String(createId());
+      masks.push({ id, ...change.bounds, weak: change.weak === true, underline: change.underline === true });
+      applied.push({ ...change, sourceMaskId: id });
+      return;
+    }
+    const index = masks.findIndex(mask => String(mask?.id || "") === change.sourceMaskId);
+    if (index < 0) {
+      if (change.kind === "delete") applied.push(change);
+      else skipped.push({ change, reason: "removed" });
+      return;
+    }
+    if (change.snapshot && !sameSnapshot(change.snapshot, sourceMaskSnapshot(masks[index]))) {
+      skipped.push({ change, reason: "changed" });
+      return;
+    }
+    if (change.kind === "delete") {
+      masks.splice(index, 1);
+      applied.push(change);
+      return;
+    }
+    masks[index] = { ...masks[index], ...change.bounds, weak: change.weak === true, underline: change.underline === true };
+    applied.push(change);
+  });
+  return { content: { ...sourceContent, noteMasks: masks }, applied, skipped };
+}
+
+// The summary page once `applied` changes were made in their sources: its
+// masks follow the sources' new state (a mask added there becomes an
+// inherited mask), and reflected deletions are no longer remembered.
+export function summaryContentAfterReflect(content = {}, page, applied = []) {
+  const slots = new Map((Array.isArray(page?.summary?.slots) ? page.summary.slots : []).map(slot => [slot.slotId, slot]));
+  const next = {
+    ...content,
+    noteMasks: (Array.isArray(content.noteMasks) ? content.noteMasks : []).map(mask => ({ ...mask })),
+    summaryRemovedMasks: (Array.isArray(content.summaryRemovedMasks) ? content.summaryRemovedMasks : []).map(item => ({ ...item }))
+  };
+  (Array.isArray(applied) ? applied : []).forEach(change => {
+    const slot = slots.get(change.slotId);
+    if (!slot || change.pageId !== page.pageId) return;
+    if (change.kind === "delete") {
+      next.summaryRemovedMasks = next.summaryRemovedMasks.filter(item => !(item.slotId === change.slotId && item.key === change.key));
+      return;
+    }
+    const mask = next.noteMasks.find(item => String(item.id) === change.maskId);
+    if (!mask) return;
+    const source = maskSnapshot({ ...change.bounds, weak: change.weak === true, underline: change.underline === true });
+    Object.assign(mask, placeSourceBounds(source, slot.rect), { weak: source.weak, underline: source.underline });
+    mask.origin = { slotId: slot.slotId, key: change.kind === "add" ? `note:${change.sourceMaskId}` : change.key, source };
+    delete mask.summaryLocal;
+  });
+  return next;
+}
+
+// The summary's own changes (kept, or not reflected yet) to the masks of a
+// slot that updating from `entries` replaces: masks the summary changed and
+// the source changed too (or deleted), and deleted masks the source changed.
+export function countSummaryMergeConflicts(content = {}, slot, entries = []) {
+  const sources = new Map((Array.isArray(entries) ? entries : []).map(entry => [entry.key, entry]));
+  let count = 0;
+  (Array.isArray(content.noteMasks) ? content.noteMasks : []).forEach(mask => {
+    if (mask?.origin?.slotId !== slot.slotId) return;
+    const entry = sources.get(mask.origin.key);
+    if (entry && sameSnapshot(mask.origin.source, maskSnapshot(entry))) return;
+    if (inheritedMaskDifference(mask, slot)) count += 1;
+  });
+  (Array.isArray(content.summaryRemovedMasks) ? content.summaryRemovedMasks : []).forEach(item => {
+    if (item?.slotId !== slot.slotId) return;
+    const entry = sources.get(item.key);
+    if (entry && !sameSnapshot(item.source, maskSnapshot(entry))) count += 1;
+  });
+  return count;
 }
 
 const BACKGROUND_KEY_FIELDS = ["type", "paperColor", "ruleType", "ruleSpacingRatio", "ruleColor", "ruleOpacity", "ruleWidthRatio", "imagePath", "sourcePageNumber", "pdfRotation", "materialId", "materialPage"];

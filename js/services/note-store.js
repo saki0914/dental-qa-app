@@ -36,6 +36,7 @@ import {
 } from "../core/note-material-mutation.js";
 import { randomId } from "../core/id.js";
 import { normalizeNoteLineElements } from "../core/note-geometry.js";
+import { normalizeNoteTags, sameNoteTags } from "../core/note-tags.js";
 import { sha256Hex } from "../core/sha256.js";
 import { runWithConcurrency } from "../core/bounded-concurrency.js";
 import { createNotePageSaveQueue } from "../core/note-page-save-queue.js";
@@ -715,6 +716,52 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     });
   }
 
+  // Tags of a note (revision 16). They are not edits of the note: its
+  // updatedAt (the list's order and its cached thumbnail) stays.
+  async function setNoteTags(noteId, tags, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    const normalized = normalizeNoteTags(tags);
+    context(expectedUid);
+    await updateDoc(noteRef(db, uid, noteId), { tags: normalized });
+    return normalized;
+  }
+
+  // A tag renamed or taken off on every note (`transform` turns a note's
+  // tags into its new tags), in batches. Notes whose tags stay are not
+  // written. Returns the ids of the notes changed.
+  async function updateTagsOnNotes(transform, expectedUid) {
+    if (typeof transform !== "function") throw new TypeError("タグの変更方法がありません。");
+    const documents = await listNoteDocuments({ expectedUid });
+    const { uid, db } = writeContext(expectedUid);
+    const changes = documents
+      .map(note => {
+        const before = normalizeNoteTags(note.tags);
+        const after = normalizeNoteTags(transform(before, note));
+        return sameNoteTags(before, after) ? null : { id: note.id, tags: after };
+      })
+      .filter(Boolean);
+    const changed = [];
+    for (let offset = 0; offset < changes.length; offset += CREATION_BATCH_SIZE) {
+      const chunk = changes.slice(offset, offset + CREATION_BATCH_SIZE);
+      const batch = writeBatch(db);
+      chunk.forEach(change => batch.update(noteRef(db, uid, change.id), { tags: change.tags }));
+      context(expectedUid);
+      await batch.commit();
+      changed.push(...chunk.map(change => change.id));
+    }
+    return changed;
+  }
+
+  // The summary pages (revision 16) with changes not reflected in their
+  // source notes, so that the list and the next opening tell about them.
+  async function setSummaryPendingPages(noteId, pageIds, expectedUid) {
+    const { uid, db } = writeContext(expectedUid);
+    const ids = [...new Set((Array.isArray(pageIds) ? pageIds : []).map(String).filter(Boolean))].sort().slice(0, 1000);
+    context(expectedUid);
+    await updateDoc(noteRef(db, uid, noteId), { summaryPendingPageIds: ids });
+    return ids;
+  }
+
   async function deleteStoragePaths(paths, expectedUid) {
     const { storage } = writeContext(expectedUid);
     const failed = [];
@@ -1216,6 +1263,7 @@ export function createNoteStore({ getDb, getStorage, getUser, queueCleanup = asy
     journalSourcePages, uploadSourcePage, uploadRecoveredBackground, deleteStoragePaths, loadPageContent, savePageContent, enqueuePageContentSave, uploadAsset, getAsset,
     getStorageBlob, cleanupStoragePath, updatePageOrder, createPage, deletePage, updatePage, updatePages, updateNote,
     deleteMaterialLinkedNotes, restoreNote, deleteNote,
-    uploadSummaryBackground, commitSummaryPages, listSummaryNotesUsing, setPageTestMark
+    uploadSummaryBackground, commitSummaryPages, listSummaryNotesUsing, setPageTestMark,
+    setNoteTags, updateTagsOnNotes, setSummaryPendingPages
   };
 }

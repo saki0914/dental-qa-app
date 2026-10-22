@@ -631,7 +631,21 @@ test("@authenticated テストに出るページからまとめノートを作�
   const oldPicture = summaryPage.background.imagePath;
   await summaryTab.reload({ waitUntil: "domcontentloaded" });
   await expect(summaryTab.locator("#noteEditorStartup")).toBeHidden({ timeout: 60_000 });
+  // Revision 16: the summary asks before it takes the changes, and says
+  // which of its own changes the source changes replace.
+  await expect(summaryTab.locator("#noteSummaryUpdateDialog")).toBeVisible();
+  await expect(summaryTab.locator("#noteSummaryUpdateList li")).toHaveCount(1);
+  await expect(summaryTab.locator("#noteSummaryUpdateList")).toContainText("授業ノートA  p.1");
+  await expect(summaryTab.locator("#noteSummaryUpdateWarning")).toContainText("まとめで変えたマスク1個");
+  expect((await maskShares(stage)).length, "答えるまでは変えない").toBe(6);
+  await summaryTab.locator("#noteSummaryUpdateApplyBtn").click();
+  await expect(summaryTab.locator("#noteSummaryUpdateDialog")).toBeHidden({ timeout: 60_000 });
   await expect(summaryTab.locator("#noteEditorNotice")).toContainText("元ノートの変更を1ページに反映しました");
+  await expect(summaryTab.locator("#noteSummaryBannerUpdates")).toBeHidden();
+  // The move of A p.2's mask is not in its source yet (A p.1's was replaced).
+  await expect(summaryTab.locator("#noteSummaryBannerPending")).toContainText("元ノートに反映していない変更があります（まとめ 1ページ）");
+  await summaryTab.locator('[data-summary-banner="dismiss-pending"]').click();
+  await expect(summaryTab.locator("#noteSummaryBanner")).toBeHidden();
   shares = await maskShares(stage);
   expect(shares, "元ノートで追加したマスクが増え、まとめ側のマスクは残る").toHaveLength(7);
   expectBoundsClose(shares.find(mask => mask.id === a1Id), place(a1Changed, slotA1.rect), "元ノートで変えたマスクは元ノートを優先");
@@ -654,10 +668,17 @@ test("@authenticated テストに出るページからまとめノートを作�
   await guardProductionFirebase(secondAgain, blockedRequests);
   await secondAgain.setViewportSize({ width: 1180, height: 1500 });
   await openEditor(secondAgain, secondId);
+  await expect(secondAgain.locator("#noteSummaryUpdateDialog")).toBeVisible();
+  await secondAgain.locator("#noteSummaryUpdateApplyBtn").click();
+  await expect(secondAgain.locator("#noteSummaryUpdateDialog")).toBeHidden({ timeout: 60_000 });
   await expect(secondAgain.locator(".note-mask.inherited"), "同じ元ページを使う別のまとめにも反映").toHaveCount(3);
   const secondPictureBefore = (await readNote(user.uid, secondId)).pages[0].background.imagePath;
   await takeOutOfSummary(secondAgain, "授業ノートA  p.1");
   await expect(secondAgain.locator(".note-mask.inherited")).toHaveCount(0);
+  // The page's content is saved after the picture (its journal entry goes
+  // with the save).
+  await waitSaved(secondAgain);
+  await expect.poll(async () => (await readNote(user.uid, secondId)).pendingStoragePaths, { timeout: 20_000 }).toEqual([]);
   const secondAfter = await readNote(user.uid, secondId);
   expect(secondAfter.summarySourcePages).toEqual([]);
   expect(secondAfter.summarySourceNoteIds).toEqual([]);
@@ -733,6 +754,8 @@ test("@authenticated テストに出るページからまとめノートを作�
   await summaryTab.bringToFront();
   await summaryTab.locator("#noteEditModeBtn").click();
   await takeOutOfSummary(summaryTab, "授業ノートA  p.1");
+  await waitSaved(summaryTab);
+  await expect.poll(async () => (await readNote(user.uid, summaryId)).pendingStoragePaths, { timeout: 20_000 }).toEqual([]);
   const after = await readNote(user.uid, summaryId);
   expect(after.summarySourcePages).not.toContain(`${source.noteId}/${pageA1}`);
   expect(after.pendingStoragePaths).toEqual([]);

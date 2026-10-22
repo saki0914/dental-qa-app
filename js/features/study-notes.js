@@ -84,14 +84,20 @@ import {
   SUMMARY_PAGE_SIZE,
   SUMMARY_VERSION,
   addInheritedMaskTombstones,
+  applySummaryChangesToSource,
   buildSummaryLayout,
+  countSummaryMergeConflicts,
+  describeSummaryChange,
   isInheritedMask,
   isSummaryNote,
   isSummaryPage,
+  keepSummaryChangesLocal,
   mergeSummarySlotMasks,
   normalizeSummaryOptions,
   removeSummarySlotFromContent,
+  summaryContentAfterReflect,
   summaryInkKey,
+  summaryPendingChanges,
   summaryRefKey,
   summarySlotLabel,
   summarySourceKey,
@@ -99,6 +105,25 @@ import {
   summarySourceRefs,
   withoutMaskOrigin
 } from "../core/note-summary.js";
+import {
+  NOTE_TAG_FILTER_ALL,
+  NOTE_TAG_FILTER_NONE,
+  NOTE_TAG_MAX_COUNT,
+  buildNoteTagTree,
+  countUntaggedNotes,
+  describeNoteTagFilter,
+  filterNotesByTag,
+  flattenNoteTagTree,
+  isNoteTagWithin,
+  matchesNoteTagFilter,
+  noteTagAncestors,
+  noteTagKey,
+  noteTagsOf,
+  normalizeNoteTag,
+  normalizeNoteTags,
+  removeNoteTagFromList,
+  renameNoteTagInList
+} from "../core/note-tags.js";
 import { notePageMetrics } from "../core/note-page-metrics.js";
 import {
   getMaterialDefaultNoteId,
@@ -379,6 +404,150 @@ function ensureRevision15Elements(doc = globalThis.document) {
   }
 }
 
+// The controls of revision 16, made here for the same reason: tags of the
+// note list, the page number to jump to, and reflecting a summary note's
+// changes in its source notes.
+function ensureRevision16Elements(doc = globalThis.document) {
+  if (!doc?.getElementById) return;
+  const byId = id => doc.getElementById(id);
+  const fromHtml = html => {
+    const template = doc.createElement("template");
+    template.innerHTML = html.trim();
+    return template.content.firstElementChild;
+  };
+  const listView = byId("noteListView");
+  const list = byId("noteList");
+  if (listView && list && !byId("noteListTools")) {
+    const tools = fromHtml(`<div id="noteListTools" class="note-list-tools">
+      <label class="note-list-tag-select"><span>タグ</span><select id="noteTagFilterSelect" aria-label="タグで絞り込む"></select></label>
+      <label class="note-list-search"><span>検索</span><input id="noteSearchInput" type="search" placeholder="ノート名・タグ" autocomplete="off" enterkeyhint="search"></label>
+      <button type="button" class="btn" id="noteTagManageBtn">タグを管理</button>
+    </div>`);
+    const heading = listView.querySelector(".note-list-heading");
+    if (heading) heading.after(tools); else listView.prepend(tools);
+    const body = fromHtml('<div id="noteListBody" class="note-list-body"><nav id="noteTagPane" class="note-tag-pane" aria-label="タグ"></nav></div>');
+    list.before(body);
+    body.append(list);
+  }
+  const anchorDialog = byId("noteSummaryDialog") || byId("noteExportDialog");
+  const addDialog = (id, html) => {
+    if (!anchorDialog || byId(id)) return;
+    const dialog = fromHtml(html);
+    const last = ["noteTagDialog", "noteTagManageDialog", "notePageJumpDialog", "noteSummaryUpdateDialog", "noteSummaryPushDialog"]
+      .map(byId).filter(Boolean).pop() || anchorDialog;
+    last.after(dialog);
+  };
+  addDialog("noteTagDialog", `<dialog id="noteTagDialog" class="note-export-dialog note-tag-dialog">
+    <form method="dialog" id="noteTagDialogForm">
+      <h3>タグを編集</h3>
+      <p id="noteTagDialogNoteName" class="note-tag-dialog-note"></p>
+      <ul id="noteTagDialogTags" class="note-tag-dialog-tags" aria-label="付いているタグ"></ul>
+      <label>今あるタグから追加<select id="noteTagDialogExisting"></select></label>
+      <div class="note-tag-dialog-new">
+        <label>新しいタグ<input id="noteTagDialogInput" maxlength="60" placeholder="例: 口腔解剖学/4章" autocomplete="off" enterkeyhint="done"></label>
+        <button type="button" class="btn" id="noteTagDialogAddBtn">追加</button>
+      </div>
+      <p class="note-setting-hint">「/」で区切ると入れ子になります（例：「口腔解剖学/4章」は「口腔解剖学」の中に出ます）。</p>
+      <p id="noteTagDialogStatus" class="note-summary-dialog-status" role="status" aria-live="polite"></p>
+      <div class="note-dialog-actions">
+        <button type="button" class="btn primary" id="noteTagDialogSaveBtn">保存</button>
+        <button type="button" class="btn" id="noteTagDialogCancelBtn">キャンセル</button>
+      </div>
+    </form>
+  </dialog>`);
+  addDialog("noteTagManageDialog", `<dialog id="noteTagManageDialog" class="note-export-dialog note-tag-manage-dialog">
+    <form method="dialog">
+      <h3>タグを管理</h3>
+      <p class="note-setting-hint">名前を変えると、下の階層のタグも一緒に変わります。削除してもノートは消えません（そのタグと下の階層のタグが外れます）。</p>
+      <ul id="noteTagManageList" class="note-tag-manage-list"></ul>
+      <p id="noteTagManageStatus" class="note-summary-dialog-status" role="status" aria-live="polite"></p>
+      <div class="note-dialog-actions"><button type="button" class="btn" id="noteTagManageCloseBtn">閉じる</button></div>
+    </form>
+  </dialog>`);
+  addDialog("notePageJumpDialog", `<dialog id="notePageJumpDialog" class="note-export-dialog note-page-jump-dialog">
+    <form method="dialog" id="notePageJumpForm" novalidate>
+      <h3>ページへ移動</h3>
+      <label>ページ番号 <span id="notePageJumpRange" class="note-page-jump-range"></span><input id="notePageJumpInput" type="number" inputmode="numeric" min="1" step="1" enterkeyhint="go" autocomplete="off"></label>
+      <p id="notePageJumpStatus" class="note-summary-dialog-status" role="status" aria-live="polite"></p>
+      <div class="note-dialog-actions">
+        <button type="submit" class="btn primary" id="notePageJumpGoBtn">移動</button>
+        <button type="button" class="btn" id="notePageJumpCancelBtn">キャンセル</button>
+      </div>
+    </form>
+  </dialog>`);
+  addDialog("noteSummaryUpdateDialog", `<dialog id="noteSummaryUpdateDialog" class="note-export-dialog note-summary-update-dialog">
+    <form method="dialog">
+      <h3>元ノートが更新されています</h3>
+      <p class="note-summary-dialog-hint">次の元ページの変更を、このまとめノートにまだ反映していません。</p>
+      <ul id="noteSummaryUpdateList" class="note-summary-update-list"></ul>
+      <p id="noteSummaryUpdateWarning" class="note-summary-update-warning hidden"></p>
+      <p id="noteSummaryUpdateStatus" class="note-summary-dialog-status" role="status" aria-live="polite"></p>
+      <div class="note-dialog-actions">
+        <button type="button" class="btn primary" id="noteSummaryUpdateApplyBtn">更新する</button>
+        <button type="button" class="btn" id="noteSummaryUpdateLaterBtn">今はしない</button>
+      </div>
+    </form>
+  </dialog>`);
+  addDialog("noteSummaryPushDialog", `<dialog id="noteSummaryPushDialog" class="note-export-dialog note-summary-push-dialog">
+    <form method="dialog">
+      <h3 id="noteSummaryPushTitle">元ノートへの反映</h3>
+      <p id="noteSummaryPushLead" class="note-summary-dialog-hint"></p>
+      <div id="noteSummaryPushList" class="note-summary-push-list"></div>
+      <p id="noteSummaryPushStatus" class="note-summary-dialog-status" role="status" aria-live="polite"></p>
+      <div class="note-dialog-actions">
+        <button type="button" class="btn primary" data-summary-push="apply"></button>
+        <button type="button" class="btn" data-summary-push="local"></button>
+        <button type="button" class="btn" data-summary-push="cancel"></button>
+      </div>
+    </form>
+  </dialog>`);
+  const notice = byId("noteEditorNotice");
+  if (notice && !byId("noteSummaryBanner")) {
+    notice.after(fromHtml(`<div id="noteSummaryBanner" class="note-summary-banner hidden" role="status" aria-live="polite">
+      <div id="noteSummaryBannerUpdates" class="note-summary-banner-row hidden">
+        <span id="noteSummaryBannerUpdatesText"></span>
+        <button type="button" class="btn primary" data-summary-banner="update">更新する</button>
+        <button type="button" class="btn" data-summary-banner="update-details">内容を見る</button>
+        <button type="button" class="note-summary-banner-close" data-summary-banner="dismiss-updates" aria-label="このお知らせを閉じる">✕</button>
+      </div>
+      <div id="noteSummaryBannerPending" class="note-summary-banner-row hidden">
+        <span id="noteSummaryBannerPendingText"></span>
+        <button type="button" class="btn primary" data-summary-banner="push">確認する</button>
+        <button type="button" class="note-summary-banner-close" data-summary-banner="dismiss-pending" aria-label="このお知らせを閉じる">✕</button>
+      </div>
+    </div>`));
+  }
+  const renameAction = doc.querySelector('#noteMoreMenu [data-note-action="rename"]');
+  if (renameAction && !doc.querySelector('#noteMoreMenu [data-note-action="tags"]')) {
+    renameAction.after(fromHtml('<button type="button" data-note-action="tags">タグを編集</button>'));
+  }
+  // Also where the page counter does not fit (a narrow screen).
+  const resetViewAction = doc.querySelector('#noteMoreMenu [data-note-action="reset-view"]');
+  if (resetViewAction && !doc.querySelector('#noteMoreMenu [data-note-action="page-jump"]')) {
+    resetViewAction.before(fromHtml('<button type="button" data-note-action="page-jump">ページ番号で移動</button>'));
+  }
+  const sourcesAction = doc.querySelector('#noteMoreMenu [data-note-action="summary-sources"]');
+  if (sourcesAction && !doc.querySelector('#noteMoreMenu [data-note-action="summary-push"]')) {
+    sourcesAction.after(fromHtml('<button type="button" data-note-action="summary-push" class="hidden">元ノートへの反映</button>'));
+  }
+  // First in the menu: the menu scrolls sideways on an iPad, and the action
+  // the user came for must not be out of sight at its end.
+  const selectionActions = byId("noteSelectionActions");
+  if (selectionActions && !selectionActions.querySelector('[data-selection-action="reflect-source"]')) {
+    const title = byId("noteSelectionActionsTitle");
+    const button = fromHtml('<button type="button" class="note-selection-primary" data-selection-action="reflect-source">元ノートに反映</button>');
+    if (title?.parentElement === selectionActions) title.after(button); else selectionActions.prepend(button);
+  }
+  const counter = byId("notePageCounter");
+  if (counter && counter.getAttribute("role") !== "button") {
+    counter.setAttribute("role", "button");
+    counter.tabIndex = 0;
+    counter.title = "ページ番号を入力して移動";
+    counter.setAttribute("aria-label", "ページ番号を入力して移動");
+    counter.classList.add("note-page-counter-button");
+  }
+}
+
 export function createStudyNotes(dependencies) {
   const {
     getCurrentUser,
@@ -413,6 +582,7 @@ export function createStudyNotes(dependencies) {
     }
   }
   ensureRevision15Elements(document);
+  ensureRevision16Elements(document);
   const ui = {
     noteModeBtn: byId("noteModeBtn"), noteView: byId("noteView"), listView: byId("noteListView"),
     createView: byId("noteCreateView"), editorView: byId("noteEditorView"), list: byId("noteList"),
@@ -486,7 +656,26 @@ export function createStudyNotes(dependencies) {
     maskUnderline: byId("noteMaskUnderline"), summaryPicker: byId("noteSummaryPicker"),
     summaryDialog: byId("noteSummaryDialog"), summarySlotList: byId("noteSummarySlotList"),
     summaryDialogStatus: byId("noteSummaryDialogStatus"), summaryRefresh: byId("noteSummaryRefreshBtn"),
-    summarySourcesAction: document.querySelector('#noteMoreMenu [data-note-action="summary-sources"]')
+    summarySourcesAction: document.querySelector('#noteMoreMenu [data-note-action="summary-sources"]'),
+    // Revision 16 (made by ensureRevision16Elements).
+    tagFilterSelect: byId("noteTagFilterSelect"), searchInput: byId("noteSearchInput"), tagManageButton: byId("noteTagManageBtn"),
+    tagPane: byId("noteTagPane"),
+    tagDialog: byId("noteTagDialog"), tagDialogNoteName: byId("noteTagDialogNoteName"), tagDialogTags: byId("noteTagDialogTags"),
+    tagDialogExisting: byId("noteTagDialogExisting"), tagDialogInput: byId("noteTagDialogInput"), tagDialogAdd: byId("noteTagDialogAddBtn"),
+    tagDialogStatus: byId("noteTagDialogStatus"), tagDialogSave: byId("noteTagDialogSaveBtn"), tagDialogCancel: byId("noteTagDialogCancelBtn"),
+    tagManageDialog: byId("noteTagManageDialog"), tagManageList: byId("noteTagManageList"), tagManageStatus: byId("noteTagManageStatus"),
+    tagManageClose: byId("noteTagManageCloseBtn"),
+    pageJumpDialog: byId("notePageJumpDialog"), pageJumpForm: byId("notePageJumpForm"), pageJumpInput: byId("notePageJumpInput"),
+    pageJumpRange: byId("notePageJumpRange"), pageJumpStatus: byId("notePageJumpStatus"), pageJumpCancel: byId("notePageJumpCancelBtn"),
+    summaryBanner: byId("noteSummaryBanner"), summaryBannerUpdates: byId("noteSummaryBannerUpdates"),
+    summaryBannerUpdatesText: byId("noteSummaryBannerUpdatesText"), summaryBannerPending: byId("noteSummaryBannerPending"),
+    summaryBannerPendingText: byId("noteSummaryBannerPendingText"),
+    summaryUpdateDialog: byId("noteSummaryUpdateDialog"), summaryUpdateList: byId("noteSummaryUpdateList"),
+    summaryUpdateWarning: byId("noteSummaryUpdateWarning"), summaryUpdateStatus: byId("noteSummaryUpdateStatus"),
+    summaryUpdateApply: byId("noteSummaryUpdateApplyBtn"), summaryUpdateLater: byId("noteSummaryUpdateLaterBtn"),
+    summaryPushDialog: byId("noteSummaryPushDialog"), summaryPushTitle: byId("noteSummaryPushTitle"), summaryPushLead: byId("noteSummaryPushLead"),
+    summaryPushList: byId("noteSummaryPushList"), summaryPushStatus: byId("noteSummaryPushStatus"),
+    summaryPushAction: document.querySelector('#noteMoreMenu [data-note-action="summary-push"]')
   };
   if (dedicatedEditor && ui.localSlot && ui.localEnvironmentBanner) {
     ui.localSlot.append(ui.localEnvironmentBanner);
@@ -545,6 +734,29 @@ export function createStudyNotes(dependencies) {
   // Told once the editor shows (the summary update ran while it opened).
   let summaryOpenNotice = "";
   let summarySyncRunning = false;
+  // Revision 16. The note list's tag filter and search words; the tags of
+  // the tag tree that show their children.
+  let noteTagFilter = NOTE_TAG_FILTER_ALL;
+  let noteSearchQuery = "";
+  let noteTagFilterLoadedFor = "";
+  const expandedNoteTags = new Set();
+  // The note whose tags the tag dialog edits, and the tags chosen so far.
+  let tagDialogState = null;
+  let tagManageRunning = false;
+  // A summary note: its pages with changes not reflected in their source
+  // notes (as last written to the note), the source updates not taken yet
+  // (shown in the banner) and the open reflect dialog.
+  let summaryPendingPageIds = new Set();
+  let summaryPendingWrittenKey = "";
+  let summaryPendingWriteTimer = 0;
+  let summaryPendingWriteChain = Promise.resolve();
+  let summaryUpdateState = { updates: [], conflicts: 0, failed: 0, missing: 0 };
+  let summaryCheckRunning = false;
+  let summaryLastCheckAt = 0;
+  let summaryPushState = null;
+  let summaryReflectRunning = false;
+  // Set while the tab closes on purpose (no "leave the page?" question).
+  let leavingEditorOnPurpose = false;
   let eraserCursorFrame = 0;
   let transientUi = createClosedTransientUi();
   let syncingTransientUi = false;
@@ -815,7 +1027,7 @@ export function createStudyNotes(dependencies) {
 
   function noteListUrl() {
     const url = new URL(globalThis.location.href);
-    ["noteEditor", "noteId", "editorTabId", "study", "material", "create", "creationSessionId", "noteStartupAt"].forEach(name => url.searchParams.delete(name));
+    ["noteEditor", "noteId", "editorTabId", "study", "material", "create", "creationSessionId", "noteStartupAt", "page", "tag"].forEach(name => url.searchParams.delete(name));
     return url;
   }
 
@@ -848,6 +1060,7 @@ export function createStudyNotes(dependencies) {
   // closing it returns to that list. A tab the browser does not let a page
   // close (opened from a bookmark, for example) shows the note list instead.
   function closeNoteTab({ replace = false } = {}) {
+    leavingEditorOnPurpose = true;
     try {
       globalThis.close?.();
     } catch (error) {
@@ -1430,15 +1643,18 @@ export function createStudyNotes(dependencies) {
           ? "画像を編集"
           : "選択項目を編集";
     }
-    const maskActions = new Set(["duplicate", "front", "back", "weak", "weak-on", "weak-off", "underline-on", "underline-off", "delete", "select-page-masks", "clear-selection"]);
+    const maskActions = new Set(["duplicate", "front", "back", "weak", "weak-on", "weak-off", "underline-on", "underline-off", "reflect-source", "delete", "select-page-masks", "clear-selection"]);
     // One underline action: put it on unless every chosen mask has one.
     const allUnderlined = currentTool === "mask" && selectedMasks().length > 0 && selectedMasks().every(hasMaskUnderline);
+    // A summary note's chosen masks with changes not in their sources
+    // (revision 16).
+    const reflectable = hasSelection && currentTool === "mask" && selectedSummaryChanges().length > 0;
     ui.selectionActions.querySelectorAll("button[data-selection-action]").forEach(button => {
       const action = button.dataset.selectionAction;
       const otherUnderlineAction = action === (allUnderlined ? "underline-on" : "underline-off");
       button.classList.toggle("hidden", currentTool === "mask"
-        ? !maskActions.has(action) || otherUnderlineAction
-        : action === "underline-on" || action === "underline-off");
+        ? !maskActions.has(action) || otherUnderlineAction || (action === "reflect-source" && !reflectable)
+        : action === "underline-on" || action === "underline-off" || action === "reflect-source");
     });
   }
 
@@ -1669,6 +1885,7 @@ export function createStudyNotes(dependencies) {
     url.searchParams.set("noteStartupAt", String(Math.trunc(startupAt)));
     url.searchParams.delete("create");
     url.searchParams.delete("creationSessionId");
+    url.searchParams.delete("tag");
     if (study) url.searchParams.set("study", "1"); else url.searchParams.delete("study");
     if (material) url.searchParams.set("material", "1"); else url.searchParams.delete("material");
     if (pageId) url.searchParams.set("page", pageId); else url.searchParams.delete("page");
@@ -1680,7 +1897,10 @@ export function createStudyNotes(dependencies) {
     url.searchParams.set("noteEditor", "1");
     url.searchParams.set("create", "pdf");
     url.searchParams.set("creationSessionId", randomId());
-    ["noteId", "editorTabId", "study", "material", "noteStartupAt"].forEach(name => url.searchParams.delete(name));
+    ["noteId", "editorTabId", "study", "material", "noteStartupAt", "page", "tag"].forEach(name => url.searchParams.delete(name));
+    // The note made there gets the tag the list shows (revision 16).
+    const [tag] = tagsForNewNote();
+    if (tag) url.searchParams.set("tag", tag);
     return url;
   }
 
@@ -1957,6 +2177,9 @@ export function createStudyNotes(dependencies) {
       if (pendingLocalSavePromises.get(key) === task) pendingLocalSavePromises.delete(key);
     };
     task.then(clear, clear);
+    // A summary page tells whether it has changes not reflected in its
+    // sources (revision 16).
+    observeSummaryPending(saveIdentity.noteId, saveIdentity.pageId, content);
     return task;
   }
 
@@ -2252,11 +2475,14 @@ export function createStudyNotes(dependencies) {
           ...pendingAssets.filter(item => item.noteId === note.id).map(item => item.pageId)
         ]).size;
       });
+      loadNoteTagFilter(session);
       renderNoteList();
       const unsyncedCount = notes.reduce((sum, note) => sum + Number(note.unsyncedCount || 0), 0);
-      setListStatus(notes.length
+      noteListBaseStatus = notes.length
         ? `${notes.length}件のノートがあります。${unsyncedCount ? ` 端末内に未同期の変更が${unsyncedCount}ページあります。` : ""}${orphanedDrafts.length ? ` 一覧にないノートの下書きが${orphanedDrafts.length}件あります。` : ""}`
-        : orphanedDrafts.length ? `一覧にないノートの下書きが${orphanedDrafts.length}件あります。復元できます。` : "ノートはまだありません。");
+        : orphanedDrafts.length ? `一覧にないノートの下書きが${orphanedDrafts.length}件あります。復元できます。` : "ノートはまだありません。";
+      setListStatus(noteListBaseStatus);
+      updateNoteListStatus();
       if (!localRecoverySuppressed) {
         void recoverAllPendingWork(session).catch(error => {
           if (error?.name !== "NoteSessionChangedError") console.warn("未送信ノートの自動再送を継続できませんでした。", error);
@@ -2286,12 +2512,431 @@ export function createStudyNotes(dependencies) {
     ]);
   }
 
+  // ---- Tags of the note list (revision 16) ----
+
+  let noteListBaseStatus = "";
+
+  function noteTagFilterStorageKey(uid) {
+    return `dentalQaNoteTagFilter:${uid}`;
+  }
+
+  // The tag filter and the opened tags of the tree stay per device.
+  function loadNoteTagFilter(session = captureUserSession()) {
+    if (!session || noteTagFilterLoadedFor === session.uid) return;
+    noteTagFilterLoadedFor = session.uid;
+    noteTagFilter = NOTE_TAG_FILTER_ALL;
+    expandedNoteTags.clear();
+    try {
+      const stored = JSON.parse(globalThis.localStorage?.getItem(noteTagFilterStorageKey(session.uid)) || "null");
+      noteTagFilter = stored?.filter === "none" ? NOTE_TAG_FILTER_NONE : normalizeNoteTag(stored?.filter || "");
+      (Array.isArray(stored?.expanded) ? stored.expanded : []).forEach(tag => {
+        const key = noteTagKey(tag);
+        if (key) expandedNoteTags.add(key);
+      });
+    } catch {
+      noteTagFilter = NOTE_TAG_FILTER_ALL;
+    }
+  }
+
+  function saveNoteTagFilter() {
+    const uid = captureUserSession()?.uid;
+    if (!uid) return;
+    try {
+      globalThis.localStorage?.setItem(noteTagFilterStorageKey(uid), JSON.stringify({
+        filter: noteTagFilter === NOTE_TAG_FILTER_NONE ? "none" : noteTagFilter,
+        expanded: [...expandedNoteTags]
+      }));
+    } catch {}
+  }
+
+  function setNoteTagFilter(filter) {
+    noteTagFilter = filter === NOTE_TAG_FILTER_NONE ? NOTE_TAG_FILTER_NONE : normalizeNoteTag(filter);
+    // The tags above the chosen one open, so that it shows in the tree.
+    if (noteTagFilter && noteTagFilter !== NOTE_TAG_FILTER_NONE) {
+      noteTagAncestors(noteTagFilter).slice(0, -1).forEach(tag => expandedNoteTags.add(noteTagKey(tag)));
+    }
+    saveNoteTagFilter();
+    renderNoteList();
+    updateNoteListStatus();
+  }
+
+  // The tag that a note made now gets: the tag the list shows (a creation
+  // tab was told it in its address).
+  function tagsForNewNote() {
+    const tag = dedicatedEditorCreateMode
+      ? normalizeNoteTag(routeParams.get("tag") || "")
+      : noteTagFilter && noteTagFilter !== NOTE_TAG_FILTER_NONE ? noteTagFilter : "";
+    return tag ? [tag] : [];
+  }
+
+  function visibleListNotes() {
+    return filterNotesByTag(notes, { tag: noteTagFilter, query: noteSearchQuery });
+  }
+
+  function updateNoteListStatus() {
+    const filtered = noteTagFilter !== NOTE_TAG_FILTER_ALL || noteSearchQuery.trim();
+    if (!filtered || !notes.length) {
+      if (noteListBaseStatus) setListStatus(noteListBaseStatus);
+      return;
+    }
+    const tagText = noteTagFilter !== NOTE_TAG_FILTER_ALL ? `${describeNoteTagFilter(noteTagFilter)}の` : "";
+    const queryText = noteSearchQuery.trim() ? `${tagText ? "うち" : ""}「${noteSearchQuery.trim()}」を含む` : "";
+    setListStatus(`${tagText}${queryText}ノート ${visibleListNotes().length}件（全${notes.length}件）`);
+  }
+
+  const tagFilterOptionValue = filter => filter === NOTE_TAG_FILTER_NONE ? "none" : filter ? `tag:${filter}` : "all";
+  const tagFilterFromOptionValue = value => value === "none" ? NOTE_TAG_FILTER_NONE : String(value || "").startsWith("tag:") ? String(value).slice(4) : NOTE_TAG_FILTER_ALL;
+
+  // The tag pull-down (narrow screens) and the tag tree (wide screens).
+  function renderNoteListTools() {
+    if (!ui.tagFilterSelect || !ui.tagPane) return;
+    const rows = flattenNoteTagTree(buildNoteTagTree(notes));
+    const untagged = countUntaggedNotes(notes);
+    // A tag that no note has any more filters nothing.
+    if (noteTagFilter && noteTagFilter !== NOTE_TAG_FILTER_NONE) {
+      const row = rows.find(item => noteTagKey(item.tag) === noteTagKey(noteTagFilter));
+      noteTagFilter = row ? row.tag : NOTE_TAG_FILTER_ALL;
+    } else if (noteTagFilter === NOTE_TAG_FILTER_NONE && !untagged && notes.length) {
+      noteTagFilter = NOTE_TAG_FILTER_ALL;
+    }
+    const option = (filter, text) => {
+      const node = document.createElement("option");
+      node.value = tagFilterOptionValue(filter);
+      node.textContent = text;
+      return node;
+    };
+    ui.tagFilterSelect.replaceChildren(
+      option(NOTE_TAG_FILTER_ALL, `すべてのノート（${notes.length}）`),
+      ...rows.map(row => option(row.tag, `${"　".repeat(row.depth)}${row.depth ? "└ " : ""}#${row.name}（${row.count}）`)),
+      ...(untagged ? [option(NOTE_TAG_FILTER_NONE, `タグなし（${untagged}）`)] : [])
+    );
+    ui.tagFilterSelect.value = tagFilterOptionValue(noteTagFilter);
+    const tree = document.createElement("ul");
+    tree.className = "note-tag-tree";
+    const item = ({ filter, label, count, depth = 0, row = null }) => {
+      const entry = document.createElement("li");
+      entry.style.setProperty("--tag-depth", String(depth));
+      if (row?.hasChildren) {
+        const expanded = expandedNoteTags.has(noteTagKey(row.tag));
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "note-tag-toggle";
+        toggle.dataset.tagToggle = row.tag;
+        toggle.textContent = expanded ? "▾" : "▸";
+        toggle.setAttribute("aria-expanded", String(expanded));
+        toggle.setAttribute("aria-label", `#${row.tag}の下のタグを${expanded ? "閉じる" : "開く"}`);
+        entry.append(toggle);
+      } else {
+        const spacer = document.createElement("span");
+        spacer.className = "note-tag-toggle-spacer";
+        entry.append(spacer);
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "note-tag-item";
+      button.dataset.tagFilter = tagFilterOptionValue(filter);
+      const selected = filter === noteTagFilter || (filter && filter !== NOTE_TAG_FILTER_NONE && noteTagFilter !== NOTE_TAG_FILTER_NONE && noteTagKey(filter) === noteTagKey(noteTagFilter));
+      button.setAttribute("aria-pressed", String(selected));
+      const name = document.createElement("span");
+      name.className = "note-tag-name";
+      name.textContent = label;
+      const number = document.createElement("span");
+      number.className = "note-tag-count";
+      number.textContent = String(count);
+      button.append(name, number);
+      entry.append(button);
+      tree.append(entry);
+    };
+    item({ filter: NOTE_TAG_FILTER_ALL, label: "すべてのノート", count: notes.length });
+    rows.forEach(row => {
+      const hidden = noteTagAncestors(row.tag).slice(0, -1).some(tag => !expandedNoteTags.has(noteTagKey(tag)));
+      if (!hidden) item({ filter: row.tag, label: `#${row.name}`, count: row.count, depth: row.depth, row });
+    });
+    if (untagged) item({ filter: NOTE_TAG_FILTER_NONE, label: "タグなし", count: untagged });
+    const title = document.createElement("h4");
+    title.className = "note-tag-pane-title";
+    title.textContent = "タグ";
+    ui.tagPane.replaceChildren(title, tree);
+    if (!rows.length) {
+      const hint = document.createElement("p");
+      hint.className = "note-tag-pane-hint";
+      hint.textContent = "ノートのカードの「タグ」からタグを付けると、ここでタグごとに表示できます。「/」で区切ると入れ子になります。";
+      ui.tagPane.append(hint);
+    }
+  }
+
+  function handleTagPaneClick(event) {
+    const toggle = event.target?.closest?.("button[data-tag-toggle]");
+    if (toggle) {
+      const key = noteTagKey(toggle.dataset.tagToggle);
+      if (expandedNoteTags.has(key)) expandedNoteTags.delete(key); else expandedNoteTags.add(key);
+      saveNoteTagFilter();
+      renderNoteListTools();
+      return;
+    }
+    const button = event.target?.closest?.("button[data-tag-filter]");
+    if (button) setNoteTagFilter(tagFilterFromOptionValue(button.dataset.tagFilter));
+  }
+
+  function noteTagChips(note) {
+    const tags = noteTagsOf(note);
+    if (!tags.length) return null;
+    const line = document.createElement("div");
+    line.className = "note-card-tags";
+    tags.forEach(tag => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "note-tag-chip";
+      chip.textContent = `#${tag}`;
+      chip.title = `「#${tag}」のノートを表示`;
+      chip.addEventListener("click", () => setNoteTagFilter(tag));
+      line.append(chip);
+    });
+    return line;
+  }
+
+  // The tags of the other notes, offered when tags are chosen. An editor tab
+  // reads the notes once (it has no list of its own).
+  let editorKnownNotes = null;
+  async function notesForTagChoices() {
+    if (!dedicatedEditor) return notes;
+    if (!editorKnownNotes) {
+      const session = captureUserSession();
+      assertUserSession(session);
+      editorKnownNotes = await noteStore.listNotes({ expectedUid: session.uid });
+      assertUserSession(session);
+    }
+    return editorKnownNotes;
+  }
+
+  function setTagDialogStatus(message) {
+    if (ui.tagDialogStatus) ui.tagDialogStatus.textContent = String(message || "");
+  }
+
+  async function openTagDialog(note = currentNote) {
+    if (!ui.tagDialog || !note) return;
+    if (currentNote?.id === note.id && !canMutateCurrentNote(currentNote)) return;
+    closeTransientUi();
+    tagDialogState = { noteId: note.id, tags: noteTagsOf(note), choices: [], saving: false };
+    ui.tagDialogNoteName.textContent = `「${note.title || "無題ノート"}」`;
+    ui.tagDialogInput.value = "";
+    setTagDialogStatus("");
+    renderTagDialog();
+    if (!ui.tagDialog.open) ui.tagDialog.showModal?.();
+    try {
+      const state = tagDialogState;
+      const choices = flattenNoteTagTree(buildNoteTagTree(await notesForTagChoices())).map(row => row.tag);
+      if (tagDialogState !== state) return;
+      state.choices = choices;
+      renderTagDialog();
+    } catch (error) {
+      if (error?.name === "NoteSessionChangedError") throw error;
+      console.warn("今あるタグを読み込めませんでした。", error);
+    }
+  }
+
+  function renderTagDialog() {
+    const state = tagDialogState;
+    if (!state || !ui.tagDialogTags) return;
+    ui.tagDialogTags.replaceChildren();
+    if (!state.tags.length) {
+      const empty = document.createElement("li");
+      empty.className = "note-tag-dialog-empty";
+      empty.textContent = "タグはまだ付いていません。";
+      ui.tagDialogTags.append(empty);
+    }
+    state.tags.forEach((tag, index) => {
+      const entry = document.createElement("li");
+      const name = document.createElement("span");
+      name.className = "note-tag-chip static";
+      name.textContent = `#${tag}`;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "note-tag-remove";
+      remove.dataset.tagRemoveIndex = String(index);
+      remove.textContent = "✕";
+      remove.setAttribute("aria-label", `#${tag}を外す`);
+      remove.disabled = state.saving;
+      entry.append(name, remove);
+      ui.tagDialogTags.append(entry);
+    });
+    const taken = new Set(state.tags.map(noteTagKey));
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = state.choices.some(tag => !taken.has(noteTagKey(tag))) ? "選んでください" : "ほかのタグはありません";
+    ui.tagDialogExisting.replaceChildren(placeholder, ...state.choices.filter(tag => !taken.has(noteTagKey(tag))).map(tag => {
+      const option = document.createElement("option");
+      option.value = tag;
+      option.textContent = `${"　".repeat(tag.split("/").length - 1)}#${tag}`;
+      return option;
+    }));
+    ui.tagDialogExisting.value = "";
+    [ui.tagDialogExisting, ui.tagDialogInput, ui.tagDialogAdd, ui.tagDialogSave].forEach(control => {
+      if (control) control.disabled = state.saving;
+    });
+  }
+
+  function addTagToDialog(value) {
+    const state = tagDialogState;
+    if (!state || state.saving) return false;
+    const tag = normalizeNoteTag(value);
+    if (!tag) {
+      setTagDialogStatus(String(value || "").trim() ? "タグは60文字までで入力してください。" : "タグの名前を入力してください。");
+      return false;
+    }
+    if (state.tags.some(item => noteTagKey(item) === noteTagKey(tag))) {
+      setTagDialogStatus(`#${tag} はすでに付いています。`);
+      return false;
+    }
+    if (state.tags.length >= NOTE_TAG_MAX_COUNT) {
+      setTagDialogStatus(`タグは1つのノートに${NOTE_TAG_MAX_COUNT}個まで付けられます。`);
+      return false;
+    }
+    // A tag that differs only in case from one in use takes its spelling.
+    state.tags.push(state.choices.find(item => noteTagKey(item) === noteTagKey(tag)) || tag);
+    setTagDialogStatus("");
+    renderTagDialog();
+    return true;
+  }
+
+  function closeTagDialog() {
+    tagDialogState = null;
+    if (ui.tagDialog?.open) ui.tagDialog.close();
+  }
+
+  async function saveTagDialog() {
+    const state = tagDialogState;
+    if (!state || state.saving) return;
+    // A tag typed but not added yet is added.
+    if (ui.tagDialogInput.value.trim() && !addTagToDialog(ui.tagDialogInput.value)) return;
+    ui.tagDialogInput.value = "";
+    const session = captureUserSession();
+    assertUserSession(session);
+    state.saving = true;
+    renderTagDialog();
+    setTagDialogStatus("保存しています…");
+    try {
+      const saved = await noteStore.setNoteTags(state.noteId, state.tags, session.uid);
+      assertUserSession(session);
+      [notes.find(note => note.id === state.noteId), currentNote?.id === state.noteId ? currentNote : null,
+        editorKnownNotes?.find(note => note.id === state.noteId)]
+        .filter(Boolean).forEach(note => { note.tags = saved; });
+      closeTagDialog();
+      if (dedicatedEditor) {
+        announceNoteChanged(state.noteId);
+        showEditorNotice(saved.length ? `タグを保存しました：${saved.map(tag => `#${tag}`).join("、")}` : "タグを外しました。");
+      } else {
+        renderNoteList();
+        updateNoteListStatus();
+      }
+    } catch (error) {
+      if (error?.name === "NoteSessionChangedError") throw error;
+      state.saving = false;
+      renderTagDialog();
+      setTagDialogStatus(`タグを保存できませんでした：${error.message || error}`);
+    }
+  }
+
+  function openTagManageDialog() {
+    if (!ui.tagManageDialog) return;
+    renderTagManageDialog();
+    if (ui.tagManageStatus) ui.tagManageStatus.textContent = "";
+    if (!ui.tagManageDialog.open) ui.tagManageDialog.showModal?.();
+  }
+
+  function renderTagManageDialog() {
+    if (!ui.tagManageList) return;
+    const rows = flattenNoteTagTree(buildNoteTagTree(notes));
+    ui.tagManageList.replaceChildren();
+    if (!rows.length) {
+      const empty = document.createElement("li");
+      empty.className = "note-tag-dialog-empty";
+      empty.textContent = "タグはまだありません。ノートのカードの「タグ」から付けられます。";
+      ui.tagManageList.append(empty);
+    }
+    rows.forEach(row => {
+      const entry = document.createElement("li");
+      entry.style.setProperty("--tag-depth", String(row.depth));
+      const name = document.createElement("span");
+      name.className = "note-tag-manage-name";
+      name.textContent = `#${row.tag}`;
+      const count = document.createElement("span");
+      count.className = "note-tag-count";
+      count.textContent = `${row.count}件`;
+      entry.append(name, count);
+      [["rename", "名前を変更"], ["delete", "削除"]].forEach(([action, label]) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = action === "delete" ? "btn ng" : "btn";
+        button.dataset.tagManage = action;
+        button.dataset.tag = row.tag;
+        button.textContent = label;
+        button.disabled = tagManageRunning;
+        entry.append(button);
+      });
+      ui.tagManageList.append(entry);
+    });
+  }
+
+  async function runTagManage(action, tag) {
+    if (tagManageRunning || !tag) return;
+    const session = captureUserSession();
+    assertUserSession(session);
+    const count = notes.filter(note => noteTagsOf(note).some(item => isNoteTagWithin(item, tag))).length;
+    let transform;
+    let done;
+    let nextFilter = noteTagFilter;
+    if (action === "rename") {
+      const answer = prompt(`「#${tag}」の新しい名前（「/」で区切ると入れ子になります）`, tag);
+      if (answer == null) return;
+      const target = normalizeNoteTag(answer);
+      if (!target) { alert("タグの名前を60文字までで入力してください。"); return; }
+      if (target === tag) return;
+      if (!confirm(`「#${tag}」（下の階層を含む）を「#${target}」に変えます。${count}件のノートのタグが変わります。`)) return;
+      transform = tags => renameNoteTagInList(tags, tag, target);
+      done = changed => `${changed}件のノートのタグを「#${target}」に変えました。`;
+      if (noteTagFilter && noteTagFilter !== NOTE_TAG_FILTER_NONE && isNoteTagWithin(noteTagFilter, tag)) {
+        nextFilter = renameNoteTagInList([noteTagFilter], tag, target)[0] || NOTE_TAG_FILTER_ALL;
+      }
+    } else {
+      if (!confirm(`「#${tag}」と下の階層のタグを、${count}件のノートから外します。ノートは消えません。`)) return;
+      transform = tags => removeNoteTagFromList(tags, tag);
+      done = changed => `${changed}件のノートから「#${tag}」を外しました。`;
+      if (noteTagFilter && noteTagFilter !== NOTE_TAG_FILTER_NONE && isNoteTagWithin(noteTagFilter, tag)) nextFilter = NOTE_TAG_FILTER_ALL;
+    }
+    tagManageRunning = true;
+    renderTagManageDialog();
+    if (ui.tagManageStatus) ui.tagManageStatus.textContent = "タグを変更しています…";
+    try {
+      const changed = await noteStore.updateTagsOnNotes(transform, session.uid);
+      assertUserSession(session);
+      notes.forEach(note => {
+        const next = normalizeNoteTags(transform(noteTagsOf(note)));
+        if (changed.includes(note.id)) note.tags = next;
+      });
+      noteTagFilter = nextFilter;
+      saveNoteTagFilter();
+      if (ui.tagManageStatus) ui.tagManageStatus.textContent = done(changed.length);
+      renderNoteList();
+      updateNoteListStatus();
+    } catch (error) {
+      if (error?.name === "NoteSessionChangedError") throw error;
+      if (ui.tagManageStatus) ui.tagManageStatus.textContent = `タグを変更できませんでした：${error.message || error}`;
+      // Some batches may have been written: show what the notes now say.
+      void refreshNotes().catch(refreshError => console.warn("ノート一覧を更新できませんでした。", refreshError));
+    } finally {
+      tagManageRunning = false;
+      renderTagManageDialog();
+    }
+  }
+
   function renderNoteList() {
     cancelNoteCardThumbnailQueue();
     ui.list.querySelectorAll("img[data-thumbnail-url]").forEach(image => {
       URL.revokeObjectURL(image.dataset.thumbnailUrl);
     });
     ui.list.replaceChildren();
+    renderNoteListTools();
     orphanedDrafts.forEach(group => {
       const card = document.createElement("article");
       card.className = "note-card note-recovery-card";
@@ -2322,11 +2967,29 @@ export function createStudyNotes(dependencies) {
       card.append(title, meta, actions);
       ui.list.append(card);
     });
-    notes.forEach(note => {
+    const shownNotes = visibleListNotes();
+    if (notes.length && !shownNotes.length) {
+      const empty = document.createElement("p");
+      empty.className = "note-list-empty";
+      empty.textContent = noteSearchQuery.trim()
+        ? "条件に合うノートはありません。検索語やタグを変えてください。"
+        : "このタグのノートはありません。";
+      ui.list.append(empty);
+    }
+    shownNotes.forEach(note => {
       const card = document.createElement("article");
       card.className = "note-card";
       const preview = document.createElement("div"); preview.className = "note-card-preview loading"; preview.textContent = noteTypeLabel(note);
       const title = document.createElement("h4"); title.textContent = note.title || "無題ノート";
+      const tagLine = noteTagChips(note);
+      // A summary note whose changes were not reflected in its sources
+      // (revision 16; its tab was closed without being asked).
+      const pendingPages = isSummaryNote(note) && Array.isArray(note.summaryPendingPageIds) ? note.summaryPendingPageIds.length : 0;
+      const pendingAlert = pendingPages ? document.createElement("p") : null;
+      if (pendingAlert) {
+        pendingAlert.className = "note-card-alert";
+        pendingAlert.textContent = `元ノートに反映していない変更があります（${pendingPages}ページ）。開くと確認できます。`;
+      }
       const meta = document.createElement("div"); meta.className = "note-card-meta";
       const materialMaskCount = note.type === "material-linked"
         ? getMaterials().find(material => material.id === note.sourceMaterialId)?.masks?.length || 0
@@ -2343,15 +3006,17 @@ export function createStudyNotes(dependencies) {
         ["編集", () => openEditorTab(note.id, { material: note.type === "material-linked" })],
         ["暗記", () => openEditorTab(note.id, { study: true, material: note.type === "material-linked" })],
         ["PDF", () => openExportFromList(note.id)],
+        ["タグ", () => openTagDialog(note)],
         ["名前変更", () => renameNote(note)],
         ["複製", () => duplicateNote(note.id)],
         ...(note.hasConflict ? [["競合を解決", () => resolveConflict(note)]] : []),
         ["削除", () => deleteNote(note)]
       ].forEach(([label, action]) => {
         const button = document.createElement("button"); button.type = "button"; button.textContent = label;
+        if (label === "タグ") button.dataset.noteCardAction = "tags";
         button.addEventListener("click", () => Promise.resolve(action()).catch(reportError)); actions.append(button);
       });
-      card.append(preview, title, meta, actions); ui.list.append(card);
+      card.append(...[preview, title, tagLine, meta, pendingAlert, actions].filter(Boolean)); ui.list.append(card);
       preview.tabIndex = 0;
       preview.setAttribute("role", "button");
       preview.setAttribute("aria-label", `${note.title || "無題ノート"}を編集`);
@@ -2553,7 +3218,7 @@ export function createStudyNotes(dependencies) {
     const title = ui.newTitle.value.trim() || "新しい学習ノート";
     const page = blankPage(kind);
     const noteId = await noteStore.createNote({
-      title, type: "standalone", defaultBackground: page.background, pages: [page], expectedUid: session.uid
+      title, type: "standalone", defaultBackground: page.background, pages: [page], tags: tagsForNewNote(), expectedUid: session.uid
     });
     assertUserSession(session);
     openEditorTab(noteId, {}, reservedWindow);
@@ -2650,7 +3315,7 @@ export function createStudyNotes(dependencies) {
       await noteStore.createNote({
         noteId,
         title: `${material.title || "画像教材"} ノート`, type: "material-linked", sourceMaterialId: materialId,
-        isDefaultMaterialNote: true,
+        isDefaultMaterialNote: true, tags: tagsForNewNote(),
         defaultBackground: { ...DEFAULT_BACKGROUND }, pages: notePages, reuseExisting: true, expectedUid: session.uid
       });
       assertUserSession(session);
@@ -2678,7 +3343,7 @@ export function createStudyNotes(dependencies) {
     const creationSignal = createController.signal;
     ui.createProgress.classList.remove("hidden");
     ui.createProgressBar.value = 0;
-    await noteStore.createCreatingNote(noteId, { title, type: "pdf-imported", defaultBackground: { ...DEFAULT_BACKGROUND } }, session.uid);
+    await noteStore.createCreatingNote(noteId, { title, type: "pdf-imported", defaultBackground: { ...DEFAULT_BACKGROUND }, tags: tagsForNewNote() }, session.uid);
     assertUserSession(session);
     // The Storage Emulator (firebase-tools 15.24) sometimes never answers
     // uploads made at the same moment: its rules runtime reads two replies
@@ -2986,10 +3651,13 @@ export function createStudyNotes(dependencies) {
       });
       currentNote.conflicts = localConflicts;
       currentNote.hasConflict = conflictPageIds.size > 0;
-      // A summary note takes the changes of its source pages before it
-      // shows (revision 15). A failure leaves it as it was.
+      // A summary note finds out whether its source pages changed before it
+      // shows (revision 15; since revision 16 the user is asked before it
+      // takes the changes). A failure leaves it as it was.
       summaryOpenNotice = "";
+      clearSummaryTracking();
       if (isSummaryNote(currentNote) && dedicatedEditor) {
+        startSummaryTracking(currentNote);
         summaryOpenNotice = await syncSummaryOnOpen({ session, preferCloud });
         assertUserSession(session);
       }
@@ -3017,6 +3685,10 @@ export function createStudyNotes(dependencies) {
       setStudyMode(study);
       setEditorStartupState("ready");
       if (summaryOpenNotice) showEditorNotice(summaryOpenNotice, { durationMs: 8_000 });
+      // Revision 16: the summary's sources changed, or it was left with
+      // changes not reflected in them.
+      renderSummaryBanner();
+      if (summaryUpdateState.updates.length) openSummaryUpdateDialog();
       startupMetrics.mark("first-visible-page", { canEdit: isEditableNow() });
       startupMetrics.mark("interactive-ready", { canEdit: isEditableNow() });
       markStartupCanEdit();
@@ -3500,6 +4172,32 @@ export function createStudyNotes(dependencies) {
     }
     } finally {
       pageSwitching = false;
+    }
+  }
+
+  // Jumping to a page by its number (revision 16): the page counter opens it.
+  function openPageJumpDialog() {
+    if (!currentNote || !pages.length || !ui.pageJumpDialog || startupState !== "ready") return;
+    if (!prepareEditorAction("ページ移動")) return;
+    closeTransientUi();
+    ui.pageJumpRange.textContent = `（1〜${pages.length}）`;
+    ui.pageJumpInput.max = String(pages.length);
+    ui.pageJumpInput.value = String(currentPageIndex + 1);
+    ui.pageJumpStatus.textContent = "";
+    if (!ui.pageJumpDialog.open) ui.pageJumpDialog.showModal?.();
+    try { ui.pageJumpInput.focus(); ui.pageJumpInput.select(); } catch {}
+  }
+
+  function submitPageJump(event) {
+    event?.preventDefault?.();
+    const number = Number(String(ui.pageJumpInput.value || "").normalize("NFKC").trim());
+    if (!Number.isInteger(number) || number < 1 || number > pages.length) {
+      ui.pageJumpStatus.textContent = `1〜${pages.length}のページ番号を入力してください。`;
+      return;
+    }
+    ui.pageJumpDialog.close();
+    if (number - 1 !== currentPageIndex) {
+      switchPage(number - 1, { direction: number - 1 > currentPageIndex ? "next" : "previous" }).catch(reportError);
     }
   }
 
@@ -6729,6 +7427,10 @@ export function createStudyNotes(dependencies) {
         await noteStore.updateNote(currentNote.id, { summarySourceNoteIds: refs.noteIds, summarySourcePages: refs.pageRefs }, session.uid);
         currentNote.summarySourceNoteIds = refs.noteIds;
         currentNote.summarySourcePages = refs.pageRefs;
+        if (summaryPendingPageIds.delete(page.pageId)) {
+          scheduleSummaryPendingWrite(0);
+          renderSummaryBanner();
+        }
       }
     } catch (error) {
       if (error?.name === "NoteSessionChangedError") throw error;
@@ -6939,12 +7641,18 @@ export function createStudyNotes(dependencies) {
   // a page is drawn again only when what its sources show changed (not for
   // their masks). The summary's own writing and masks are kept; see
   // mergeSummarySlotMasks for the inherited masks.
-  async function syncSummaryNote({ session = captureUserSession(), force = false, live = false, onProgress = () => {} } = {}) {
+  // `dryRun` (revision 16): only finds out what updating would change, so
+  // that the user is asked first. `result.updates` lists the summary pages
+  // it would change; a page whose sources changed in a way it does not show
+  // (its new keys only) is brought up to date at once.
+  async function syncSummaryNote({ session = captureUserSession(), force = false, live = false, dryRun = false, onProgress = () => {} } = {}) {
     assertUserSession(session);
-    if (!currentNote || !isSummaryNote(currentNote) || summarySyncRunning) return null;
+    if (!currentNote || !isSummaryNote(currentNote) || summarySyncRunning || summaryReflectRunning) return null;
     summarySyncRunning = true;
+    renderSummaryBanner();
     const noteId = currentNote.id;
-    const result = { changedPages: 0, failedSlots: 0, missingSlots: 0, skippedPages: 0 };
+    const result = { changedPages: 0, failedSlots: 0, missingSlots: 0, skippedPages: 0, updates: [], conflicts: 0 };
+    const keyUpdates = [];
     const uploaded = [];
     // Once the commit was sent, its pictures stay journaled: if it did not
     // arrive, the cleanup of stale journal entries deletes them later; if it
@@ -6988,7 +7696,8 @@ export function createStudyNotes(dependencies) {
           const loaded = new Map();
           for (const { slot, source } of plan.changed) loaded.set(slot.slotId, await loadSummarySlotData(source, session));
           const redraw = plan.changed.some(({ slot }) => loaded.get(slot.slotId).inkKey !== slot.inkKey);
-          if (redraw) {
+          // Only drawing the picture again needs the other places' sources.
+          if (redraw && !dryRun) {
             for (const slot of plan.page.summary.slots) {
               if (loaded.has(slot.slotId)) continue;
               const source = summarySlotSource(index, slot);
@@ -6999,11 +7708,15 @@ export function createStudyNotes(dependencies) {
           const base = await summaryPageContent(plan.page, { live });
           assertUserSession(session);
           let content = base;
+          let conflicts = 0;
           const changedIds = new Set(plan.changed.map(({ slot }) => slot.slotId));
           const slots = plan.page.summary.slots.map(slot => {
             const data = loaded.get(slot.slotId);
             if (!data) return slot;
-            if (changedIds.has(slot.slotId)) content = mergeSummarySlotMasks(content, slot, data.entries);
+            if (changedIds.has(slot.slotId)) {
+              conflicts += countSummaryMergeConflicts(base, slot, data.entries);
+              content = mergeSummarySlotMasks(content, slot, data.entries);
+            }
             return { ...slot, sourceKey: data.sourceKey, inkKey: data.inkKey };
           });
           const masksChanged = JSON.stringify([content.noteMasks, content.summaryRemovedMasks || []]) !==
@@ -7012,6 +7725,22 @@ export function createStudyNotes(dependencies) {
             slot.sourceKey !== plan.page.summary.slots[slotIndex].sourceKey || slot.inkKey !== plan.page.summary.slots[slotIndex].inkKey
           ));
           if (!redraw && !masksChanged && !keysChanged) continue;
+          if (dryRun) {
+            if (redraw || masksChanged) {
+              result.updates.push({
+                pageId: plan.page.pageId,
+                pageNumber: pages.indexOf(plan.page) + 1,
+                labels: plan.changed.map(({ slot }) => slot.label || "元ページ"),
+                ink: redraw,
+                masks: masksChanged,
+                conflicts
+              });
+              result.conflicts += conflicts;
+            } else {
+              keyUpdates.push({ page: plan.page, fields: { summary: { ...plan.page.summary, slots } } });
+            }
+            continue;
+          }
           let background = plan.page.background;
           if (redraw) {
             const blob = await renderSummaryComposite(plan.page, loaded);
@@ -7028,6 +7757,14 @@ export function createStudyNotes(dependencies) {
           console.warn("まとめページを元ノートから更新できませんでした。", error);
           result.failedSlots += plan.changed.length;
         }
+      }
+      if (dryRun) {
+        if (keyUpdates.length && currentNote?.id === noteId) {
+          await noteStore.commitSummaryPages(noteId, keyUpdates.map(({ page, fields }) => ({ pageId: page.pageId, fields })), {}, session.uid);
+          assertUserSession(session);
+          keyUpdates.forEach(({ page, fields }) => Object.assign(page, fields));
+        }
+        return result;
       }
       if (!updates.length || currentNote?.id !== noteId) return result;
       commitSent = true;
@@ -7050,27 +7787,598 @@ export function createStudyNotes(dependencies) {
           .catch(error => console.warn("使われなかったまとめページ画像を削除できませんでした。", error))));
       }
       summarySyncRunning = false;
+      renderSummaryBanner();
     }
   }
 
-  // Runs while a summary note opens, before its first page shows.
+  // Runs while a summary note opens, before its first page shows: finds out
+  // whether its sources changed (revision 16: the user is asked before the
+  // summary takes the changes).
   async function syncSummaryOnOpen({ session, preferCloud = false }) {
-    if (readOnlyEditor || !hasWriterOwnership()) return "このタブは読み取り専用のため、元ノートの変更は反映していません。";
-    if (preferCloud) return "クラウド版を開いたため、元ノートの変更は反映していません。「•••」→「まとめの元ページ・更新」から反映できます。";
+    if (readOnlyEditor || !hasWriterOwnership()) return "このタブは読み取り専用のため、元ノートの変更は確認していません。";
+    if (preferCloud) return "クラウド版を開いたため、元ノートの変更は確認していません。「•••」→「まとめの元ページ・更新」から更新できます。";
     setEditorStartupState("syncing-summary");
     try {
       const result = await syncSummaryNote({
         session,
-        onProgress: ({ phase, current, total }) => setEditorStartupState("syncing-summary", {
-          detail: phase === "checking" ? "現在の処理：元ノートの変更を確認中" : `現在の処理：元ノートの変更を反映中（${current} / ${total}ページ）`
-        })
+        dryRun: true,
+        onProgress: () => setEditorStartupState("syncing-summary", { detail: "現在の処理：元ノートの変更を確認中" })
       });
-      return summarySyncMessage(result);
+      summaryLastCheckAt = Date.now();
+      setSummaryUpdateState(result);
+      return summaryCheckMessage(result);
+    } catch (error) {
+      if (error?.name === "NoteSessionChangedError") throw error;
+      console.warn("まとめノートの元ノートを確認できませんでした。", error);
+      return `元ノートの変更を確認できませんでした（${error.message || error}）。「•••」→「まとめの元ページ・更新」から更新できます。`;
+    }
+  }
+
+  // ---- Summary notes and their sources, both ways (revision 16) ----
+
+  // What a check found that is not an update to ask about.
+  function summaryCheckMessage(result) {
+    if (!result) return "";
+    const parts = [];
+    if (result.failedSlots) parts.push(`${result.failedSlots}件の元ページを読み込めなかったため、変更を確認できていません。`);
+    if (result.missingSlots) parts.push(`${result.missingSlots}件の元ページが見つかりません（削除されています）。`);
+    if (result.skippedPages) parts.push(`保存競合のある${result.skippedPages}ページは確認していません。`);
+    return parts.join("");
+  }
+
+  function setSummaryUpdateState(result) {
+    if (!result) return;
+    summaryUpdateState = {
+      updates: Array.isArray(result.updates) ? result.updates : [],
+      conflicts: Number(result.conflicts || 0)
+    };
+    renderSummaryBanner();
+  }
+
+  function clearSummaryTracking() {
+    clearTimeout(summaryPendingWriteTimer);
+    summaryPendingWriteTimer = 0;
+    summaryPendingPageIds = new Set();
+    summaryPendingWrittenKey = "";
+    summaryUpdateState = { updates: [], conflicts: 0 };
+    summaryLastCheckAt = 0;
+    summaryBannerDismissed.updates = "";
+    summaryBannerDismissed.pending = "";
+    renderSummaryBanner();
+  }
+
+  // The summary note that opened: its pages that were left with changes not
+  // reflected in their sources.
+  function startSummaryTracking(note) {
+    clearSummaryTracking();
+    if (!note || !isSummaryNote(note)) return;
+    const ids = (Array.isArray(note.summaryPendingPageIds) ? note.summaryPendingPageIds : [])
+      .map(String).filter(pageId => pages.some(page => page.pageId === pageId));
+    summaryPendingPageIds = new Set(ids);
+    summaryPendingWrittenKey = `${note.id}|${[...(Array.isArray(note.summaryPendingPageIds) ? note.summaryPendingPageIds : [])].map(String).sort().join(",")}`;
+    // Pages of the note that are gone leave the mark.
+    if (ids.length !== (note.summaryPendingPageIds || []).length) scheduleSummaryPendingWrite(0);
+  }
+
+  function summaryPendingTrackable() {
+    return Boolean(currentNote && isSummaryNote(currentNote) && dedicatedEditor && !readOnlyEditor && hasWriterOwnership());
+  }
+
+  function observeSummaryPending(noteId, pageId, content) {
+    if (!summaryPendingTrackable() || currentNote.id !== noteId) return;
+    const page = pages.find(item => item.pageId === pageId);
+    if (!isSummaryPage(page)) return;
+    const pending = summaryPendingChanges(page, content).length > 0;
+    if (pending === summaryPendingPageIds.has(pageId)) return;
+    if (pending) summaryPendingPageIds.add(pageId); else summaryPendingPageIds.delete(pageId);
+    scheduleSummaryPendingWrite();
+    renderSummaryBanner();
+  }
+
+  function scheduleSummaryPendingWrite(delayMs = 1_200) {
+    clearTimeout(summaryPendingWriteTimer);
+    summaryPendingWriteTimer = setTimeout(() => {
+      summaryPendingWriteTimer = 0;
+      void flushSummaryPendingWrite().catch(error => {
+        if (error?.name !== "NoteSessionChangedError") console.warn("まとめの未反映の印を保存できませんでした。", error);
+      });
+    }, delayMs);
+  }
+
+  // Writes which pages have changes not reflected, when that changed.
+  function flushSummaryPendingWrite() {
+    clearTimeout(summaryPendingWriteTimer);
+    summaryPendingWriteTimer = 0;
+    const note = currentNote;
+    const session = captureUserSession();
+    if (!note || !isSummaryNote(note) || !session || !summaryPendingTrackable()) return summaryPendingWriteChain;
+    const ids = [...summaryPendingPageIds].filter(pageId => pages.some(page => page.pageId === pageId)).sort();
+    const key = `${note.id}|${ids.join(",")}`;
+    if (key === summaryPendingWrittenKey) return summaryPendingWriteChain;
+    summaryPendingWriteChain = summaryPendingWriteChain.catch(() => {}).then(async () => {
+      if (key === summaryPendingWrittenKey) return;
+      const written = await noteStore.setSummaryPendingPages(note.id, ids, session.uid);
+      summaryPendingWrittenKey = key;
+      note.summaryPendingPageIds = written;
+      announceNoteChanged(note.id);
+    });
+    return summaryPendingWriteChain;
+  }
+
+  // The changes of the summary not reflected in its sources: of the pages
+  // this tab changed or read, and of the pages marked on the note.
+  async function collectSummaryPendingChanges() {
+    const changes = [];
+    for (const [index, page] of pages.entries()) {
+      // A page with a save conflict is settled first (its content is not
+      // the cloud's).
+      if (!isSummaryPage(page) || conflictPageIds.has(page.pageId)) continue;
+      const current = page.pageId === pages[currentPageIndex]?.pageId && currentContent;
+      if (!current && !contentCache.has(page.pageId) && !summaryPendingPageIds.has(page.pageId)) continue;
+      const content = current ? clone(currentContent) : await pageContent(page);
+      const pageChanges = summaryPendingChanges(page, content);
+      // The mark follows what the page now says.
+      if (Boolean(pageChanges.length) !== summaryPendingPageIds.has(page.pageId)) {
+        if (pageChanges.length) summaryPendingPageIds.add(page.pageId); else summaryPendingPageIds.delete(page.pageId);
+        scheduleSummaryPendingWrite(0);
+      }
+      changes.push(...pageChanges.map(change => ({ ...change, summaryPageNumber: index + 1 })));
+    }
+    renderSummaryBanner();
+    return changes;
+  }
+
+  // A row closed with ✕ shows again once what it tells changes.
+  const summaryBannerDismissed = { updates: "", pending: "" };
+  const summaryBannerKeys = () => ({
+    updates: summaryUpdateState.updates.map(update => `${update.pageId}:${update.labels.join(",")}`).join("|"),
+    pending: [...summaryPendingPageIds].sort().join("|")
+  });
+
+  function renderSummaryBanner() {
+    const banner = ui.summaryBanner;
+    if (!banner) return;
+    const summary = Boolean(currentNote && isSummaryNote(currentNote) && dedicatedEditor && startupState === "ready");
+    const keys = summaryBannerKeys();
+    const updates = summary && keys.updates !== summaryBannerDismissed.updates ? summaryUpdateState.updates : [];
+    const pendingPages = summary && summaryPendingTrackable() && keys.pending !== summaryBannerDismissed.pending ? summaryPendingPageIds.size : 0;
+    ui.summaryBannerUpdates?.classList.toggle("hidden", !updates.length);
+    if (updates.length && ui.summaryBannerUpdatesText) {
+      ui.summaryBannerUpdatesText.textContent = `元ノートに更新があります（まとめ ${updates.length}ページ分）`;
+    }
+    ui.summaryBannerPending?.classList.toggle("hidden", !pendingPages);
+    if (pendingPages && ui.summaryBannerPendingText) {
+      ui.summaryBannerPendingText.textContent = `元ノートに反映していない変更があります（まとめ ${pendingPages}ページ）`;
+    }
+    banner.classList.toggle("hidden", !updates.length && !pendingPages);
+    // A check in the background does not stop the buttons (they wait for it).
+    const busy = summaryReflectRunning || (summarySyncRunning && !summaryCheckRunning);
+    banner.querySelectorAll("button").forEach(button => { button.disabled = busy; });
+    ui.summaryPushAction?.classList.toggle("hidden", !summary);
+  }
+
+  function updateLabel(update) {
+    const what = [update.ink ? "書き込み" : "", update.masks ? "マスク" : ""].filter(Boolean).join("・");
+    return `まとめ ${update.pageNumber}ページ：${update.labels.join("、")}${what ? `（${what}）` : ""}`;
+  }
+
+  function setSummaryUpdateDialogBusy(busy) {
+    [ui.summaryUpdateApply, ui.summaryUpdateLater].forEach(button => { if (button) button.disabled = busy; });
+  }
+
+  function openSummaryUpdateDialog() {
+    if (!ui.summaryUpdateDialog || !summaryUpdateState.updates.length) return;
+    if (ui.summaryPushDialog?.open) return;
+    ui.summaryUpdateList.replaceChildren(...summaryUpdateState.updates.map(update => {
+      const item = document.createElement("li");
+      item.textContent = updateLabel(update);
+      return item;
+    }));
+    const conflicts = summaryUpdateState.conflicts;
+    ui.summaryUpdateWarning.classList.toggle("hidden", !conflicts);
+    ui.summaryUpdateWarning.textContent = conflicts
+      ? `まとめで変えたマスク${conflicts}個は、更新すると元ノートの内容に置き換わります（元ノートを優先）。まとめの変更を元ノートに残したいときは「今はしない」を選び、先に「元ノートに反映していない変更」から反映してください。`
+      : "";
+    ui.summaryUpdateStatus.textContent = "";
+    setSummaryUpdateDialogBusy(false);
+    if (!ui.summaryUpdateDialog.open) ui.summaryUpdateDialog.showModal?.();
+  }
+
+  async function applySummaryUpdatesNow() {
+    await settleSummaryCheck();
+    if (!currentNote || !isSummaryNote(currentNote) || summarySyncRunning || summaryReflectRunning) return;
+    if (!canMutateCurrentNote(currentNote)) return;
+    if (!prepareEditorAction("元ノートからの更新")) return;
+    const session = captureUserSession();
+    assertUserSession(session);
+    const inDialog = Boolean(ui.summaryUpdateDialog?.open);
+    const status = message => { if (inDialog) ui.summaryUpdateStatus.textContent = message; };
+    setSummaryUpdateDialogBusy(true);
+    status("元ノートの変更を反映しています…");
+    try {
+      await flushPendingStrokeWork({ render: false, throwOnError: true });
+      selectedIds = [];
+      closeTransientUi();
+      const result = await syncSummaryNote({
+        session,
+        live: true,
+        onProgress: ({ phase, current, total }) => status(phase === "checking"
+          ? "元ノートの変更を確認しています…"
+          : `元ノートの変更を反映しています（${current} / ${total}ページ）…`)
+      });
+      if (!result) return;
+      renderPageList();
+      if (currentContent) renderPage();
+      summaryUpdateState = { updates: [], conflicts: 0 };
+      summaryLastCheckAt = Date.now();
+      if (ui.summaryUpdateDialog?.open) ui.summaryUpdateDialog.close();
+      showEditorNotice(summarySyncMessage(result) || "元ノートからの変更はありませんでした。", { durationMs: 6_000 });
     } catch (error) {
       if (error?.name === "NoteSessionChangedError") throw error;
       console.warn("まとめノートを元ノートから更新できませんでした。", error);
-      return `元ノートの変更を反映できませんでした（${error.message || error}）。「•••」→「まとめの元ページ・更新」から再試行できます。`;
+      status(`元ノートから更新できませんでした：${error.message || error}`);
+      if (!inDialog) showEditorNotice(`元ノートから更新できませんでした：${error.message || error}`, { durationMs: 8_000 });
+    } finally {
+      setSummaryUpdateDialogBusy(false);
+      renderSummaryBanner();
     }
+  }
+
+  // The tab shows again (the user may have edited a source in another tab):
+  // the banner tells whether the sources changed.
+  let summaryHiddenAt = 0;
+  let summaryCheckPromise = null;
+  function recheckSummaryUpdates() {
+    if (!summaryPendingTrackable() || startupState !== "ready") return Promise.resolve();
+    if (summaryCheckRunning || summarySyncRunning || summaryReflectRunning) return Promise.resolve();
+    if (ui.summaryUpdateDialog?.open || ui.summaryPushDialog?.open) return Promise.resolve();
+    if (Date.now() - summaryLastCheckAt < 2_000) return Promise.resolve();
+    const session = captureUserSession();
+    if (!session) return Promise.resolve();
+    summaryCheckRunning = true;
+    summaryCheckPromise = (async () => {
+      try {
+        const result = await syncSummaryNote({ session, dryRun: true, live: true });
+        summaryLastCheckAt = Date.now();
+        if (result) setSummaryUpdateState(result);
+      } catch (error) {
+        if (error?.name === "NoteSessionChangedError") return;
+        console.warn("まとめノートの元ノートを確認できませんでした。", error);
+      } finally {
+        summaryCheckRunning = false;
+      }
+    })();
+    return summaryCheckPromise;
+  }
+
+  // A check that runs in the background is waited for: a button pressed
+  // meanwhile still does its work.
+  async function settleSummaryCheck() {
+    if (summaryCheckRunning && summaryCheckPromise) await summaryCheckPromise.catch(() => {});
+  }
+
+  const SUMMARY_SKIP_REASONS = {
+    removed: "元ノートでこのマスクが削除されています",
+    changed: "元ノートでもこのマスクが変更されています（「元ノートから更新」で元ノートの内容に合わせられます）",
+    locked: "元ノートが別のタブで開かれています（そのタブを閉じてからもう一度お試しください）",
+    "local-changes": "元ノートに、この端末でまだクラウドへ保存されていない変更があります（元ノートを開いて保存を終えてください）",
+    missing: "元ページが見つかりません",
+    conflict: "元ノートが同時に更新されました（もう一度お試しください）",
+    error: "保存できませんでした"
+  };
+
+  function groupBy(list, keyOf) {
+    const groups = new Map();
+    list.forEach(item => {
+      const key = keyOf(item);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(item);
+    });
+    return groups;
+  }
+
+  // Writes `changes` (of the summary's masks) into their source pages, one
+  // source note at a time while holding its editor lock, and makes the
+  // summary follow. A change whose source page is open elsewhere, has
+  // edits of this device not saved yet, or changed the mask itself is not
+  // made (and stays not reflected).
+  async function reflectSummaryChanges(changes) {
+    await settleSummaryCheck();
+    const session = captureUserSession();
+    assertUserSession(session);
+    if (!summaryPendingTrackable()) throw new Error("このタブは読み取り専用のため、元ノートに反映できません。");
+    if (summaryReflectRunning || summarySyncRunning) throw new Error("まとめノートの更新中です。終わってからもう一度お試しください。");
+    summaryReflectRunning = true;
+    renderSummaryBanner();
+    const applied = [];
+    const skipped = [];
+    const changedNotes = new Set();
+    try {
+      await flushPendingStrokeWork({ render: false, throwOnError: true });
+      for (const [noteId, noteChanges] of groupBy(changes, change => change.noteId)) {
+        const skipAll = (list, reason, error = null) => list.forEach(change => skipped.push({ change, reason, error }));
+        if (!noteId || noteId === currentNote?.id) { skipAll(noteChanges, "missing"); continue; }
+        const lease = createNoteEditorLease({ uid: session.uid, noteId, clientInstanceId });
+        let claimed = null;
+        try {
+          claimed = await lease.claim();
+        } catch (error) {
+          lease.dispose();
+          throw error;
+        }
+        if (!claimed?.acquired) {
+          lease.dispose();
+          skipAll(noteChanges, "locked");
+          continue;
+        }
+        try {
+          const [note, sourcePages, local] = await Promise.all([
+            noteStore.getNote(noteId, { expectedUid: session.uid }),
+            noteStore.listPages(noteId, { expectedUid: session.uid }),
+            loadNoteLocalRecords(session.uid, noteId)
+          ]);
+          assertUserSession(session);
+          if (!note || note.deletedAt || (note.status && note.status !== "ready")) { skipAll(noteChanges, "missing"); continue; }
+          const localPageIds = new Set([...local.pendingSaves, ...local.pageDrafts, ...local.conflicts].map(record => record?.pageId).filter(Boolean));
+          for (const [pageId, pageChanges] of groupBy(noteChanges, change => change.sourcePageId)) {
+            const sourcePage = sourcePages.find(page => page.pageId === pageId);
+            if (!sourcePage) { skipAll(pageChanges, "missing"); continue; }
+            if (localPageIds.has(pageId)) { skipAll(pageChanges, "local-changes"); continue; }
+            const content = await noteStore.loadPageContent(noteId, sourcePage, { expectedUid: session.uid });
+            assertUserSession(session);
+            const outcome = applySummaryChangesToSource(content, pageChanges, { createId: randomId });
+            skipped.push(...outcome.skipped);
+            if (!outcome.applied.length) continue;
+            const writer = lease.getIdentity();
+            try {
+              await noteStore.enqueuePageContentSave({
+                noteId,
+                pageId,
+                expectedRevision: Number(sourcePage.contentRevision || 0),
+                expectedUid: session.uid,
+                clientInstanceId,
+                editorTabId: writer.editorTabId,
+                writerSessionId: writer.writerSessionId
+              }, outcome.content);
+              assertUserSession(session);
+              applied.push(...outcome.applied);
+              changedNotes.add(noteId);
+            } catch (error) {
+              if (error?.name === "NoteSessionChangedError") throw error;
+              console.warn("元ノートに反映できませんでした。", error);
+              skipAll(outcome.applied, error?.name === "NoteConflictError" ? "conflict" : "error", error);
+            }
+          }
+        } finally {
+          lease.dispose();
+        }
+      }
+      if (applied.length && currentNote) {
+        for (const [pageId, pageApplied] of groupBy(applied, change => change.pageId)) {
+          const page = pages.find(item => item.pageId === pageId);
+          if (!page) continue;
+          const content = await summaryPageContent(page, { live: true });
+          applySummaryPageContent(page, summaryContentAfterReflect(content, page, pageApplied));
+        }
+        // The history holds the masks as they were before the sources changed.
+        history.clear();
+        if (currentContent) renderPage();
+      }
+      changedNotes.forEach(announceNoteChanged);
+      return { applied, skipped };
+    } finally {
+      summaryReflectRunning = false;
+      renderSummaryBanner();
+    }
+  }
+
+  // Changes kept as the summary's own: not asked about again.
+  async function keepSummaryChangesAsOwn(changes) {
+    for (const [pageId, pageChanges] of groupBy(changes, change => change.pageId)) {
+      const page = pages.find(item => item.pageId === pageId);
+      if (!page) continue;
+      const content = await summaryPageContent(page, { live: true });
+      applySummaryPageContent(page, keepSummaryChangesLocal(content, pageChanges));
+    }
+  }
+
+  function summarySkipText(skipped) {
+    return skipped.map(item => `・${item.change.label || "元ページ"}：${describeSummaryChange(item.change)} — ${SUMMARY_SKIP_REASONS[item.reason] || SUMMARY_SKIP_REASONS.error}`).join("\n");
+  }
+
+  // `mode` "leave": asked when the summary is left (its answer says whether
+  // to leave); "review": opened from the banner or the menu.
+  function openSummaryPushDialog({ mode = "review", changes = [] } = {}) {
+    if (!ui.summaryPushDialog) return Promise.resolve("cancel");
+    if (summaryPushState) finishSummaryPush("cancel");
+    if (ui.summaryUpdateDialog?.open) ui.summaryUpdateDialog.close();
+    return new Promise(resolve => {
+      summaryPushState = { mode, changes, checked: new Set(changes.map(change => change.id)), busy: false, resolve };
+      ui.summaryPushStatus.textContent = "";
+      renderSummaryPushDialog();
+      if (!ui.summaryPushDialog.open) ui.summaryPushDialog.showModal?.();
+    });
+  }
+
+  function finishSummaryPush(decision) {
+    const state = summaryPushState;
+    if (!state) return;
+    summaryPushState = null;
+    if (ui.summaryPushDialog?.open) ui.summaryPushDialog.close();
+    state.resolve(decision);
+  }
+
+  function renderSummaryPushDialog() {
+    const state = summaryPushState;
+    if (!state) return;
+    const leave = state.mode === "leave";
+    ui.summaryPushTitle.textContent = leave ? "元ノートに反映していない変更があります" : "元ノートへの反映";
+    ui.summaryPushLead.textContent = leave
+      ? "まとめで変えたマスクのうち、元ノートにまだ反映していない変更です。反映する変更にチェックを付けてください。反映しなかった変更は、このまとめだけの変更として残り、次からは聞きません。"
+      : "まとめで変えたマスクのうち、元ノートにまだ反映していない変更です。チェックを付けた変更を元ノートに反映するか、このまとめだけの変更にできます。";
+    ui.summaryPushList.replaceChildren();
+    if (!state.changes.length) {
+      const empty = document.createElement("p");
+      empty.className = "note-summary-slot-empty";
+      empty.textContent = "元ノートに反映していない変更はありません。";
+      ui.summaryPushList.append(empty);
+    }
+    for (const [, group] of groupBy(state.changes, change => `${change.pageId}|${change.slotId}`)) {
+      const fieldset = document.createElement("fieldset");
+      const legend = document.createElement("legend");
+      legend.textContent = `${group[0].label || "元ページ"}（まとめ ${group[0].summaryPageNumber || "?"}ページ）`;
+      fieldset.append(legend);
+      group.forEach(change => {
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.dataset.summaryChangeId = change.id;
+        input.checked = state.checked.has(change.id);
+        input.disabled = state.busy;
+        label.append(input, document.createTextNode(` ${describeSummaryChange(change)}`));
+        fieldset.append(label);
+      });
+      ui.summaryPushList.append(fieldset);
+    }
+    const chosen = state.changes.filter(change => state.checked.has(change.id)).length;
+    const button = action => ui.summaryPushDialog.querySelector(`[data-summary-push="${action}"]`);
+    button("apply").textContent = leave ? "選んだ変更を反映して戻る" : "選んだ変更を元ノートに反映";
+    button("local").textContent = leave ? "反映しないで戻る" : "選んだ変更をまとめだけにする";
+    button("cancel").textContent = leave ? "キャンセル" : "閉じる";
+    button("apply").disabled = state.busy || !chosen;
+    button("local").disabled = state.busy || (!leave && !chosen);
+    button("cancel").disabled = state.busy;
+  }
+
+  async function handleSummaryPushAction(action) {
+    const state = summaryPushState;
+    if (!state || state.busy) return;
+    if (action === "cancel") {
+      finishSummaryPush("cancel");
+      return;
+    }
+    const leave = state.mode === "leave";
+    const chosen = state.changes.filter(change => state.checked.has(change.id));
+    const others = state.changes.filter(change => !state.checked.has(change.id));
+    const setBusy = busy => { state.busy = busy; renderSummaryPushDialog(); };
+    if (action === "local") {
+      const target = leave ? state.changes : chosen;
+      setBusy(true);
+      try {
+        await keepSummaryChangesAsOwn(target);
+      } catch (error) {
+        setBusy(false);
+        ui.summaryPushStatus.textContent = `まとめだけの変更にできませんでした：${error.message || error}`;
+        if (error?.name === "NoteSessionChangedError") throw error;
+        return;
+      }
+      if (leave || !others.length) {
+        finishSummaryPush("local");
+        if (!leave) showEditorNotice(`${target.length}件の変更を、このまとめだけの変更にしました。`);
+        return;
+      }
+      state.changes = others;
+      state.checked = new Set(others.map(change => change.id));
+      setBusy(false);
+      ui.summaryPushStatus.textContent = `${target.length}件の変更を、このまとめだけの変更にしました。`;
+      return;
+    }
+    if (action !== "apply" || !chosen.length) return;
+    setBusy(true);
+    ui.summaryPushStatus.textContent = "元ノートに反映しています…";
+    let result;
+    try {
+      result = await reflectSummaryChanges(chosen);
+    } catch (error) {
+      setBusy(false);
+      ui.summaryPushStatus.textContent = `元ノートに反映できませんでした：${error.message || error}`;
+      if (error?.name === "NoteSessionChangedError") throw error;
+      return;
+    }
+    const failed = result.skipped.map(item => item.change);
+    const failedIds = new Set(failed.map(change => change.id));
+    const reflectedText = `${result.applied.length}件の変更を元ノートに反映しました。`;
+    if (!failed.length) {
+      // Leaving: the changes not chosen stay the summary's own.
+      if (leave && others.length) {
+        try { await keepSummaryChangesAsOwn(others); }
+        catch (error) {
+          setBusy(false);
+          ui.summaryPushStatus.textContent = `${reflectedText}残りの変更をまとめだけの変更にできませんでした：${error.message || error}`;
+          return;
+        }
+      }
+      if (leave || !others.length) {
+        finishSummaryPush("applied");
+        if (!leave) showEditorNotice(reflectedText, { durationMs: 6_000 });
+        return;
+      }
+    }
+    // What is left: the changes that could not be reflected (chosen) and
+    // the ones not chosen.
+    state.changes = state.changes.filter(change => failedIds.has(change.id) || !state.checked.has(change.id));
+    state.checked = new Set(failed.map(change => change.id));
+    setBusy(false);
+    ui.summaryPushStatus.textContent = failed.length
+      ? `${reflectedText}次の変更は反映できませんでした。\n${summarySkipText(result.skipped)}`
+      : reflectedText;
+  }
+
+  // Asked when the summary note is left (revision 16). Resolves true to
+  // leave.
+  async function confirmLeavingSummary() {
+    if (!summaryPendingTrackable()) return true;
+    await flushPendingStrokeWork({ render: false, throwOnError: true });
+    const changes = await collectSummaryPendingChanges();
+    if (changes.length) {
+      const decision = await openSummaryPushDialog({ mode: "leave", changes });
+      if (decision === "cancel") return false;
+    }
+    await flushSummaryPendingWrite().catch(error => {
+      if (error?.name === "NoteSessionChangedError") throw error;
+      console.warn("まとめの未反映の印を保存できませんでした。", error);
+    });
+    return true;
+  }
+
+  async function openSummaryPushReview() {
+    if (!currentNote || !isSummaryNote(currentNote)) return;
+    if (!summaryPendingTrackable()) { explainBlockedEdit(); return; }
+    if (!prepareEditorAction("元ノートへの反映")) return;
+    closeTransientUi();
+    await flushPendingStrokeWork({ render: false, throwOnError: true });
+    const changes = await collectSummaryPendingChanges();
+    if (!changes.length) {
+      showEditorNotice("元ノートに反映していない変更はありません。");
+      return;
+    }
+    await openSummaryPushDialog({ mode: "review", changes });
+  }
+
+  // The changes of the masks chosen on the page shown.
+  function selectedSummaryChanges() {
+    const page = pages[currentPageIndex];
+    if (!currentContent || !isSummaryPage(page) || !summaryPendingTrackable()) return [];
+    const chosen = new Set(selectedIds);
+    return summaryPendingChanges(page, currentContent)
+      .filter(change => change.kind !== "delete" && chosen.has(change.maskId))
+      .map(change => ({ ...change, summaryPageNumber: currentPageIndex + 1 }));
+  }
+
+  async function reflectSelectedMasks() {
+    const changes = selectedSummaryChanges();
+    if (!changes.length) {
+      showEditorNotice("選んだマスクには、元ノートに反映する変更がありません。");
+      return;
+    }
+    if (!confirm(`選んだマスクの変更${changes.length}件を元ノートに反映しますか？\n${changes.map(change => `・${change.label || "元ページ"}：${describeSummaryChange(change)}`).join("\n")}`)) return;
+    closeTransientUi();
+    const result = await reflectSummaryChanges(changes);
+    selectedIds = [];
+    renderPage();
+    showEditorNotice(result.skipped.length
+      ? `${result.applied.length}件を反映しました。反映できなかった変更：\n${summarySkipText(result.skipped)}`
+      : `${result.applied.length}件の変更を元ノートに反映しました。`, { durationMs: result.skipped.length ? 10_000 : 6_000 });
   }
 
   function setSummaryDialogStatus(message) {
@@ -7136,7 +8444,8 @@ export function createStudyNotes(dependencies) {
   }
 
   async function refreshSummaryFromSources() {
-    if (!currentNote || !isSummaryNote(currentNote) || summarySyncRunning) return;
+    await settleSummaryCheck();
+    if (!currentNote || !isSummaryNote(currentNote) || summarySyncRunning || summaryReflectRunning) return;
     if (!canMutateCurrentNote(currentNote)) return;
     if (!prepareEditorAction("元ノートからの更新")) return;
     const session = captureUserSession();
@@ -7156,6 +8465,11 @@ export function createStudyNotes(dependencies) {
       });
       renderPageList();
       if (currentContent) renderPage();
+      if (result) {
+        summaryUpdateState = { updates: [], conflicts: 0 };
+        summaryLastCheckAt = Date.now();
+        renderSummaryBanner();
+      }
       setSummaryDialogStatus(summarySyncMessage(result) || "元ノートからの変更はありませんでした。");
     } catch (error) {
       setSummaryDialogStatus(`元ノートから更新できませんでした：${error.message || error}`);
@@ -7170,9 +8484,10 @@ export function createStudyNotes(dependencies) {
   // masks go. The summary's own writing and masks stay; the source note is
   // not changed (and can be deleted afterwards).
   async function removeSummarySlot(slotId) {
+    await settleSummaryCheck();
     const page = pages[currentPageIndex];
     const slot = isSummaryPage(page) ? page.summary.slots.find(item => item.slotId === slotId) : null;
-    if (!slot || summarySyncRunning) return;
+    if (!slot || summarySyncRunning || summaryReflectRunning) return;
     if (!canMutateCurrentNote(currentNote, { page, allowConflict: false })) return;
     if (!prepareEditorAction("まとめから外す操作")) return;
     if (!confirm(`「${slot.label || "元ページ"}」をこのまとめから外しますか？\n元ノートは変わりません。このページからその元ページの画像とマスクを取り除きます（まとめに書いた内容はそのまま残ります）。`)) return;
@@ -7242,7 +8557,11 @@ export function createStudyNotes(dependencies) {
     url.searchParams.set("noteEditor", "1");
     url.searchParams.set("create", "summary");
     url.searchParams.set("creationSessionId", randomId());
-    ["noteId", "editorTabId", "study", "material", "noteStartupAt", "page"].forEach(name => url.searchParams.delete(name));
+    ["noteId", "editorTabId", "study", "material", "noteStartupAt", "page", "tag"].forEach(name => url.searchParams.delete(name));
+    // The tag the list shows: the summary note gets it, and the marked pages
+    // of its notes are chosen first (revision 16).
+    const [tag] = tagsForNewNote();
+    if (tag) url.searchParams.set("tag", tag);
     return url;
   }
 
@@ -7280,9 +8599,20 @@ export function createStudyNotes(dependencies) {
     };
   }
 
+  // The pages a summary is made of are chosen as the study screen's subject
+  // is (revision 16): a tag, then a note; the marked pages of the notes left
+  // are all chosen, and any can be left out.
+  function summaryScopeSources(tag = summaryPicker.tag, noteId = summaryPicker.noteId) {
+    return summaryPicker.sources.filter(source => matchesNoteTagFilter(source.note, tag) && (!noteId || source.note.id === noteId));
+  }
+
+  function applySummaryScope() {
+    summaryPicker.selected = summaryScopeSources().flatMap(source => source.items).slice(0, SUMMARY_MAX_SOURCE_PAGES);
+  }
+
   async function loadSummaryPicker(session = captureUserSession()) {
     if (!ui.summaryPicker || !session) return;
-    summaryPicker = { sources: [], selected: [], loading: true, error: "", creating: false, options: { ...SUMMARY_DEFAULT_OPTIONS } };
+    summaryPicker = { sources: [], selected: [], loading: true, error: "", creating: false, options: { ...SUMMARY_DEFAULT_OPTIONS }, tag: NOTE_TAG_FILTER_ALL, noteId: "" };
     renderSummaryPicker();
     try {
       const documents = await noteStore.listNoteDocuments({ expectedUid: session.uid });
@@ -7299,7 +8629,13 @@ export function createStudyNotes(dependencies) {
       }));
       assertUserSession(session);
       summaryPicker.sources = sources.filter(Boolean);
-      summaryPicker.selected = summaryPicker.sources.flatMap(source => source.items).slice(0, SUMMARY_MAX_SOURCE_PAGES);
+      // The tag the note list showed, when its notes have marked pages.
+      const [listTag] = tagsForNewNote();
+      const tagRow = listTag
+        ? flattenNoteTagTree(buildNoteTagTree(summaryPicker.sources.map(source => source.note))).find(row => noteTagKey(row.tag) === noteTagKey(listTag))
+        : null;
+      summaryPicker.tag = tagRow ? tagRow.tag : NOTE_TAG_FILTER_ALL;
+      applySummaryScope();
     } catch (error) {
       if (error?.name === "NoteSessionChangedError") throw error;
       summaryPicker.error = error.message || String(error);
@@ -7339,12 +8675,53 @@ export function createStudyNotes(dependencies) {
     }
     const selectedKeys = new Set(summaryPicker.selected.map(item => item.key));
     const full = summaryPicker.selected.length >= SUMMARY_MAX_SOURCE_PAGES;
+    // The tag and note pull-downs (revision 16).
+    const pageCount = list => list.reduce((sum, source) => sum + source.items.length, 0);
+    const scope = document.createElement("section");
+    scope.className = "note-summary-scope";
+    const scopeSelect = (title, name, options, current) => {
+      const label = document.createElement("label");
+      label.className = "field-group";
+      const caption = document.createElement("span");
+      caption.textContent = title;
+      const select = document.createElement("select");
+      select.dataset.summaryScope = name;
+      select.disabled = summaryPicker.creating;
+      options.forEach(([value, text]) => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = text;
+        select.append(option);
+      });
+      select.value = current;
+      label.append(caption, select);
+      return label;
+    };
+    const allNotes = summaryPicker.sources.map(source => source.note);
+    const tagRows = flattenNoteTagTree(buildNoteTagTree(allNotes));
+    const untaggedSources = summaryPicker.sources.filter(source => noteTagsOf(source.note).length === 0);
+    scope.append(
+      scopeSelect("タグ", "tag", [
+        ["all", `すべてのタグ（${pageCount(summaryPicker.sources)}ページ）`],
+        ...tagRows.map(row => [`tag:${row.tag}`, `${"　".repeat(row.depth)}${row.depth ? "└ " : ""}#${row.name}（${pageCount(summaryScopeSources(row.tag, ""))}ページ）`]),
+        ...(untaggedSources.length ? [["none", `タグなし（${pageCount(untaggedSources)}ページ）`]] : [])
+      ], tagFilterOptionValue(summaryPicker.tag)),
+      scopeSelect("ノート", "note", [
+        ["", `すべてのノート（${pageCount(summaryScopeSources(summaryPicker.tag, ""))}ページ）`],
+        ...summaryScopeSources(summaryPicker.tag, "").map(source => [source.note.id, `${source.note.title || "無題ノート"}（${source.items.length}ページ）`])
+      ], summaryPicker.noteId)
+    );
     const sources = document.createElement("section");
     sources.className = "note-summary-sources";
     const sourcesTitle = document.createElement("h4");
-    sourcesTitle.textContent = "「テストに出る」ページ";
+    const scopeSources = summaryScopeSources();
+    const scopePages = pageCount(scopeSources);
+    sourcesTitle.textContent = `「テストに出る」ページ（${scopePages}ページ）`;
     sources.append(sourcesTitle);
-    summaryPicker.sources.forEach(source => {
+    if (scopePages > SUMMARY_MAX_SOURCE_PAGES) {
+      sources.append(paragraph(`1つのまとめノートに使えるのは${SUMMARY_MAX_SOURCE_PAGES}ページまでです。最初の${SUMMARY_MAX_SOURCE_PAGES}ページを選んでいます。`, "note-summary-limit"));
+    }
+    scopeSources.forEach(source => {
       const group = document.createElement("fieldset");
       group.className = "note-summary-source";
       const legend = document.createElement("legend");
@@ -7423,12 +8800,36 @@ export function createStudyNotes(dependencies) {
     create.dataset.summaryPickerAction = "create";
     create.textContent = "まとめノートを作成";
     create.disabled = summaryPicker.creating || !count;
-    root.append(sources, order, options, result, create);
+    // Two columns on a wide screen; the result and the button stay in view
+    // at the bottom while the lists scroll (revision 16).
+    const choose = document.createElement("div");
+    choose.className = "note-summary-column";
+    choose.append(scope, sources);
+    const arrange = document.createElement("div");
+    arrange.className = "note-summary-column";
+    // The settings above the (long) order, so that they show without scrolling.
+    arrange.append(options, order);
+    const footer = document.createElement("div");
+    footer.className = "note-summary-footer";
+    footer.append(result, create);
+    root.append(choose, arrange, footer);
   }
 
   function handleSummaryPickerEvent(event) {
     if (summaryPicker.creating || summaryPicker.loading) return;
     const target = event.target;
+    if (event.type === "change" && target?.matches?.("select[data-summary-scope]")) {
+      if (target.dataset.summaryScope === "tag") {
+        summaryPicker.tag = tagFilterFromOptionValue(target.value);
+        // A note that the tag leaves out is no longer chosen.
+        if (!summaryScopeSources(summaryPicker.tag, "").some(source => source.note.id === summaryPicker.noteId)) summaryPicker.noteId = "";
+      } else {
+        summaryPicker.noteId = String(target.value || "");
+      }
+      applySummaryScope();
+      renderSummaryPicker();
+      return;
+    }
     if (event.type === "change" && target?.matches?.('input[type="checkbox"][data-summary-key]')) {
       const key = target.dataset.summaryKey;
       if (target.checked) {
@@ -7517,6 +8918,7 @@ export function createStudyNotes(dependencies) {
         summary: { version: SUMMARY_VERSION, perPage: options.perPage, memo: options.memo, createdAt: new Date().toISOString() },
         summarySourceNoteIds: refs.noteIds,
         summarySourcePages: refs.pageRefs,
+        tags: tagsForNewNote(),
         pages: notePages,
         deferReady: true,
         expectedUid: session.uid
@@ -7780,6 +9182,10 @@ export function createStudyNotes(dependencies) {
 
   function selectionAction(action) {
     if (!isEditableNow()) { explainBlockedEdit(); return; }
+    if (action === "reflect-source") {
+      reflectSelectedMasks().catch(reportError);
+      return;
+    }
     if (action === "select-page-masks") {
       selectedIds = currentContent.noteMasks.map(mask => mask.id);
       maskEditMode = true;
@@ -8015,17 +9421,22 @@ export function createStudyNotes(dependencies) {
     assertUserSession(session);
     if (guardedNote && !canMutateCurrentNote(guardedNote)) return null;
     const newPages = sourcePages.map((page, index) => ({ ...clone(page), pageId: randomId(), order: index + 1, contentRevision: 0, contentPath: "", contentHash: "" }));
-    // A copied summary note is a summary note of its own (revision 15).
+    // A copied summary note is a summary note of its own (revision 15),
+    // with the same changes not reflected in the sources (revision 16).
+    const newPageIds = new Map(sourcePages.map((page, index) => [page.pageId, newPages[index].pageId]));
     const summaryFields = isSummaryNote(sourceNote)
       ? {
         summary: clone(sourceNote.summary),
         summarySourceNoteIds: [...(sourceNote.summarySourceNoteIds || [])],
-        summarySourcePages: [...(sourceNote.summarySourcePages || [])]
+        summarySourcePages: [...(sourceNote.summarySourcePages || [])],
+        summaryPendingPageIds: (Array.isArray(sourceNote.summaryPendingPageIds) ? sourceNote.summaryPendingPageIds : [])
+          .map(pageId => newPageIds.get(pageId)).filter(Boolean)
       }
       : {};
     const newId = await noteStore.createNote({
       title: `${sourceNote.title || "無題ノート"} のコピー`, type: sourceNote.type,
       sourceMaterialId: sourceNote.sourceMaterialId || null, defaultBackground: sourceNote.defaultBackground || DEFAULT_BACKGROUND,
+      tags: noteTagsOf(sourceNote),
       ...summaryFields,
       pages: newPages,
       deferReady: true,
@@ -8102,6 +9513,8 @@ export function createStudyNotes(dependencies) {
       defaultBackground: DEFAULT_BACKGROUND,
       recoveredFromNoteId: sourceNoteId,
       recoveredAt: new Date().toISOString(),
+      // The copy stays where its note was in the tag tree (revision 16).
+      tags: noteTagsOf(sourceNote),
       pages: copyPages,
       deferReady: true,
       expectedUid: session.uid
@@ -8586,6 +9999,9 @@ export function createStudyNotes(dependencies) {
     cancelActiveInteraction("close");
     cancelCropEditor({ restore: true });
     closeTransientUi();
+    // A summary note asks about changes not reflected in its sources first
+    // (revision 16).
+    if (currentNote && !await confirmLeavingSummary()) return;
     if (currentNote && !await flushAllWithDecision("ノート一覧へ戻る操作")) return;
     editorLease?.release();
     if (dedicatedEditor) {
@@ -8604,6 +10020,7 @@ export function createStudyNotes(dependencies) {
     closeTransientUi();
     if (currentNote && !await flushAllWithDecision("ノートを閉じる操作")) return;
     editorLease?.release();
+    clearSummaryTracking();
     currentNote = null; pages = []; currentContent = null; selectedIds = []; history.clear();
     contentLoadPromises.clear(); backgroundBlobCache.clear(); backgroundBlobPromises.clear();
     resetPageRender(); cancelPageThumbnailQueue(); cancelNoteCardThumbnailQueue(); releaseThumbnailUrls(); thumbnailTokens.clear(); zoomController?.destroy(); zoomController = null;
@@ -8625,6 +10042,9 @@ export function createStudyNotes(dependencies) {
     pendingLocalSavePromises.clear();
     pendingAssetRecoveryPromises.clear(); pendingRecoveryPromises.clear(); pendingRecoverySweeps.clear();
     editorLease?.dispose(); editorLease = null;
+    clearSummaryTracking();
+    if (summaryPushState) finishSummaryPush("cancel");
+    noteTagFilterLoadedFor = ""; noteTagFilter = NOTE_TAG_FILTER_ALL; editorKnownNotes = null; tagDialogState = null;
     currentNote = null; pages = []; currentContent = null; notes = []; orphanedDrafts = []; contentCache.clear(); assetCache.clear();
     contentLoadPromises.clear(); backgroundBlobCache.clear(); backgroundBlobPromises.clear();
     selectedIds = []; activeTouchPointerIds.clear(); swipeGesture = null; activeGesture = null;
@@ -8958,6 +10378,108 @@ export function createStudyNotes(dependencies) {
     // must not be edited at the same time.
     ui.summaryDialog?.addEventListener("cancel", event => {
       if (summarySyncRunning) event.preventDefault();
+    });
+    // Revision 16: tags of the note list.
+    ui.tagFilterSelect?.addEventListener("change", () => setNoteTagFilter(tagFilterFromOptionValue(ui.tagFilterSelect.value)));
+    ui.tagPane?.addEventListener("click", handleTagPaneClick);
+    let searchTimer = 0;
+    ui.searchInput?.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        noteSearchQuery = ui.searchInput.value;
+        renderNoteList();
+        updateNoteListStatus();
+      }, 150);
+    });
+    ui.tagManageButton?.addEventListener("click", openTagManageDialog);
+    ui.tagManageClose?.addEventListener("click", () => ui.tagManageDialog?.close());
+    ui.tagManageDialog?.addEventListener("cancel", event => { if (tagManageRunning) event.preventDefault(); });
+    ui.tagManageList?.addEventListener("click", event => {
+      const button = event.target?.closest?.("button[data-tag-manage]");
+      if (button && !button.disabled) runTagManage(button.dataset.tagManage, button.dataset.tag).catch(reportError);
+    });
+    ui.tagDialogTags?.addEventListener("click", event => {
+      const button = event.target?.closest?.("button[data-tag-remove-index]");
+      if (!button || !tagDialogState || tagDialogState.saving) return;
+      tagDialogState.tags.splice(Number(button.dataset.tagRemoveIndex), 1);
+      setTagDialogStatus("");
+      renderTagDialog();
+    });
+    ui.tagDialogExisting?.addEventListener("change", () => {
+      if (ui.tagDialogExisting.value) addTagToDialog(ui.tagDialogExisting.value);
+    });
+    const addTypedTag = () => { if (addTagToDialog(ui.tagDialogInput.value)) ui.tagDialogInput.value = ""; };
+    ui.tagDialogAdd?.addEventListener("click", addTypedTag);
+    ui.tagDialogInput?.addEventListener("keydown", event => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      addTypedTag();
+    });
+    ui.tagDialogSave?.addEventListener("click", () => saveTagDialog().catch(reportError));
+    ui.tagDialogCancel?.addEventListener("click", closeTagDialog);
+    ui.tagDialog?.addEventListener("cancel", event => {
+      if (tagDialogState?.saving) event.preventDefault();
+      else tagDialogState = null;
+    });
+    byId("noteTagDialogForm")?.addEventListener("submit", event => event.preventDefault());
+    // Revision 16: the page number to jump to.
+    ui.pageCounter?.addEventListener("click", openPageJumpDialog);
+    ui.pageCounter?.addEventListener("keydown", event => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      openPageJumpDialog();
+    });
+    ui.pageJumpForm?.addEventListener("submit", submitPageJump);
+    ui.pageJumpCancel?.addEventListener("click", () => ui.pageJumpDialog?.close());
+    // Revision 16: a summary note and its sources, both ways.
+    ui.summaryBanner?.addEventListener("click", event => {
+      const action = event.target?.closest?.("button[data-summary-banner]")?.dataset.summaryBanner;
+      if (action === "update") applySummaryUpdatesNow().catch(reportError);
+      if (action === "update-details") openSummaryUpdateDialog();
+      if (action === "push") openSummaryPushReview().catch(reportError);
+      if (action === "dismiss-updates" || action === "dismiss-pending") {
+        const keys = summaryBannerKeys();
+        if (action === "dismiss-updates") summaryBannerDismissed.updates = keys.updates;
+        else summaryBannerDismissed.pending = keys.pending;
+        renderSummaryBanner();
+      }
+    });
+    ui.summaryUpdateApply?.addEventListener("click", () => applySummaryUpdatesNow().catch(reportError));
+    ui.summaryUpdateLater?.addEventListener("click", () => {
+      if (!summarySyncRunning) ui.summaryUpdateDialog?.close();
+    });
+    ui.summaryUpdateDialog?.addEventListener("cancel", event => { if (summarySyncRunning) event.preventDefault(); });
+    ui.summaryUpdateDialog?.addEventListener("close", renderSummaryBanner);
+    ui.summaryPushDialog?.addEventListener("click", event => {
+      const action = event.target?.closest?.("button[data-summary-push]")?.dataset.summaryPush;
+      if (action) handleSummaryPushAction(action).catch(reportError);
+    });
+    ui.summaryPushList?.addEventListener("change", event => {
+      const input = event.target?.closest?.("input[data-summary-change-id]");
+      if (!input || !summaryPushState || summaryPushState.busy) return;
+      if (input.checked) summaryPushState.checked.add(input.dataset.summaryChangeId);
+      else summaryPushState.checked.delete(input.dataset.summaryChangeId);
+      renderSummaryPushDialog();
+    });
+    ui.summaryPushDialog?.addEventListener("cancel", event => {
+      event.preventDefault();
+      if (!summaryPushState?.busy) finishSummaryPush("cancel");
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        summaryHiddenAt = Date.now();
+        void flushSummaryPendingWrite().catch(() => {});
+        return;
+      }
+      if (summaryHiddenAt && Date.now() - summaryHiddenAt > 500) void recheckSummaryUpdates();
+    });
+    globalThis.addEventListener?.("focus", () => { void recheckSummaryUpdates(); });
+    // A desktop browser asks before a tab with changes not reflected closes
+    // (iPad Safari does not: the note list and the next opening tell then).
+    globalThis.addEventListener?.("beforeunload", event => {
+      if (leavingEditorOnPurpose || !summaryPendingTrackable() || !summaryPendingPageIds.size) return;
+      event.preventDefault();
+      event.returnValue = "";
     });
     ui.closeNote.addEventListener("click", () => returnToNoteList().catch(reportError));
     ui.lockReadOnly.addEventListener("click", () => {
@@ -9526,6 +11048,9 @@ export function createStudyNotes(dependencies) {
       const action = button.dataset.noteAction;
       if (action === "export") openExportDialog();
       if (action === "summary-sources") openSummaryDialog();
+      if (action === "summary-push") openSummaryPushReview().catch(reportError);
+      if (action === "tags") openTagDialog(currentNote).catch(reportError);
+      if (action === "page-jump") openPageJumpDialog();
       if (action === "rename") renameNote().catch(reportError);
       if (action === "duplicate") duplicateNote(currentNote.id).catch(reportError);
       if (action === "delete") deleteNote().catch(reportError);

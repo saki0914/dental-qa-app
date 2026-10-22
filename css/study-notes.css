@@ -628,10 +628,12 @@ body.note-editor-dedicated .local-environment-details{
 }
 .note-more-menu>div,.note-save-popover,body.note-editor-dedicated .local-environment-details{z-index:170}
 @media(max-width:820px){
+  /* The page counter stays on an iPad held upright: it opens the page
+     number to jump to (revision 16). */
   .note-editor>.note-editor-header{
-    grid-template-columns:44px minmax(64px,1fr) repeat(3,44px) 100px 84px 44px 54px 44px;
+    grid-template-columns:44px minmax(64px,1fr) 56px repeat(3,44px) 100px 84px 44px 54px 44px;
   }
-  .note-editor>.note-editor-header .note-page-counter{display:none}
+  .note-editor>.note-editor-header .note-page-counter{display:block;inline-size:56px;font-size:.78rem}
 }
 @media(max-width:680px){
   .note-editor>.note-editor-header{
@@ -639,7 +641,8 @@ body.note-editor-dedicated .local-environment-details{
   }
   .note-editor>.note-editor-header #noteUndoBtn,
   .note-editor>.note-editor-header #noteRedoBtn,
-  .note-editor>.note-editor-header .note-editor-local-slot{display:none}
+  .note-editor>.note-editor-header .note-editor-local-slot,
+  .note-editor>.note-editor-header .note-page-counter{display:none}
 }
 
 /* Masks look like the image memory screen's masks (.pdf-mask in app.css):
@@ -844,3 +847,93 @@ body.note-editor-dedicated .local-environment-details{
 .note-summary-slot-empty{color:#64748b}
 .note-summary-dialog-status{min-height:1.4em;margin:0;color:#1e3a8a}
 .note-summary-dialog.is-busy{cursor:progress}
+
+/* Revision 16: tags of the note list, the page number to jump to, summary
+   notes reflected in their sources, and the summary creation screen that
+   scrolls in either orientation. */
+.note-list-tools{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin:12px 0 4px}
+.note-list-tools label{display:grid;gap:4px;font-size:.85rem;color:#475569}
+.note-list-tools select,.note-list-tools input{min-height:42px;box-sizing:border-box}
+.note-list-search{flex:1 1 220px}
+.note-list-search input{width:100%}
+.note-list-tag-select{display:none!important;flex:1 1 200px}
+.note-list-tag-select select{width:100%}
+.note-list-tools .btn{width:auto;flex:0 0 auto;min-height:42px;padding:8px 16px}
+/* The card's actions keep their words on one line (a seventh, タグ, came). */
+.note-card-actions button{flex:1 0 auto;white-space:nowrap;padding:0 10px}
+.note-list-body{display:grid;grid-template-columns:minmax(170px,220px) minmax(0,1fr);gap:16px;align-items:start}
+.note-list-body .note-card-grid{margin-top:0}
+.note-tag-pane{position:sticky;top:12px;max-height:calc(100dvh - 40px);overflow:auto;box-sizing:border-box;padding:10px 8px;border:1px solid #dbe2ea;border-radius:14px;background:#f8fafc}
+.note-tag-pane-title{margin:0 0 6px 6px;font-size:.9rem;color:#334155}
+.note-tag-pane-hint{margin:8px 6px 0;font-size:.75rem;line-height:1.5;color:#64748b}
+.note-tag-tree{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+.note-tag-tree li{display:flex;align-items:center;min-width:0;padding-left:calc(var(--tag-depth,0) * 14px)}
+.note-tag-toggle,.note-tag-toggle-spacer{flex:0 0 26px;width:26px}
+.note-tag-toggle{min-height:36px;padding:0;border:0;border-radius:6px;background:transparent;color:#475569}
+.note-tag-item{flex:1 1 auto;display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0;min-height:36px;padding:4px 8px;border:0;border-radius:8px;background:transparent;color:#0f172a;text-align:left}
+.note-tag-item:hover{background:#eef2f7}
+.note-tag-item[aria-pressed="true"]{background:#dbeafe;color:#1e3a8a;font-weight:700}
+.note-tag-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.note-tag-count{flex:0 0 auto;font-size:.78rem;color:#64748b}
+.note-card-tags{display:flex;flex-wrap:wrap;gap:4px}
+.note-tag-chip{display:inline-flex;align-items:center;min-height:28px;max-width:100%;box-sizing:border-box;padding:2px 9px;border:1px solid #c7d2fe;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:.78rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button.note-tag-chip{cursor:pointer}
+.note-card-alert{margin:0;padding:6px 9px;border-radius:9px;background:#fef2f2;color:#991b1b;font-size:.8rem;font-weight:700;line-height:1.5}
+.note-list-empty{grid-column:1/-1;margin:8px 0;color:#64748b}
+@media (max-width:700px){
+  .note-list-body{grid-template-columns:minmax(0,1fr)}
+  .note-tag-pane{display:none}
+  .note-list-tag-select{display:grid!important}
+}
+.note-tag-dialog-note{margin:0;font-weight:700;color:#334155}
+.note-tag-dialog-tags{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+.note-tag-dialog-tags li{display:inline-flex;align-items:center;gap:2px}
+.note-tag-dialog-empty{color:#64748b}
+.note-tag-remove{min-width:34px;min-height:34px;border:0;border-radius:8px;background:transparent;color:#b91c1c;font-weight:700}
+.note-tag-dialog-new{display:flex;align-items:flex-end;gap:8px}
+.note-tag-dialog-new label{flex:1 1 auto}
+.note-tag-dialog-new .btn{width:auto;flex:0 0 auto;min-height:48px;padding:8px 18px}
+.note-tag-manage-list{list-style:none;margin:0;padding:0;display:grid;gap:6px;max-height:52vh;overflow:auto}
+.note-tag-manage-list li{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding-left:calc(var(--tag-depth,0) * 16px)}
+.note-tag-manage-name{flex:1 1 160px;min-width:0;font-weight:700;overflow-wrap:anywhere}
+.note-tag-manage-list .btn{width:auto;flex:0 0 auto;min-height:38px;padding:4px 12px;font-size:.9rem}
+.note-page-counter-button{cursor:pointer;border-radius:9px;text-decoration:underline dotted #94a3b8;text-underline-offset:4px}
+.note-page-counter-button:hover,.note-page-counter-button:focus-visible{background:#e2e8f0;outline:none}
+.note-page-jump-dialog{width:min(360px,calc(100% - 24px))}
+.note-page-jump-dialog input{font-size:1.25rem;min-height:46px}
+.note-page-jump-range{font-weight:400;color:#64748b}
+/* Under the row of the selection menu and the study controls (it does not
+   cover them), above the page's pen layer (90) and below the palette (100). */
+.note-summary-banner{position:absolute;z-index:95;top:124px;right:12px;display:grid;gap:6px;width:min(380px,calc(100% - 24px))}
+/* The words on their own line, the buttons under them, ✕ in the corner. */
+.note-summary-banner-row{position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:8px 40px 8px 10px;border:1px solid #fdba74;border-radius:12px;background:#fff7ed;color:#7c2d12;box-shadow:0 10px 28px rgba(15,23,42,.18);font-size:.82rem}
+#noteSummaryBannerPending{border-color:#fca5a5;background:#fef2f2;color:#991b1b}
+.note-summary-banner-row span{flex:1 1 100%;font-weight:700;line-height:1.4}
+.note-summary-banner-row .btn{width:auto;flex:0 0 auto;min-height:34px;padding:2px 10px;font-size:.8rem}
+.note-summary-banner-close{position:absolute;top:3px;right:3px;min-width:34px;min-height:34px;padding:0;border:0;border-radius:8px;background:transparent;color:inherit;font-weight:700}
+/* 元ノートに反映 (revision 16): first in the selection menu, and marked. */
+.note-selection-actions button.note-selection-primary{margin:0 4px;border-radius:9px;background:#2563eb;color:#fff;font-weight:700}
+.note-selection-actions button.note-selection-primary:hover{background:#1d4ed8}
+.note-summary-update-list{margin:0;padding-left:1.4em;display:grid;gap:4px;max-height:40vh;overflow:auto}
+.note-summary-update-warning{margin:0;padding:8px 10px;border-radius:10px;background:#fef3c7;color:#78350f;line-height:1.5}
+.note-summary-push-list{display:grid;gap:8px;max-height:48vh;overflow:auto}
+.note-summary-push-list fieldset{margin:0;padding:6px 12px 8px;border:1px solid #cbd5e1;border-radius:12px;background:#fff}
+.note-summary-push-list legend{padding:0 4px;font-weight:700}
+.note-summary-push-list label{display:flex;align-items:center;gap:8px;min-height:38px}
+.note-summary-push-list input[type="checkbox"]{flex:0 0 auto;width:20px;height:20px;min-height:0;margin:0;padding:0;accent-color:#2563eb}
+.note-summary-dialog-status{white-space:pre-line}
+/* The creation tab scrolls (the editor's frame does not). */
+body.note-editor-create .wrap{overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;background:#eef2f7}
+body.note-editor-create #noteCreateView{min-height:100%}
+.note-summary-scope{display:flex;flex-wrap:wrap;gap:10px}
+.note-summary-scope .field-group{flex:1 1 220px;display:grid;gap:4px;margin:0}
+.note-summary-scope select{width:100%;min-height:44px}
+.note-summary-column{display:grid;gap:14px;align-content:start;min-width:0}
+.note-summary-limit{margin:0;color:#92400e}
+.note-summary-footer{position:sticky;bottom:0;z-index:2;display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 -12px;padding:10px 12px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid #cbd5e1;background:rgba(238,242,247,.97)}
+.note-summary-footer .note-summary-result{flex:1 1 260px}
+.note-summary-footer .btn{min-height:44px}
+@media (min-width:900px){
+  .note-summary-picker{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start}
+  .note-summary-footer{grid-column:1/-1}
+}

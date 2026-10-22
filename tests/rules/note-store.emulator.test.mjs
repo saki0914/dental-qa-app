@@ -214,3 +214,39 @@ test("異なるwriterSessionの古いrevisionはrebaseせず競合にする", as
     await environment.cleanup();
   }
 });
+
+test("ノートのタグ（改訂16）は本人のノートへ正規化して保存し、編集日時を変えず、名前変更・削除は全ノートへ及ぶ", async () => {
+  const uid = "note-store-tags-user";
+  const { environment, db, store } = await createFixture(uid);
+  try {
+    await store.createNote({ noteId: "note-tags-1", title: "タグ1", type: "standalone", pages: [blankPage("page-tags-1")], tags: ["解剖/4章"], expectedUid: uid });
+    await store.createNote({ noteId: "note-tags-2", title: "タグ2", type: "standalone", pages: [blankPage("page-tags-2")], expectedUid: uid });
+    // A note of an older release: sparse, no tags; a deleted note keeps its tags too.
+    await setDoc(doc(db, "users", uid, "notes", "note-tags-legacy"), { schemaVersion: 1, title: "旧ノート", type: "standalone", pageCount: 1, deletedAt: null });
+    await setDoc(doc(db, "users", uid, "notes", "note-tags-deleted"), {
+      schemaVersion: 1, title: "削除済み", type: "standalone", pageCount: 1, deletedAt: new Date(), tags: ["解剖"]
+    });
+    const before = (await getDoc(doc(db, "users", uid, "notes", "note-tags-2"))).data();
+    const saved = await store.setNoteTags("note-tags-2", ["＃解剖／Ａ", "解剖/a", "生化学", ""], uid);
+    assert.deepEqual(saved, ["解剖/A", "生化学"]);
+    const after = (await getDoc(doc(db, "users", uid, "notes", "note-tags-2"))).data();
+    assert.deepEqual(after.tags, ["解剖/A", "生化学"]);
+    assert.equal(after.updatedAt.toMillis(), before.updatedAt.toMillis(), "タグは編集日時を変えない");
+
+    const renamed = await store.updateTagsOnNotes(tags => tags.map(tag => tag === "解剖" || tag.startsWith("解剖/") ? `口腔解剖学${tag.slice(2)}` : tag), uid);
+    assert.deepEqual(renamed.sort(), ["note-tags-1", "note-tags-2", "note-tags-deleted"]);
+    const tagsOf = async noteId => (await getDoc(doc(db, "users", uid, "notes", noteId))).data().tags;
+    assert.deepEqual(await tagsOf("note-tags-1"), ["口腔解剖学/4章"]);
+    assert.deepEqual(await tagsOf("note-tags-2"), ["口腔解剖学/A", "生化学"]);
+    assert.deepEqual(await tagsOf("note-tags-deleted"), ["口腔解剖学"]);
+    assert.equal(await tagsOf("note-tags-legacy"), undefined, "タグのないノートは書かない");
+    const removed = await store.updateTagsOnNotes(tags => tags.filter(tag => tag !== "生化学"), uid);
+    assert.deepEqual(removed, ["note-tags-2"]);
+
+    const pending = await store.setSummaryPendingPages("note-tags-1", ["page-b", "page-a", "page-a", ""], uid);
+    assert.deepEqual(pending, ["page-a", "page-b"]);
+    assert.deepEqual((await getDoc(doc(db, "users", uid, "notes", "note-tags-1"))).data().summaryPendingPageIds, ["page-a", "page-b"]);
+  } finally {
+    await environment.cleanup();
+  }
+});
