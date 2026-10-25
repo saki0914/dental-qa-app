@@ -131,7 +131,15 @@ import {
 } from "../core/note-material-mutation.js";
 import { createNoteSaveCoordinator } from "../core/note-save-coordinator.js";
 import { cloudSaveHoldDelay, strokeFlushDelay, thumbnailRefreshDelay } from "../core/note-work-timing.js";
-import { canStraightenStroke, straightenedPoints, NOTE_STRAIGHTEN_HOLD_MS, NOTE_STRAIGHTEN_MOVE_PX } from "../core/note-straightener.js";
+import { canStraightenStroke, NOTE_STRAIGHTEN_HOLD_MS, NOTE_STRAIGHTEN_MOVE_PX } from "../core/note-straightener.js";
+import { recognizeStrokeShape, shapeStrokePoints } from "../core/note-shape-snap.js";
+import {
+  NOTE_CLIPBOARD_MAX_ITEMS,
+  NOTE_CLIPBOARD_VERSION,
+  clipboardPlacement,
+  createNoteClipboard,
+  placeClipboardItem
+} from "../core/note-copy-paste.js";
 import { createNoteToolSettingsStore, normalizeNoteToolSettings } from "../core/note-tool-settings.js";
 import {
   applyRecoveredPageMetadata,
@@ -225,6 +233,10 @@ const PAN_SLOP_PX = 8;
 const MOVE_HANDLE_OFFSET_PX = 32;
 // A drag this long (CSS px) makes a mask; a tap makes none (revision 15).
 const MASK_MIN_DRAG_PX = 8;
+// How long ⌘V / Ctrl+V waits for the browser's paste event (which says
+// whether the device's clipboard holds a picture) before it pastes the items
+// copied in the notes (revision 17). Browsers send it at once or not at all.
+const KEYBOARD_PASTE_WAIT_MS = 150;
 // JPEG quality of a summary page's picture (revision 15), as PDF pages.
 const SUMMARY_JPEG_QUALITY = 0.9;
 // Colors offered while a text is written (the pen's colors).
@@ -548,6 +560,41 @@ function ensureRevision16Elements(doc = globalThis.document) {
   }
 }
 
+// The controls of revision 17, made here for the same reason: copying the
+// chosen items of a page and pasting them on another page or note.
+function ensureRevision17Elements(doc = globalThis.document) {
+  if (!doc?.getElementById) return;
+  const byId = id => doc.getElementById(id);
+  const fromHtml = html => {
+    const template = doc.createElement("template");
+    template.innerHTML = html.trim();
+    return template.content.firstElementChild;
+  };
+  const selectionActions = byId("noteSelectionActions");
+  if (selectionActions && !selectionActions.querySelector('[data-selection-action="copy"]')) {
+    const duplicate = selectionActions.querySelector('[data-selection-action="duplicate"]');
+    const button = fromHtml('<button type="button" data-selection-action="copy">コピー</button>');
+    if (duplicate) duplicate.before(button); else selectionActions.append(button);
+  }
+  if (selectionActions && !byId("notePastePill")) {
+    selectionActions.before(fromHtml(`<div id="notePastePill" class="note-paste-pill hidden" role="group" aria-label="コピーした内容">
+      <button type="button" class="note-paste-button" data-paste-action="paste">貼り付け</button>
+      <button type="button" class="note-paste-clear" data-paste-action="clear" aria-label="コピーした内容を消す" title="コピーした内容を消す">✕</button>
+    </div>`));
+  }
+  const menuFirst = doc.querySelector('#noteMoreMenu [data-note-action="export"]');
+  if (menuFirst && !doc.querySelector('#noteMoreMenu [data-note-action="paste"]')) {
+    menuFirst.before(fromHtml('<button type="button" data-note-action="paste" class="hidden">コピーした内容を貼り付け</button>'));
+  }
+  // Holding the pen still at the end makes circles and Ls too.
+  const straighten = byId("noteStraightenEnabled")?.closest("label");
+  const straightenLabel = straighten?.querySelector("span");
+  if (straightenLabel && straightenLabel.textContent === "終点長押しで直線化") {
+    straightenLabel.textContent = "終点長押しで直線・円・L字に整える";
+    straighten.title = "描き終わりでペンを止めると、直線・円（楕円）・L字などの折れ線・三角や四角に整えます。文字はそのままです。";
+  }
+}
+
 export function createStudyNotes(dependencies) {
   const {
     getCurrentUser,
@@ -583,6 +630,7 @@ export function createStudyNotes(dependencies) {
   }
   ensureRevision15Elements(document);
   ensureRevision16Elements(document);
+  ensureRevision17Elements(document);
   const ui = {
     noteModeBtn: byId("noteModeBtn"), noteView: byId("noteView"), listView: byId("noteListView"),
     createView: byId("noteCreateView"), editorView: byId("noteEditorView"), list: byId("noteList"),
@@ -675,7 +723,11 @@ export function createStudyNotes(dependencies) {
     summaryUpdateApply: byId("noteSummaryUpdateApplyBtn"), summaryUpdateLater: byId("noteSummaryUpdateLaterBtn"),
     summaryPushDialog: byId("noteSummaryPushDialog"), summaryPushTitle: byId("noteSummaryPushTitle"), summaryPushLead: byId("noteSummaryPushLead"),
     summaryPushList: byId("noteSummaryPushList"), summaryPushStatus: byId("noteSummaryPushStatus"),
-    summaryPushAction: document.querySelector('#noteMoreMenu [data-note-action="summary-push"]')
+    summaryPushAction: document.querySelector('#noteMoreMenu [data-note-action="summary-push"]'),
+    // Revision 17 (made by ensureRevision17Elements).
+    pastePill: byId("notePastePill"),
+    pasteButton: document.querySelector('#notePastePill [data-paste-action="paste"]'),
+    pasteAction: document.querySelector('#noteMoreMenu [data-note-action="paste"]')
   };
   if (dedicatedEditor && ui.localSlot && ui.localEnvironmentBanner) {
     ui.localSlot.append(ui.localEnvironmentBanner);
@@ -886,6 +938,16 @@ export function createStudyNotes(dependencies) {
   let pageLayerGeometryValid = true;
   let pageLayerGeometryIssue = "";
   const strokeRecoveryCooldown = createStrokeRecoveryCooldown();
+  // Revision 17: copied items are kept on this device (note-copy-paste.js), so
+  // that another page or another note's tab can paste them. `clipboardMarker`
+  // says what there is to paste; `pasteRepeat` counts the pastes of one copy
+  // onto one page (each further paste there moves a little);
+  // `keyboardPasteTimer` holds the paste of ⌘V / Ctrl+V while the browser has
+  // not said whether its own clipboard holds a picture.
+  const noteClipboard = createNoteClipboard();
+  let clipboardMarker = null;
+  let pasteRepeat = { key: "", count: 0 };
+  let keyboardPasteTimer = 0;
 
   function captureUserSession() {
     const uid = getCurrentUser()?.uid;
@@ -935,6 +997,8 @@ export function createStudyNotes(dependencies) {
     startupState = state;
     lastStartupError = error || (state.endsWith("error") ? lastStartupError : null);
     if (dedicatedEditor) startupMetrics.mark("startup-state", { state });
+    // What another note's tab copied can be pasted here (revision 17).
+    if (state === "ready") refreshClipboardMarker();
     if (!dedicatedEditor || !ui.startup) return;
     clearTimeout(startupSlowTimer);
     ui.startup.dataset.state = state;
@@ -1643,7 +1707,7 @@ export function createStudyNotes(dependencies) {
           ? "画像を編集"
           : "選択項目を編集";
     }
-    const maskActions = new Set(["duplicate", "front", "back", "weak", "weak-on", "weak-off", "underline-on", "underline-off", "reflect-source", "delete", "select-page-masks", "clear-selection"]);
+    const maskActions = new Set(["copy", "duplicate", "front", "back", "weak", "weak-on", "weak-off", "underline-on", "underline-off", "reflect-source", "delete", "select-page-masks", "clear-selection"]);
     // One underline action: put it on unless every chosen mask has one.
     const allUnderlined = currentTool === "mask" && selectedMasks().length > 0 && selectedMasks().every(hasMaskUnderline);
     // A summary note's chosen masks with changes not in their sources
@@ -1656,6 +1720,7 @@ export function createStudyNotes(dependencies) {
         ? !maskActions.has(action) || otherUnderlineAction || (action === "reflect-source" && !reflectable)
         : action === "underline-on" || action === "underline-off" || action === "reflect-source");
     });
+    renderPastePill();
   }
 
   function showSelectionContext() {
@@ -5875,7 +5940,7 @@ export function createStudyNotes(dependencies) {
       if (activeGesture !== gesture && !gesture.isFinalizing) return;
       const previewPoints = gesture.rawPreviewPoint
         ? gesture.straightened
-          ? straightenedPoints(gesture.freehandPoints || gesture.points, gesture.rawPreviewPoint)
+          ? snappedStrokePoints(gesture, gesture.rawPreviewPoint)
           : [...gesture.points, gesture.rawPreviewPoint]
         : gesture.points;
       drawDraftPath(previewPoints, gesture.type, gesture);
@@ -6056,16 +6121,7 @@ export function createStudyNotes(dependencies) {
       gesture.straightenTimer = setTimeout(() => {
         if (activeGesture !== gesture || gesture.straightened) return;
         flushStrokePoints(gesture);
-        const points = clone(gesture.points);
-        if (!canStraightenStroke({
-          points,
-          elapsedMs: performance.now() - gesture.holdStartedAt,
-          movementPx: 0,
-          enabled: toolSettings.straightenEnabled
-        })) return;
-        gesture.freehandPoints = points;
-        gesture.straightened = true;
-        gesture.points = straightenedPoints(points);
+        if (!snapHeldStroke(gesture, performance.now() - gesture.holdStartedAt)) return;
         drawingDiagnostics.straightenTimerFires += 1;
         drawDraftPath(gesture.points, gesture.type, gesture);
       }, NOTE_STRAIGHTEN_HOLD_MS);
@@ -6074,16 +6130,28 @@ export function createStudyNotes(dependencies) {
 
   function applyPendingStraightening(gesture) {
     if (!gesture || gesture.straightened || !["pen", "highlighter"].includes(gesture.type) || !toolSettings.straightenEnabled) return;
+    snapHeldStroke(gesture, performance.now() - Number(gesture.holdStartedAt || performance.now()));
+  }
+
+  // A stroke held still at its end becomes the shape it was meant to be
+  // (revision 17: a straight line, a circle or an ellipse, an L or another
+  // polyline, a polygon); writing is left as it was written.
+  function snapHeldStroke(gesture, elapsedMs) {
     const points = clone(gesture.points || []);
-    if (!canStraightenStroke({
-      points,
-      elapsedMs: performance.now() - Number(gesture.holdStartedAt || performance.now()),
-      movementPx: 0,
-      enabled: true
-    })) return;
+    if (!canStraightenStroke({ points, elapsedMs, movementPx: 0, enabled: toolSettings.straightenEnabled })) return false;
+    const shape = recognizeStrokeShape(points, strokePixelScale(gesture));
+    if (!shape) return false;
     gesture.freehandPoints = points;
     gesture.straightened = true;
-    gesture.points = straightenedPoints(points);
+    gesture.snappedShape = shape;
+    gesture.points = shapeStrokePoints(shape);
+    return true;
+  }
+
+  // The held stroke's points with the pen's end where it is now (lines and
+  // polylines follow it; closed shapes keep their form).
+  function snappedStrokePoints(gesture, end = null) {
+    return gesture.snappedShape ? shapeStrokePoints(gesture.snappedShape, end) : gesture.points;
   }
 
   function finalizeInterruptedDrawingStroke(event) {
@@ -6450,7 +6518,7 @@ export function createStudyNotes(dependencies) {
       }
       activeGesture.rawPreviewPoint = null;
       if (activeGesture.straightened) {
-        activeGesture.points = straightenedPoints(activeGesture.freehandPoints, point);
+        activeGesture.points = snappedStrokePoints(activeGesture, point);
         drawDraftPath(activeGesture.points, activeGesture.type, activeGesture);
       } else {
         appendPointerSamples(activeGesture, event, sample => gesturePoint(sample, activeGesture.pageRect));
@@ -6513,9 +6581,12 @@ export function createStudyNotes(dependencies) {
     gesture.committed = true;
     const isHighlighter = gesture.type === "highlighter";
     const element = {
-      id: randomId(), type: isHighlighter ? "highlighter" : "stroke", points: prepareStrokePointsForCommit(gesture.points, strokePixelScale(gesture)),
+      id: randomId(), type: isHighlighter ? "highlighter" : "stroke",
+      // A snapped shape's points are exact (its corners given twice).
+      points: gesture.snappedShape ? clone(gesture.points) : prepareStrokePointsForCommit(gesture.points, strokePixelScale(gesture)),
       pressureEnabled: false,
       straightened: gesture.straightened === true,
+      ...(gesture.snappedShape ? { strokeShape: gesture.snappedShape.kind } : {}),
       style: {
         color: isHighlighter ? toolSettings.highlighterColor : toolSettings.penColor,
         widthRatio: Number(isHighlighter ? toolSettings.highlighterWidth : toolSettings.penWidth) / 10000 * (isHighlighter ? 10 : 1),
@@ -6578,7 +6649,7 @@ export function createStudyNotes(dependencies) {
     if (drawingGesture && gesture.straightened) {
       if (event && event.pointerId === gesture.pointerId) {
         const terminal = gesturePoint(event, gesture.pageRect);
-        gesture.points = straightenedPoints(gesture.freehandPoints || gesture.points, terminal);
+        gesture.points = snappedStrokePoints(gesture, terminal);
       }
       if (gesture.previewFrame) cancelAnimationFrame(gesture.previewFrame);
       gesture.previewFrame = 0;
@@ -9130,7 +9201,6 @@ export function createStudyNotes(dependencies) {
 
   function selectedElements() { return currentContent.elements.filter(element => selectedIds.includes(element.id)); }
   function selectedMasks() { return currentContent.noteMasks.filter(mask => selectedIds.includes(mask.id)); }
-  let internalClipboard = [];
 
   function syncSelectedTextControls() {
     const text = selectedElements().find(element => element.type === "text");
@@ -9181,6 +9251,10 @@ export function createStudyNotes(dependencies) {
   }
 
   function selectionAction(action) {
+    if (action === "copy") {
+      runCopySelection();
+      return;
+    }
     if (!isEditableNow()) { explainBlockedEdit(); return; }
     if (action === "reflect-source") {
       reflectSelectedMasks().catch(reportError);
@@ -9290,23 +9364,171 @@ export function createStudyNotes(dependencies) {
     commitChange(before, `選択: ${action}`);
   }
 
-  function copySelection() {
-    if (!isEditableNow()) { explainBlockedEdit(); return; }
-    internalClipboard = [...selectedElements(), ...selectedMasks()].map(clone);
+  // ---- Copying to another page or note (revision 17) ----
+
+  function runCopySelection() {
+    return trackNoteOperation(copySelection()).catch(reportError);
   }
 
-  function pasteSelection() {
-    if (!internalClipboard.length) return;
-    if (!isEditableNow()) { explainBlockedEdit(); return; }
-    settlePendingStrokes();
-    const before = clone(currentContent); const ids = [];
-    internalClipboard.forEach(item => {
-      const copy = { ...withoutMaskOrigin(clone(item)), id: randomId() };
-      if (copy.type) currentContent.elements.push(translateElement(copy, .025, .025, pages[currentPageIndex]?.size));
-      else currentContent.noteMasks.push({ ...copy, x: clamp(copy.x + .025, 0, 1 - copy.width), y: clamp(copy.y + .025, 0, 1 - copy.height) });
-      ids.push(copy.id);
+  function runPasteClipboard() {
+    return trackNoteOperation(pasteClipboard()).catch(reportError);
+  }
+
+  // 「コピー」 also puts the words of the copied texts (or what was copied) on
+  // the device's clipboard, as copying does elsewhere: a picture copied before
+  // is no longer what ⌘V pastes, and the words can be pasted in other apps.
+  function clipboardTextOf(items) {
+    const words = items.filter(item => item.type === "text").map(item => String(item.text || "").trim()).filter(Boolean);
+    return words.length ? words.join("\n") : `学習ノートからコピーした項目（${items.length}個）`;
+  }
+
+  function writeDeviceClipboardText(text) {
+    try {
+      if (!globalThis.isSecureContext || !navigator.clipboard?.writeText) return;
+      void navigator.clipboard.writeText(text).catch(() => {});
+    } catch {
+      // The device's clipboard is a convenience; the copy is kept without it.
+    }
+  }
+
+  function refreshClipboardMarker() {
+    const uid = getCurrentUser()?.uid;
+    clipboardMarker = uid ? noteClipboard.peek(uid) : null;
+    renderPastePill();
+  }
+
+  // "貼り付け" shows with the tools that choose items (選択, and the mask
+  // tool's 選択・編集) where the menu of chosen items would be, while that
+  // menu is closed, and in the ••• menu with any tool.
+  function renderPastePill() {
+    const usable = Boolean(clipboardMarker && startupState === "ready" && isEditableNow());
+    const toolChooses = currentTool === "select" || (currentTool === "mask" && maskEditMode);
+    const selectionMenuOpen = ui.selectionActions ? !ui.selectionActions.classList.contains("hidden") : false;
+    ui.pastePill?.classList.toggle("hidden", !(usable && toolChooses && !selectionMenuOpen));
+    if (ui.pasteButton && clipboardMarker) {
+      ui.pasteButton.textContent = `貼り付け（${clipboardMarker.count}個）`;
+      ui.pasteButton.title = "コピーした内容をこのページに貼り付け";
+    }
+    ui.pasteAction?.classList.toggle("hidden", !usable);
+  }
+
+  // The chosen items, as another page or note can take them: images name the
+  // note their picture is kept in, and masks lose what tied them to a summary
+  // note's source.
+  function clipboardItemsOfSelection() {
+    // Elements in the order they are drawn (masks keep the page's order).
+    const items = currentTool === "mask"
+      ? selectedMasks()
+      : selectedElements().sort((left, right) => Number(left.zIndex || 0) - Number(right.zIndex || 0));
+    return items.map(item => {
+      const copy = clone(item);
+      if (copy.type === "image") copy.assetNoteId = copy.assetNoteId || currentNote.id;
+      if (copy.type) return copy;
+      const { summaryLocal: _kept, ...mask } = withoutMaskOrigin(copy);
+      return mask;
     });
-    selectedIds = ids; showSelectionContext(); commitChange(before, "アプリ内部貼り付け");
+  }
+
+  async function copySelection() {
+    if (!currentNote || !currentContent || studyMode) return;
+    // A read-only tab neither copies nor pastes (as before revision 17).
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
+    if (!prepareEditorAction("コピー")) return;
+    const session = captureUserSession();
+    assertUserSession(session);
+    settlePendingStrokes();
+    const items = clipboardItemsOfSelection();
+    if (!items.length) {
+      showEditorNotice("コピーする項目を選んでください。");
+      return;
+    }
+    if (items.length > NOTE_CLIPBOARD_MAX_ITEMS) {
+      showEditorNotice(`一度にコピーできるのは${NOTE_CLIPBOARD_MAX_ITEMS}個までです。`);
+      return;
+    }
+    const page = pages[currentPageIndex];
+    const record = {
+      version: NOTE_CLIPBOARD_VERSION,
+      id: randomId(),
+      uid: session.uid,
+      createdAt: new Date().toISOString(),
+      sourceNoteId: currentNote.id,
+      sourcePageId: page.pageId,
+      pageSize: { width: Number(page.size?.width) || 1240, height: Number(page.size?.height) || 1754 },
+      items
+    };
+    // Before anything is awaited: Safari lets a page write to the device's
+    // clipboard only while it handles the tap or the key.
+    writeDeviceClipboardText(clipboardTextOf(items));
+    const shared = await noteClipboard.write(session.uid, record);
+    assertUserSession(session);
+    pasteRepeat = { key: "", count: 0 };
+    refreshClipboardMarker();
+    showEditorNotice(shared
+      ? `${items.length}個をコピーしました。別のページやノートで「貼り付け」を押すと、同じ位置に貼り付けます。`
+      : `${items.length}個をコピーしました。このノートの中でだけ貼り付けられます。`, { durationMs: 5_000 });
+  }
+
+  async function pasteClipboard() {
+    if (!currentNote || !currentContent || studyMode) return;
+    if (!isEditableNow()) { explainBlockedEdit(); return; }
+    if (!prepareEditorAction("貼り付け")) return;
+    const session = captureUserSession();
+    assertUserSession(session);
+    const page = pages[currentPageIndex];
+    const content = currentContent;
+    const record = await noteClipboard.read(session.uid);
+    assertUserSession(session);
+    if (!record?.items?.length) {
+      refreshClipboardMarker();
+      showEditorNotice("貼り付ける内容がありません。先に「選択」で選んで「コピー」してください。");
+      return;
+    }
+    // The page may have changed while the copy was read.
+    if (pages[currentPageIndex] !== page || currentContent !== content || !isEditableNow()) return;
+    if (!prepareEditorAction("貼り付け")) return;
+    settlePendingStrokes();
+    // The pasted items are chosen with the tool that moves them: 選択 for
+    // writing, text, shapes and images, the mask tool's 選択・編集 for masks.
+    const pastesElements = record.items.some(item => item.type);
+    const toolReady = () => pastesElements ? currentTool === "select" : currentTool === "mask" && maskEditMode;
+    if (!toolReady()) {
+      if (pastesElements) setTool("select");
+      else setMaskEditMode(true);
+      if (!toolReady()) return;
+    }
+    const samePage = record.sourceNoteId === currentNote.id && record.sourcePageId === page.pageId;
+    const repeatKey = `${record.id}|${currentNote.id}|${page.pageId}`;
+    pasteRepeat = pasteRepeat.key === repeatKey ? { key: repeatKey, count: pasteRepeat.count + 1 } : { key: repeatKey, count: 0 };
+    const targetSize = { width: Number(page.size?.width) || 1240, height: Number(page.size?.height) || 1754 };
+    const placement = clipboardPlacement(selectionBounds(record.items, record.pageSize), {
+      sourceSize: record.pageSize, targetSize, samePage, repeat: pasteRepeat.count
+    });
+    const before = clone(currentContent);
+    const elementIds = [];
+    const maskIds = [];
+    let zIndex = elementZIndex(currentContent.elements);
+    for (const item of record.items) {
+      const placed = { ...placeClipboardItem(item, placement, targetSize), id: randomId() };
+      if (placed.type) {
+        // A picture of this note needs no other note.
+        if (placed.type === "image" && placed.assetNoteId === currentNote.id) delete placed.assetNoteId;
+        placed.zIndex = zIndex;
+        zIndex += 10;
+        currentContent.elements.push(placed);
+        elementIds.push(placed.id);
+      } else {
+        currentContent.noteMasks.push(placed);
+        maskIds.push(placed.id);
+      }
+    }
+    selectedIds = pastesElements ? elementIds : maskIds;
+    commitChange(before, "貼り付け");
+    showSelectionContext();
+    const where = placement.fit < 1
+      ? "ページに収まるよう小さくしました。"
+      : samePage || pasteRepeat.count ? "少しずらしています。" : "コピーしたときと同じ位置です。";
+    showEditorNotice(`${record.items.length}個を貼り付けました。${where}`);
   }
 
   function undo() {
@@ -11051,6 +11273,9 @@ export function createStudyNotes(dependencies) {
       if (action === "summary-push") openSummaryPushReview().catch(reportError);
       if (action === "tags") openTagDialog(currentNote).catch(reportError);
       if (action === "page-jump") openPageJumpDialog();
+      if (action === "paste") {
+        if (closeTransientUi()) runPasteClipboard();
+      }
       if (action === "rename") renameNote().catch(reportError);
       if (action === "duplicate") duplicateNote(currentNote.id).catch(reportError);
       if (action === "delete") deleteNote().catch(reportError);
@@ -11070,10 +11295,41 @@ export function createStudyNotes(dependencies) {
       if (!currentNote || ui.editorView.classList.contains("hidden")) return;
       if (event.target === ui.pasteFallback) closeTransientUi();
       else if (isTextEditingTarget(event.target)) return;
+      // ⌘V / Ctrl+V: a picture on the device's clipboard is pasted as a
+      // picture; otherwise the items copied in the notes are (revision 17).
+      const keyboardPaste = Boolean(keyboardPasteTimer);
+      clearTimeout(keyboardPasteTimer);
+      keyboardPasteTimer = 0;
       const file = imageFileFromPasteEvent(event);
-      if (!file) return;
+      if (!file) {
+        if (keyboardPaste) {
+          event.preventDefault();
+          runPasteClipboard();
+        }
+        return;
+      }
       if (!isEditableNow()) { explainBlockedEdit(); return; }
       event.preventDefault(); addImageBlob(file).catch(reportError);
+    });
+    ui.pastePill?.addEventListener("click", event => {
+      const action = event.target.closest("button[data-paste-action]")?.dataset.pasteAction;
+      if (action === "paste") runPasteClipboard();
+      if (action === "clear") {
+        const uid = getCurrentUser()?.uid;
+        if (!uid) return;
+        void noteClipboard.clear(uid).finally(() => {
+          refreshClipboardMarker();
+          showEditorNotice("コピーした内容を消しました。");
+        });
+      }
+    });
+    // Another tab copied (or cleared what was copied).
+    globalThis.addEventListener?.("storage", event => {
+      const uid = getCurrentUser()?.uid;
+      if (uid && (event.key === null || event.key === noteClipboard.markerKey(uid))) refreshClipboardMarker();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") refreshClipboardMarker();
     });
     document.addEventListener("keydown", event => {
       if (event.key === "Escape" && !ui.editorView.classList.contains("hidden")) {
@@ -11090,8 +11346,16 @@ export function createStudyNotes(dependencies) {
       if (cropSession) return;
       const command = event.metaKey || event.ctrlKey;
       if (command && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); }
-      else if (command && event.key.toLowerCase() === "c" && selectedIds.length) { event.preventDefault(); copySelection(); }
-      else if (command && event.key.toLowerCase() === "v" && internalClipboard.length) { event.preventDefault(); pasteSelection(); }
+      else if (command && event.key.toLowerCase() === "c" && selectedIds.length) { event.preventDefault(); runCopySelection(); }
+      else if (command && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "v" && clipboardMarker) {
+        // The browser says in its paste event whether its clipboard holds a
+        // picture; a browser that sends none to the page pastes the items.
+        clearTimeout(keyboardPasteTimer);
+        keyboardPasteTimer = setTimeout(() => {
+          keyboardPasteTimer = 0;
+          runPasteClipboard();
+        }, KEYBOARD_PASTE_WAIT_MS);
+      }
       else if (["Delete", "Backspace"].includes(event.key) && selectedIds.length) { event.preventDefault(); selectionAction("delete"); }
     });
     ui.startupActions.addEventListener("click", event => {

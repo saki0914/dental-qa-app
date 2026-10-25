@@ -937,3 +937,11 @@ body.note-editor-create #noteCreateView{min-height:100%}
   .note-summary-picker{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start}
   .note-summary-footer{grid-column:1/-1}
 }
+/* Revision 17: what was copied, ready to paste on this page (where the menu
+   of chosen items shows, while that menu is closed). */
+.note-paste-pill{position:absolute;z-index:32;top:8px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:2px;max-width:calc(100% - 24px);padding:4px;border:1px solid #93c5fd;border-radius:999px;background:#fff;box-shadow:0 8px 20px rgba(15,23,42,.16)}
+.note-paste-pill .note-paste-button{min-height:40px;padding:0 18px;border:0;border-radius:999px;background:#2563eb;color:#fff;font-weight:700;white-space:nowrap}
+.note-paste-pill .note-paste-button:hover{background:#1d4ed8}
+.note-paste-pill .note-paste-clear{flex:0 0 40px;min-height:40px;border:0;border-radius:999px;background:transparent;color:#475569;font-size:1rem}
+.note-paste-pill .note-paste-clear:hover{background:#f1f5f9}
+.note-editor.is-readonly .note-paste-pill,.note-editor.markup-inactive .note-paste-pill{display:none!important}

@@ -153,6 +153,36 @@ async function renderPdfPageToJpeg({ pdfDoc, pageNumber, pdfjsLib, createCanvas,
   );
 }
 
+// Fonts embedded in the PDF are drawn from their outlines (revision 17).
+// pdf.js normally re-encodes an embedded font and hands it to the browser,
+// which draws the text. iPad Safari drew nothing for the CID-keyed CFF fonts
+// that pdf.js 4.10.38 re-encodes (Japanese fonts such as Hiragino, as PDFs
+// made on Apple devices embed them; that version writes their charset wrong
+// for CoreText): a lecture PDF lost all its Japanese text while its numbers,
+// arrows, boxes and photos stayed. pdf.js can instead read each glyph's
+// outline from the font program itself (the same code in every browser) and
+// fill it, as it does when a browser refuses a font: refusing every embedded
+// font makes it do so. Fonts that are not embedded have no outlines and keep
+// the font the device has. Returns whether the document's fonts are drawn so;
+// a pdf.js without this loader is left as it is.
+export function drawEmbeddedFontsFromOutlines(pdfDoc) {
+  const loader = pdfDoc?._transport?.fontLoader;
+  if (!loader || typeof loader.bind !== "function") return false;
+  if (loader.bind.embeddedFontsFromOutlines === true) return true;
+  const bindNative = loader.bind.bind(loader);
+  const bind = async font => {
+    if (font?.data && !font.missingFile && !font.systemFontInfo && !font.isType3Font && !font.cssFontInfo) {
+      // pdf.js then asks its worker for the outlines of this font's glyphs.
+      font.disableFontFace = true;
+      throw new Error("PDFに埋め込まれたフォントは輪郭から描きます。");
+    }
+    return bindNative(font);
+  };
+  bind.embeddedFontsFromOutlines = true;
+  loader.bind = bind;
+  return true;
+}
+
 // pdf.js reads the byte ranges it needs straight from the file, in chunks of
 // this size, instead of holding the whole PDF: a page drawn natively never
 // needs pdf.js to read its image.
@@ -215,6 +245,10 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
     const pdfDoc = await loadingTask.promise;
     if (!Number.isInteger(pdfDoc.numPages) || pdfDoc.numPages < 1) {
       throw new Error("PDFのページ数を取得できませんでした。");
+    }
+    // Before any page loads a font.
+    if (!drawEmbeddedFontsFromOutlines(pdfDoc) && pdfDoc._transport) {
+      console.warn("PDFの埋め込みフォントを輪郭から描けないため、ブラウザのフォント機能で描きます。");
     }
     // pdf-lib and pdf.js must see the same pages to draw any natively.
     if (scannedPages && scannedPages.pageCount !== pdfDoc.numPages) scannedPages = null;

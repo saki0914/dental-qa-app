@@ -8,6 +8,7 @@ import {
   PDF_RANGE_CHUNK_SIZE,
   PDF_RENDER_RETRY_FACTORS,
   convertPdfToImageFiles,
+  drawEmbeddedFontsFromOutlines,
   normalizePdfRotation,
   pdfRenderScale
 } from "../../js/core/pdf-converter.js";
@@ -316,4 +317,70 @@ test("スキャンページは1ページずつデコードし、2ページ分の
   });
   assert.deepEqual(pages, [1, 2, 3, 4]);
   assert.equal(peak, 1);
+});
+
+// pdf.js 4.10.38's font loader, reduced to bind(): it records the fonts it was
+// given to load as browser fonts.
+function fakeFontLoader() {
+  const loader = {
+    bound: [],
+    async bind(font) {
+      this.bound.push(font.loadedName);
+    }
+  };
+  return loader;
+}
+
+test("改訂17: PDFに埋め込まれたフォントはブラウザのフォントにせず輪郭から描かせ、埋め込みでないフォントは端末のフォントのまま", async () => {
+  const loader = fakeFontLoader();
+  const pdfDoc = { _transport: { fontLoader: loader } };
+  assert.equal(drawEmbeddedFontsFromOutlines(pdfDoc), true);
+  const embedded = { loadedName: "g_d0_f1", data: new Uint8Array([1, 2, 3]) };
+  await assert.rejects(loader.bind(embedded), "埋め込みフォントはpdf.jsが輪郭を作る（ブラウザのフォントにしない）");
+  assert.equal(embedded.disableFontFace, true, "このフォントは輪郭から描く");
+  const others = [
+    { loadedName: "missing", missingFile: true },
+    { loadedName: "system", data: null, systemFontInfo: { loadedName: "system", src: "local(Hiragino Sans)" } },
+    { loadedName: "type3", isType3Font: true, data: null },
+    { loadedName: "xfa", data: new Uint8Array([1]), cssFontInfo: { fontFamily: "Xfa" } }
+  ];
+  for (const font of others) await loader.bind(font);
+  assert.deepEqual(loader.bound, ["missing", "system", "type3", "xfa"], "埋め込みでないフォントは今までどおり");
+  assert.ok(others.every(font => font.disableFontFace !== true));
+  assert.equal(drawEmbeddedFontsFromOutlines(pdfDoc), true, "2回目は重ねない");
+  await assert.rejects(loader.bind({ loadedName: "g_d0_f2", data: new Uint8Array([1]) }));
+  assert.deepEqual(loader.bound, ["missing", "system", "type3", "xfa"]);
+  assert.equal(drawEmbeddedFontsFromOutlines({}), false, "この仕組みのないpdf.jsはそのまま");
+  assert.equal(drawEmbeddedFontsFromOutlines(null), false);
+});
+
+test("改訂17: 変換は最初のページを描く前に、埋め込みフォントを輪郭から描く設定にする", async () => {
+  const pdf = fakePdf({ pageSizes: [[595, 842], [595, 842]] });
+  const loader = fakeFontLoader();
+  const getDocument = pdf.lib.getDocument;
+  let pdfDoc = null;
+  pdf.lib.getDocument = options => {
+    const task = getDocument(options);
+    return {
+      ...task,
+      promise: task.promise.then(doc => {
+        pdfDoc = doc;
+        doc._transport = { fontLoader: loader };
+        const getPage = doc.getPage.bind(doc);
+        doc.getPage = async pageNumber => {
+          assert.equal(loader.bind.embeddedFontsFromOutlines, true, `${pageNumber}ページ目より前に設定する`);
+          return getPage(pageNumber);
+        };
+        return doc;
+      })
+    };
+  };
+  const pages = [];
+  await convertPdfToImageFiles(pdfFile(), null, {
+    pdfjsLib: pdf.lib, createCanvas: pdf.createCanvas, wait: noWait, openScannedPages: noScans,
+    onPage: async page => { pages.push(page.pageNumber); }
+  });
+  assert.deepEqual(pages, [1, 2]);
+  assert.ok(pdfDoc);
+  assert.equal(pdf.state.getDocumentOptions.disableFontFace, false, "埋め込みでないフォントのため、文書全体ではフォント機能を止めない");
 });

@@ -33,7 +33,7 @@
   </script>
   <title>Dental QA Ultimate</title>
   <!-- asset-versions:start (npm run stamp) -->
-  <meta name="app-build" content="e5c4b21590">
+  <meta name="app-build" content="679a4a9ac0">
   <script type="importmap">
   {
     "imports": {
@@ -50,6 +50,7 @@
       "./js/core/note-background.js": "./js/core/note-background.js?v=56d8b876d3",
       "./js/core/note-clipboard.js": "./js/core/note-clipboard.js?v=7be5725f1e",
       "./js/core/note-conflict-resolution.js": "./js/core/note-conflict-resolution.js?v=86418f1bfd",
+      "./js/core/note-copy-paste.js": "./js/core/note-copy-paste.js?v=f01aebe118",
       "./js/core/note-editor-lock.js": "./js/core/note-editor-lock.js?v=4f061bb325",
       "./js/core/note-editor-state.js": "./js/core/note-editor-state.js?v=1ef2bfaae7",
       "./js/core/note-errors.js": "./js/core/note-errors.js?v=84119462ae",
@@ -69,8 +70,9 @@
       "./js/core/note-resource-cache.js": "./js/core/note-resource-cache.js?v=9048db4a92",
       "./js/core/note-save-coordinator.js": "./js/core/note-save-coordinator.js?v=f53615b557",
       "./js/core/note-session-loading.js": "./js/core/note-session-loading.js?v=18e62dbcca",
+      "./js/core/note-shape-snap.js": "./js/core/note-shape-snap.js?v=da05203f5f",
       "./js/core/note-startup-metrics.js": "./js/core/note-startup-metrics.js?v=8631a0c19d",
-      "./js/core/note-straightener.js": "./js/core/note-straightener.js?v=0caefe2399",
+      "./js/core/note-straightener.js": "./js/core/note-straightener.js?v=eae4ac18da",
       "./js/core/note-stroke-session.js": "./js/core/note-stroke-session.js?v=965b6bf238",
       "./js/core/note-stroke.js": "./js/core/note-stroke.js?v=62d0edee3f",
       "./js/core/note-summary.js": "./js/core/note-summary.js?v=33c43fbf94",
@@ -84,7 +86,7 @@
       "./js/core/note-work-timing.js": "./js/core/note-work-timing.js?v=e2bee1b455",
       "./js/core/page-zoom-controller.js": "./js/core/page-zoom-controller.js?v=6ce5953e9a",
       "./js/core/pdf-bilevel-image.js": "./js/core/pdf-bilevel-image.js?v=89322f8bcc",
-      "./js/core/pdf-converter.js": "./js/core/pdf-converter.js?v=b2a2a4b0c8",
+      "./js/core/pdf-converter.js": "./js/core/pdf-converter.js?v=4bb81ef055",
       "./js/core/pdf-creation-progress.js": "./js/core/pdf-creation-progress.js?v=4c659c0e3a",
       "./js/core/pdf-lib-loader.js": "./js/core/pdf-lib-loader.js?v=6872a028ea",
       "./js/core/pdf-scanned-page.js": "./js/core/pdf-scanned-page.js?v=88305500d3",
@@ -98,7 +100,7 @@
       "./js/core/text-utils.js": "./js/core/text-utils.js?v=262e6e686d",
       "./js/features/image-memory.js": "./js/features/image-memory.js?v=eb1f7db7f6",
       "./js/features/question-manager.js": "./js/features/question-manager.js?v=c65a31b6f2",
-      "./js/features/study-notes.js": "./js/features/study-notes.js?v=350f0f182c",
+      "./js/features/study-notes.js": "./js/features/study-notes.js?v=61fe044019",
       "./js/services/cloud-store.js": "./js/services/cloud-store.js?v=bcde239f2a",
       "./js/services/note-store.js": "./js/services/note-store.js?v=81d51951a6"
     }
@@ -106,7 +108,7 @@
   </script>
   <!-- asset-versions:end -->
   <link rel="stylesheet" href="./css/app.css?v=34b77aaa29">
-  <link rel="stylesheet" href="./css/study-notes.css?v=f24751dd57">
+  <link rel="stylesheet" href="./css/study-notes.css?v=761497c6a8">
 </head>
 <body>
 <div class="wrap">
@@ -565,7 +567,7 @@
                 <div id="noteWidthPresets" class="note-width-presets" aria-label="太さプリセット"></div>
                 <label class="tool-setting-label">詳細 <input id="noteWidthInput" type="range" min="1" max="100" value="25"><output id="noteWidthValue">25</output></label>
                 <label class="tool-setting-label">透明度 <input id="noteOpacityInput" type="range" min="5" max="100" value="100"><output id="noteOpacityValue">100%</output></label>
-                <label class="tool-setting-toggle"><input id="noteStraightenEnabled" type="checkbox" checked><span>終点長押しで直線化</span></label>
+                <label class="tool-setting-toggle" title="描き終わりでペンを止めると、直線・円（楕円）・L字などの折れ線・三角や四角に整えます。文字はそのままです。"><input id="noteStraightenEnabled" type="checkbox" checked><span>終点長押しで直線・円・L字に整える</span></label>
               </section>
               <section class="note-setting-section hidden" data-setting-tools="eraser-object eraser-pixel">
                 <h4>種類</h4>
