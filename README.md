@@ -54,7 +54,7 @@ Cloud Storage for Firebaseを利用するには、FirebaseプロジェクトのB
 
 問題JSONの形式（選択問題の書き方を含む）、画像付き問題の一括登録とMac/iPhone/iPadでの運用は、[`docs/QUESTION_IMPORT.md`](docs/QUESTION_IMPORT.md)を参照してください。
 
-ノートから生成するPDFは端末へのダウンロードまたは対応端末の共有シートにだけ渡し、Firebase Storageには保存しません。PDF出力用のpdf-libはリポジトリ内へ固定していますが、PDF取込用のpdf.jsは別ライブラリで、現在は外部CDNから読み込みます。PDFを取り込むとき、PDFに埋め込まれたフォント（Apple製品で作ったPDFのヒラギノなど）は、ブラウザのフォント機能に渡さずpdf.jsがフォントの輪郭から描きます（iPadのSafariで日本語の文字が消えるのを防ぐため。`js/core/pdf-converter.js`の`drawEmbeddedFontsFromOutlines`）。
+ノートから生成するPDFは端末へのダウンロードまたは対応端末の共有シートにだけ渡し、Firebase Storageには保存しません。PDF出力用のpdf-libはリポジトリ内へ固定していますが、PDF取込用のpdf.jsは別ライブラリで、本体は外部CDN（cdnjs）から読み込みます。cdnjsにはpdf.jsのCMap（日本語・中国語・韓国語の書体を読むための文字の対応表）と標準フォントが置かれていないため、これらは`vendor/pdfjs-dist-4.10.38/`に同梱してアプリ自身から読ませます（CMapを読めないと、pdf.jsはその書体の文字を全て描きません）。CMapを読めなかったときは、文字の欠けたページを保存せずに変換を止めます。また、PDFに埋め込まれたフォント（Apple製品で作ったPDFのヒラギノなど）は、ブラウザのフォント機能に渡さずpdf.jsがフォントの輪郭から描きます（`js/core/pdf-converter.js`の`drawEmbeddedFontsFromOutlines`）。
 
 ノートの「選択」（マスクはマスクの「選択」）で選んだ手書き・テキスト・図形・画像・マスクは「コピー」（⌘C）でこの端末に覚え、同じノートの別のページや別のノート（別のタブ）で「貼り付け」（⌘V、または「•••」→「コピーした内容を貼り付け」）できます。別のページへは同じ位置に、コピーしたページへは少しずらして貼ります。コピーはこの端末のIndexedDB（`dentalQaNoteClipboard`）と、他のタブへ知らせる目印のlocalStorage（`dentalQaNoteClipboard:{uid}`）だけに置き、クラウドには保存しません。貼り付けた画像は元のノートの画像を指します（ノートの複製と同じ`assetNoteId`）。
 

@@ -65,7 +65,7 @@ npm run test:all
 - 教材を`archiving`状態へ先にロックし、`materialRefs`で取得した連携ノートを最大500件ずつ論理削除してから教材更新・削除を確定すること
 - `archiving`中の教材から新しい連携ノートを作成できないこと
 - ノートPDFは端末へのダウンロード・共有だけを行い、StorageへのPDFアップロードを許可しないこと
-- PDFに埋め込まれた日本語フォント（CID-keyed CFF）をブラウザのフォントにせず輪郭から描き、文字が画像に残ること（`tests/fixtures/pdf-embedded-cid-cff-ja.pdf`）
+- PDFに埋め込まれた日本語フォント（CID-keyed CFF。Adobe-Japan1でToUnicodeのないものを含む）の文字が画像に残り、CMapを同梱の`vendor/pdfjs-dist-4.10.38/`から読むこと、CMapを読めないときは文字の欠けたページを作らずに止めること（`tests/fixtures/pdf-embedded-cid-cff-ja.pdf`）
 - 選んだ手書き・テキスト・図形・画像・マスクを別のページ・別のノートのタブへコピー・貼り付けし、位置・形・画像の参照が保たれること
 - 終点でペンを止めた線が直線・円・L字（折れ線）・四角（多角形）に整い、文字のような線と設定オフのときは変わらないこと
 
@@ -75,7 +75,7 @@ npm run test:all
 
 - 本番環境の実ユーザーでのログイン・新規登録
 - 本番Firestore・Storageへの書き込み
-- PDF取込（pdf.js）に使う外部CDNが停止・遮断された場合の代替経路
+- PDF取込（pdf.js）の本体を読む外部CDN（cdnjs）が停止・遮断された場合の代替経路（CMapと標準フォントは同梱）
 - 進捗リセット
 - ソフトウェアキーボード
 - iPhone・iPad実機固有の操作

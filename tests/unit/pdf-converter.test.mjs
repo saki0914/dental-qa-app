@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
+import { existsSync, readdirSync } from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
+  PDF_CMAP_FETCH_ATTEMPTS,
+  PDF_CMAP_RETRY_DELAY_MS,
   PDF_IMAGE_MAX_PIXELS,
+  PDF_JS_CMAP_URL,
+  PDF_JS_STANDARD_FONT_DATA_URL,
   PDF_RENDER_MAX_PIXELS,
   PDF_RENDER_MAX_SCALE,
   PDF_RANGE_CHUNK_SIZE,
   PDF_RENDER_RETRY_FACTORS,
   convertPdfToImageFiles,
+  createCMapReaderFactory,
   drawEmbeddedFontsFromOutlines,
   normalizePdfRotation,
   pdfRenderScale
@@ -53,8 +60,8 @@ class FakeRangeTransport {
 // successive attempts ("render" rejects the render, "blob" makes toBlob yield
 // null); missing entries succeed. Without `ranges` it has no
 // PDFDataRangeTransport.
-function fakePdf({ pageSizes = [[595, 842]], failures = {}, ranges = true } = {}) {
-  const state = { getDocumentOptions: null, cleanups: 0, attempts: [], destroyed: false };
+function fakePdf({ pageSizes = [[595, 842]], failures = {}, ranges = true, cMapRequests = {} } = {}) {
+  const state = { getDocumentOptions: null, cleanups: 0, attempts: [], destroyed: false, cMapResults: [] };
   const remaining = Object.fromEntries(Object.entries(failures).map(([page, list]) => [page, [...list]]));
   let pendingBlobFailure = false;
   const pdfDoc = {
@@ -71,7 +78,16 @@ function fakePdf({ pageSizes = [[595, 842]], failures = {}, ranges = true } = {}
           const outcome = remaining[pageNumber]?.shift() || "ok";
           state.attempts.push({ pageNumber, width: Math.floor(viewport.width), outcome });
           pendingBlobFailure = outcome === "blob";
-          return { promise: outcome === "render" ? Promise.reject(new Error("render failed")) : Promise.resolve() };
+          if (outcome === "render") return { promise: Promise.reject(new Error("render failed")) };
+          // The fonts of the page ask for their CMaps, as pdf.js's worker does
+          // (FetchBuiltInCMap); a font whose CMap fails is left out.
+          const { CMapReaderFactory, cMapUrl, cMapPacked } = state.getDocumentOptions;
+          const reader = CMapReaderFactory ? new CMapReaderFactory({ baseUrl: cMapUrl, isCompressed: cMapPacked }) : null;
+          const requests = (cMapRequests[pageNumber] || []).map(name => reader.fetch({ name }).then(
+            data => state.cMapResults.push({ name, ok: true, bytes: data.cMapData.length, isCompressed: data.isCompressed }),
+            error => state.cMapResults.push({ name, ok: false, message: error.message })
+          ));
+          return { promise: Promise.all(requests).then(() => {}) };
         },
         cleanup: () => true
       };
@@ -383,4 +399,87 @@ test("改訂17: 変換は最初のページを描く前に、埋め込みフォ�
   assert.deepEqual(pages, [1, 2]);
   assert.ok(pdfDoc);
   assert.equal(pdf.state.getDocumentOptions.disableFontFace, false, "埋め込みでないフォントのため、文書全体ではフォント機能を止めない");
+});
+
+test("改訂18: CMapと標準フォントはcdnjsではなくアプリ自身（vendor/pdfjs-dist-4.10.38）から読ませる", async () => {
+  const pdf = fakePdf();
+  await convertPdfToImageFiles(pdfFile(), null, { pdfjsLib: pdf.lib, createCanvas: pdf.createCanvas, wait: noWait, openScannedPages: noScans });
+  const options = pdf.state.getDocumentOptions;
+  assert.equal(options.cMapUrl, PDF_JS_CMAP_URL);
+  assert.equal(options.cMapPacked, true);
+  assert.equal(options.standardFontDataUrl, PDF_JS_STANDARD_FONT_DATA_URL);
+  for (const url of [options.cMapUrl, options.standardFontDataUrl]) {
+    assert.ok(url.endsWith("/"), "pdf.jsは末尾の/を求める");
+    assert.ok(!url.includes("cdnjs"), "cdnjsはpdf.jsのデータファイルを置いていない");
+    // Absolute (the pdf.js worker runs from a blob URL) and next to the app.
+    assert.ok(new URL(url).pathname.endsWith("/vendor/pdfjs-dist-4.10.38/" + (url === options.cMapUrl ? "cmaps/" : "standard_fonts/")));
+  }
+});
+
+test("改訂18: pdf.jsが日本語・中国語・韓国語のフォントで読むCMapと、取りに行く標準フォントが全てある", () => {
+  const cmaps = fileURLToPath(PDF_JS_CMAP_URL);
+  const files = readdirSync(cmaps).filter(name => name.endsWith(".bcmap"));
+  assert.equal(files.length, 168, "pdfjs-dist 4.10.38のcmaps/の全て");
+  // ToUnicode のないCIDフォント（Appleの端末で作ったPDFのヒラギノなど）と、
+  // よく使われる日本語の文字コードのCMap。
+  for (const name of ["Adobe-Japan1-UCS2", "Adobe-GB1-UCS2", "Adobe-CNS1-UCS2", "Adobe-Korea1-UCS2", "UniJIS-UCS2-H", "UniJIS-UTF16-H", "90ms-RKSJ-H", "90msp-RKSJ-H", "H", "V"]) {
+    assert.ok(existsSync(`${cmaps}/${name}.bcmap`), `${name}.bcmap`);
+  }
+  assert.ok(existsSync(`${cmaps}/LICENSE`));
+  const fonts = fileURLToPath(PDF_JS_STANDARD_FONT_DATA_URL);
+  // useSystemFonts: true のとき、pdf.jsが取りに行くのはSymbolとZapfDingbatsだけ。
+  for (const name of ["FoxitSymbol.pfb", "FoxitDingbats.pfb", "LICENSE_FOXIT"]) assert.ok(existsSync(`${fonts}/${name}`), name);
+});
+
+const okResponse = bytes => ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array(bytes).buffer });
+const notFound = { ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0) };
+
+test("改訂18: CMapはアプリのURLから.bcmapを読み、失敗したら間をおいて読み直し、読めなかった名前を記録する", async () => {
+  const requested = [];
+  const waits = [];
+  let outcomes = [new Error("network"), notFound, okResponse([1, 2, 3])];
+  const failures = [];
+  const Factory = createCMapReaderFactory({
+    fetchImpl: async url => { requested.push(url); const next = outcomes.shift(); if (next instanceof Error) throw next; return next; },
+    wait: async milliseconds => { waits.push(milliseconds); },
+    failures
+  });
+  const reader = new Factory({ baseUrl: PDF_JS_CMAP_URL, isCompressed: true });
+  const data = await reader.fetch({ name: "Adobe-Japan1-UCS2" });
+  assert.deepEqual([...data.cMapData], [1, 2, 3]);
+  assert.equal(data.isCompressed, true);
+  assert.deepEqual(requested, Array(3).fill(`${PDF_JS_CMAP_URL}Adobe-Japan1-UCS2.bcmap`));
+  assert.deepEqual(waits, [PDF_CMAP_RETRY_DELAY_MS, PDF_CMAP_RETRY_DELAY_MS * 2]);
+  assert.deepEqual(failures, [], "読めたものは記録しない");
+  outcomes = Array(PDF_CMAP_FETCH_ATTEMPTS).fill(notFound);
+  await assert.rejects(reader.fetch({ name: "UniJIS-UCS2-H" }), /UniJIS-UCS2-H/);
+  assert.deepEqual(failures, ["UniJIS-UCS2-H"]);
+  assert.equal(requested.length, 3 + PDF_CMAP_FETCH_ATTEMPTS);
+});
+
+test("改訂18: CMapを読めず文字が欠けるページは保存せず、理由を示して変換を止める", async () => {
+  const pdf = fakePdf({ pageSizes: [[595, 842], [595, 842]], cMapRequests: { 1: ["Adobe-Japan1-UCS2"] } });
+  const saved = [];
+  await assert.rejects(convertPdfToImageFiles(pdfFile(), null, {
+    pdfjsLib: pdf.lib, createCanvas: pdf.createCanvas, wait: noWait, openScannedPages: noScans,
+    fetchCMap: async () => notFound,
+    onPage: async page => { saved.push(page.pageNumber); }
+  }), error => {
+    assert.match(error.message, /PDF 1ページ目の文字を読むための対応表（CMap: Adobe-Japan1-UCS2）を読み込めなかった/);
+    assert.match(error.message, /変換を中止しました/);
+    return true;
+  });
+  assert.deepEqual(saved, [], "文字の欠けたページを保存しない");
+  assert.deepEqual(pdf.state.cMapResults.map(result => result.ok), [false]);
+  assert.equal(pdf.state.destroyed, true);
+  // The CMap read: the pages are saved.
+  const ok = fakePdf({ pageSizes: [[595, 842], [595, 842]], cMapRequests: { 1: ["Adobe-Japan1-UCS2"] } });
+  const pages = [];
+  await convertPdfToImageFiles(pdfFile(), null, {
+    pdfjsLib: ok.lib, createCanvas: ok.createCanvas, wait: noWait, openScannedPages: noScans,
+    fetchCMap: async () => okResponse([9, 9]),
+    onPage: async page => { pages.push(page.pageNumber); }
+  });
+  assert.deepEqual(pages, [1, 2]);
+  assert.deepEqual(ok.state.cMapResults, [{ name: "Adobe-Japan1-UCS2", ok: true, bytes: 2, isCompressed: true }]);
 });

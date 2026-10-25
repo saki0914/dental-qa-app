@@ -23,6 +23,15 @@ export const PDF_RENDER_RETRY_FACTORS = Object.freeze([1, 0.75, 0.5]);
 export const PDF_RENDER_RETRY_DELAY_MS = 250;
 
 const PDF_JS_BASE = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
+// pdf.js's CMaps and the standard fonts it fetches, served by the app itself
+// (vendor/pdfjs-dist-4.10.38, revision 18): cdnjs has only the builds of
+// pdf.js. Without the CMap of a Japanese, Chinese or Korean font pdf.js leaves
+// the whole font out, and its text is not drawn (a lecture PDF made on an
+// iPad lost all its Japanese text, its numbers and arrows staying). The URLs
+// are absolute: the pdf.js worker runs from a blob URL.
+const PDF_JS_DATA_BASE = new URL("../../vendor/pdfjs-dist-4.10.38/", import.meta.url);
+export const PDF_JS_CMAP_URL = new URL("cmaps/", PDF_JS_DATA_BASE).href;
+export const PDF_JS_STANDARD_FONT_DATA_URL = new URL("standard_fonts/", PDF_JS_DATA_BASE).href;
 
 let cachedPdfJsLib = null;
 
@@ -154,17 +163,18 @@ async function renderPdfPageToJpeg({ pdfDoc, pageNumber, pdfjsLib, createCanvas,
 }
 
 // Fonts embedded in the PDF are drawn from their outlines (revision 17).
-// pdf.js normally re-encodes an embedded font and hands it to the browser,
-// which draws the text. iPad Safari drew nothing for the CID-keyed CFF fonts
-// that pdf.js 4.10.38 re-encodes (Japanese fonts such as Hiragino, as PDFs
-// made on Apple devices embed them; that version writes their charset wrong
-// for CoreText): a lecture PDF lost all its Japanese text while its numbers,
-// arrows, boxes and photos stayed. pdf.js can instead read each glyph's
-// outline from the font program itself (the same code in every browser) and
-// fill it, as it does when a browser refuses a font: refusing every embedded
-// font makes it do so. Fonts that are not embedded have no outlines and keep
-// the font the device has. Returns whether the document's fonts are drawn so;
-// a pdf.js without this loader is left as it is.
+// pdf.js normally re-encodes an embedded font and hands it to the browser's
+// font engine, which draws the text. pdf.js 4.10.38 writes the charset of a
+// re-encoded CID-keyed CFF font (Japanese fonts such as Hiragino, as PDFs made
+// on Apple devices embed them) one glyph off (fixed in pdf.js 5.2), which a
+// font engine may not accept. pdf.js can instead read each glyph's outline
+// from the font program itself (the same code in every browser) and fill it,
+// as it does when a browser refuses a font: refusing every embedded font makes
+// it do so, and the text no longer depends on the device's font engine. (The
+// Japanese text a lecture PDF lost on an iPad was due to the missing CMaps,
+// PDF_JS_CMAP_URL above, revision 18.) Fonts that are not embedded have no
+// outlines and keep the font the device has. Returns whether the document's
+// fonts are drawn so; a pdf.js without this loader is left as it is.
 export function drawEmbeddedFontsFromOutlines(pdfDoc) {
   const loader = pdfDoc?._transport?.fontLoader;
   if (!loader || typeof loader.bind !== "function") return false;
@@ -187,6 +197,42 @@ export function drawEmbeddedFontsFromOutlines(pdfDoc) {
 // this size, instead of holding the whole PDF: a page drawn natively never
 // needs pdf.js to read its image.
 export const PDF_RANGE_CHUNK_SIZE = 1024 * 1024;
+
+export const PDF_CMAP_FETCH_ATTEMPTS = 3;
+export const PDF_CMAP_RETRY_DELAY_MS = 300;
+
+// The CMaps pdf.js asks for are fetched here, on the page (revision 18): a
+// failed fetch is tried again, and a CMap that still cannot be fetched is
+// recorded in `failures`. pdf.js leaves out every font that needs a CMap it
+// cannot read and draws none of its text, so the converter stops rather than
+// keep pages that lost text.
+export function createCMapReaderFactory({ fetchImpl, wait, failures = [], attempts = PDF_CMAP_FETCH_ATTEMPTS } = {}) {
+  const fetchData = fetchImpl || ((...args) => globalThis.fetch(...args));
+  const pause = wait || (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)));
+  return class AppCMapReaderFactory {
+    constructor({ baseUrl } = {}) {
+      this.baseUrl = baseUrl || PDF_JS_CMAP_URL;
+    }
+
+    async fetch({ name } = {}) {
+      if (!name) throw new Error("CMap name must be specified.");
+      const url = `${this.baseUrl}${name}.bcmap`;
+      let lastError = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (attempt > 0) await pause(PDF_CMAP_RETRY_DELAY_MS * attempt);
+        try {
+          const response = await fetchData(url);
+          if (!response?.ok) throw new Error(`HTTP ${response?.status}`);
+          return { cMapData: new Uint8Array(await response.arrayBuffer()), isCompressed: true };
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      failures.push(name);
+      throw new Error(`Unable to load binary CMap at: ${url} (${lastError?.message || lastError})`);
+    }
+  };
+}
 
 function fileRangeTransport(pdfjsLib, file, onError) {
   const Transport = pdfjsLib.PDFDataRangeTransport;
@@ -229,15 +275,17 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
     readError ||= error;
     void loadingTask?.destroy?.();
   });
+  const cMapFailures = [];
   loadingTask = pdfjsLib.getDocument({
     ...(range
       ? { range, rangeChunkSize: PDF_RANGE_CHUNK_SIZE, disableAutoFetch: true, disableStream: true }
       : { data: new Uint8Array(await pdfFile.arrayBuffer()) }),
     useSystemFonts: true,
     disableFontFace: false,
-    cMapUrl: `${PDF_JS_BASE}/cmaps/`,
+    cMapUrl: PDF_JS_CMAP_URL,
     cMapPacked: true,
-    standardFontDataUrl: `${PDF_JS_BASE}/standard_fonts/`,
+    CMapReaderFactory: createCMapReaderFactory({ fetchImpl: options.fetchCMap, wait, failures: cMapFailures }),
+    standardFontDataUrl: PDF_JS_STANDARD_FONT_DATA_URL,
     canvasMaxAreaInBytes: PDF_IMAGE_MAX_PIXELS * 4
   });
   const files = [];
@@ -270,6 +318,12 @@ export async function convertPdfToImageFiles(pdfFile, onProgress, options = {}) 
         decodeImage: options.decodeImage
       });
       if (readError) throw readError;
+      if (cMapFailures.length) {
+        throw new Error(
+          `PDF ${pageNumber}ページ目の文字を読むための対応表（CMap: ${[...new Set(cMapFailures)].join("、")}）を読み込めなかったため、` +
+          "文字が欠けた画像を保存しないよう変換を中止しました。通信状態を確認して、もう一度お試しください。"
+        );
+      }
       const baseName = (pdfFile.name || "converted.pdf").replace(/\.pdf$/i, "");
       const file = new File(
         [rendered.blob],
