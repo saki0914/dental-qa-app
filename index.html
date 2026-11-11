@@ -33,11 +33,11 @@
   </script>
   <title>Dental QA Ultimate</title>
   <!-- asset-versions:start (npm run stamp) -->
-  <meta name="app-build" content="194f0ddcf9">
+  <meta name="app-build" content="49e4ab87b0">
   <script type="importmap">
   {
     "imports": {
-      "./js/app.js": "./js/app.js?v=fb0cfe1b35",
+      "./js/app.js": "./js/app.js?v=ac2a08f97c",
       "./js/config/firebase.js": "./js/config/firebase.js?v=a5ae88cb06",
       "./js/core/answer-comparison.js": "./js/core/answer-comparison.js?v=fdb54e842d",
       "./js/core/bounded-concurrency.js": "./js/core/bounded-concurrency.js?v=2a5884e716",
@@ -90,6 +90,7 @@
       "./js/core/pdf-creation-progress.js": "./js/core/pdf-creation-progress.js?v=4c659c0e3a",
       "./js/core/pdf-lib-loader.js": "./js/core/pdf-lib-loader.js?v=6872a028ea",
       "./js/core/pdf-scanned-page.js": "./js/core/pdf-scanned-page.js?v=88305500d3",
+      "./js/core/question-blanks.js": "./js/core/question-blanks.js?v=a719bacda5",
       "./js/core/question-choices.js": "./js/core/question-choices.js?v=872a93e11a",
       "./js/core/question-image-delete.js": "./js/core/question-image-delete.js?v=6e40cc95a0",
       "./js/core/question-import.js": "./js/core/question-import.js?v=743773d067",
@@ -99,7 +100,7 @@
       "./js/core/study-filters.js": "./js/core/study-filters.js?v=e2b83af035",
       "./js/core/text-utils.js": "./js/core/text-utils.js?v=262e6e686d",
       "./js/features/image-memory.js": "./js/features/image-memory.js?v=eb1f7db7f6",
-      "./js/features/question-manager.js": "./js/features/question-manager.js?v=c65a31b6f2",
+      "./js/features/question-manager.js": "./js/features/question-manager.js?v=0397b1cf80",
       "./js/features/study-notes.js": "./js/features/study-notes.js?v=61fe044019",
       "./js/services/cloud-store.js": "./js/services/cloud-store.js?v=bcde239f2a",
       "./js/services/note-store.js": "./js/services/note-store.js?v=81d51951a6"
@@ -107,7 +108,7 @@
   }
   </script>
   <!-- asset-versions:end -->
-  <link rel="stylesheet" href="./css/app.css?v=34b77aaa29">
+  <link rel="stylesheet" href="./css/app.css?v=e31b66d747">
   <link rel="stylesheet" href="./css/study-notes.css?v=761497c6a8">
 </head>
 <body>
@@ -147,7 +148,7 @@
       <div class="grid2" style="margin-bottom:12px;">
         <button class="choice active" id="chooseIphone" type="button">
           <div class="title">iPhone版</div>
-          <div class="desc">問題 → 答え → 解説 を見て覚える形式です。</div>
+          <div class="desc">問題 → 答え → 解説 を見て覚える形式です。穴埋めは空欄を押して4択で答えます。</div>
         </button>
         <button class="choice" id="chooseIpad" type="button">
           <div class="title">iPad版</div>
@@ -251,6 +252,9 @@
         選択問題（問題文の最後に「a. 〜」の選択肢がある問題）<br>
         - iPhone版・iPad版とも、選択肢を押すと正解・不正解と解説が表示され、「できる／まだ」に記録されます。<br>
         - 2つ選ぶ問題は、2つ選んでから「解答する」を押します。目のボタン（答えを見る）を先に押した場合は記録しません。<br>
+        穴埋め問題（問題文に【a】【b】…の空欄がある問題）<br>
+        - iPhone版では空欄を押すと4択が出ます。選ぶとその場で正解・不正解が出て、すべての空欄に答えると「できる／まだ」に記録されます（全問正解で「できる」）。<br>
+        - 間違いの選択肢は、問題に登録したもの（問題管理の「間違いの選択肢」、JSONの distractors）を使い、ないときは同じ教科の答えから、反対の言葉など紛らわしい言葉を先に選びます。<br>
         iPad版の判定ルール<br>
         - 答えの数に応じて、解答欄が自動で分かれます。<br>
         - 通常の複数回答は順不同で判定します。<br>
@@ -266,7 +270,8 @@
       <div class="sub">
         検索・追加・更新・削除ができます。<br>
         形式は「教科 / サブカテゴリ / 問題 / 答え / 解説」です。答えが複数あるときは改行、または「，」（全角カンマ）で区切ってください。サブカテゴリは従来通り読点などで区切れます。<br>
-        選択問題は、問題文の最後に改行して「a. 選択肢」「b. 選択肢」…と1行ずつ書き、答えに選択肢の記号（例: c。2つなら a と d を改行で区切る）を入れると、学習画面で選択肢を押して解答できます。
+        選択問題は、問題文の最後に改行して「a. 選択肢」「b. 選択肢」…と1行ずつ書き、答えに選択肢の記号（例: c。2つなら a と d を改行で区切る）を入れると、学習画面で選択肢を押して解答できます。<br>
+        穴埋め問題（問題文に【a】【b】…、答えを空欄の順に入力）は、iPhone版で空欄を押して4択で答えます。間違いの選択肢を決めたいときは「間違いの選択肢」に「a: 誤答1, 誤答2, 誤答3」と空欄ごとに1行ずつ書きます（空のときは自動で選びます）。
       </div>
 
       <div class="grid2">
@@ -279,6 +284,7 @@
         <textarea id="editAnswers" placeholder="答え（複数あるときは改行・半角カンマ・「，」全角カンマ区切り）"></textarea>
       </div>
       <textarea id="editExplanation" placeholder="解説"></textarea>
+      <textarea id="editDistractors" class="edit-distractors" placeholder="間違いの選択肢（穴埋め4択用・任意）&#10;a: 内発的, 価値観, 興味関心&#10;b: 罰, 評価, 叱責" aria-label="間違いの選択肢（穴埋め4択用・任意）"></textarea>
 
       <label class="helper" style="display:flex;align-items:center;gap:10px;margin-top:10px;">
         <input id="editOrderedAnswers" type="checkbox" style="width:auto;min-height:auto;">
@@ -805,6 +811,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/app.js?v=fb0cfe1b35"></script>
+<script type="module" src="./js/app.js?v=ac2a08f97c"></script>
 </body>
 </html>

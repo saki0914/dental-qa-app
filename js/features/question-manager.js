@@ -23,6 +23,11 @@ import {
   restoreFailedQuestionDeletes
 } from "../core/question-image-delete.js";
 import { choiceQuestionFormatProblem } from "../core/question-choices.js";
+import {
+  formatDistractorsText,
+  normalizeImportedDistractors,
+  parseDistractorsText
+} from "../core/question-blanks.js";
 import { assertNonEmptyBlob } from "../core/file-validator.js";
 import { randomId } from "../core/id.js";
 
@@ -139,6 +144,16 @@ function validateBulkImportItems(rawItems) {
     const choiceProblem = choiceQuestionFormatProblem({ question, answers, orderedAnswers: raw.orderedAnswers === true });
     if (choiceProblem) warnings.push(`行${rowNo}: ${choiceProblem}`);
 
+    // 穴埋め問題の間違いの選択肢（改訂19）。
+    const distractorCheck = normalizeImportedDistractors(raw.distractors, {
+      question,
+      answers,
+      orderedAnswers: raw.orderedAnswers === true,
+      rowNo
+    });
+    issues.push(...distractorCheck.issues);
+    warnings.push(...distractorCheck.warnings);
+
     const imageFileReference = String(raw.imageFile || "").trim();
     const resolvedImage = resolveImportImageFile(imageFileReference, imageFiles);
     if (resolvedImage.error === "missing") {
@@ -160,6 +175,7 @@ function validateBulkImportItems(rawItems) {
       imagePath: typeof raw.imagePath === "string" ? raw.imagePath.trim() : "",
       imageName: typeof raw.imageName === "string" ? raw.imageName.trim() : "",
       orderedAnswers: raw.orderedAnswers === true,
+      ...(distractorCheck.distractors ? { distractors: distractorCheck.distractors } : {}),
       _pendingImageFile: resolvedImage.file,
       _imageFileReference: imageFileReference
     };
@@ -509,6 +525,9 @@ function fillEditorForm(q) {
 
   if (el.editOrderedAnswers) {
     el.editOrderedAnswers.checked = !!q.orderedAnswers;
+  }
+  if (el.editDistractors) {
+    el.editDistractors.value = formatDistractorsText(q.distractors);
   }
 
   currentEditingImageUrl = q.imageUrl || "";
@@ -906,11 +925,7 @@ async function addQuestion() {
     imageMeta = await uploadQuestionImage(questionId, pendingImageFile);
   }
 
-  const question = {
-    id: questionId,
-    ...payload,
-    ...imageMeta
-  };
+  const question = withDistractors({ id: questionId }, { ...payload, ...imageMeta });
   shared.allQuestions.push(question);
   ensureProgressRow(question.subject);
   selectedQuestionId = question.id;
@@ -949,7 +964,11 @@ async function updateQuestion() {
     imageMeta = nextImageMeta;
   }
 
-  shared.allQuestions[index] = { ...before, ...payload, subcategories: normalizeSubcategories(payload.subcategories), ...imageMeta };
+  shared.allQuestions[index] = withDistractors(before, {
+    ...payload,
+    subcategories: normalizeSubcategories(payload.subcategories),
+    ...imageMeta
+  });
   if (before.subject !== payload.subject) ensureProgressRow(payload.subject);
 
   currentEditingImageUrl = imageMeta.imageUrl || "";
@@ -977,7 +996,29 @@ function readEditorForm() {
     alert("教科・問題・答えは必須です。");
     return null;
   }
-  return { subject, subcategories, question, answers, explanation, orderedAnswers };
+  const payload = { subject, subcategories, question, answers, explanation, orderedAnswers };
+  // 穴埋め問題の間違いの選択肢（改訂19）。欄のない古い画面では触らない。
+  if (el.editDistractors) {
+    const { distractors, error } = parseDistractorsText(el.editDistractors.value, { question, answers, orderedAnswers });
+    if (error) {
+      alert(error);
+      return null;
+    }
+    payload.distractors = distractors;
+  }
+  return payload;
+}
+
+// The question with the form's fields. Without wrong choices of its own the
+// question has no distractors field (Firestore keeps no undefined values);
+// a form without the field keeps the question's.
+function withDistractors(base, payload) {
+  const { distractors, ...fields } = payload;
+  const question = { ...base, ...fields };
+  if (!("distractors" in payload)) return question;
+  if (distractors) question.distractors = distractors;
+  else delete question.distractors;
+  return question;
 }
 
 function clearEditorForm() {
@@ -987,6 +1028,7 @@ function clearEditorForm() {
   el.editAnswers.value = "";
   el.editExplanation.value = "";
   if (el.editOrderedAnswers) el.editOrderedAnswers.checked = false;
+  if (el.editDistractors) el.editDistractors.value = "";
   currentEditingImageUrl = "";
   currentEditingImageName = "";
   currentEditingImagePath = "";

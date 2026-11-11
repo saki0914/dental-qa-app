@@ -29,6 +29,7 @@ import {
   isCorrectChoiceSelection,
   parseChoiceQuestion
 } from "./core/question-choices.js";
+import { buildBlankChoices, createBlankChoicePool, parseBlankQuestion, shuffleChoices } from "./core/question-blanks.js";
 import {
   calculateStudyCounters,
   filterQuestionsForStudy,
@@ -118,6 +119,10 @@ let activeSyncSession = null;
 // question: { questionId, choice, selected, result, revealed } (revision 14).
 let studyCardQuestion = null;
 let studyChoiceState = null;
+// The fill-in-the-blank question on the study card of the iPhone version:
+// { questionId, question, parsed, pool, blanks: [{ letter, index, answer,
+// choices, picked }], result, revealed } (revision 19).
+let studyBlankState = null;
 
 const el = {
   cloudStatus: document.getElementById("cloudStatus"),
@@ -153,6 +158,7 @@ const el = {
   editAnswers: document.getElementById("editAnswers"),
   editExplanation: document.getElementById("editExplanation"),
   editOrderedAnswers: document.getElementById("editOrderedAnswers"),
+  editDistractors: document.getElementById("editDistractors"),
   searchInput: document.getElementById("searchInput"),
   emailInput: document.getElementById("emailInput"),
   passwordInput: document.getElementById("passwordInput"),
@@ -237,6 +243,7 @@ const el = {
   studyChoiceActions: document.getElementById("studyChoiceActions"),
   choiceSubmitBtn: document.getElementById("choiceSubmitBtn"),
   choiceRetryBtn: document.getElementById("choiceRetryBtn"),
+  studyBlankPopover: document.getElementById("studyBlankPopover"),
   judgeBtn: document.getElementById("judgeBtn"),
   studyActions: document.getElementById("studyActions"),
   prevBtn: document.getElementById("prevBtn"),
@@ -282,6 +289,13 @@ function ensureStudyCardElements() {
     el.choiceRetryBtn.type = "button";
     el.studyChoiceActions.append(el.choiceSubmitBtn, el.choiceRetryBtn);
     el.studyChoices.after(el.studyChoiceActions);
+  }
+  // The four choices of a blank (revision 19).
+  if (!el.studyBlankPopover) {
+    el.studyBlankPopover = create("div", "studyBlankPopover", "study-blank-popover");
+    el.studyBlankPopover.hidden = true;
+    el.studyBlankPopover.setAttribute("role", "listbox");
+    card.append(el.studyBlankPopover);
   }
 }
 
@@ -889,10 +903,24 @@ function renderStudy({ reshuffle = false } = {}) {
 // The contents of the study card. A choice question shows the question text
 // and its options as buttons (revision 14).
 function renderStudyQuestionCard(q) {
+  closeStudyBlankPopover();
   const choice = q ? parseChoiceQuestion(q) : null;
+  // 穴埋め問題は、iPhone版では空欄を押して4択で答える（改訂19）。
+  const blank = q && !choice && deviceMode === "iphone" ? parseBlankQuestion(q) : null;
   studyCardQuestion = q || null;
   studyChoiceState = choice
     ? { questionId: q.id, choice, selected: [], result: null, revealed: false }
+    : null;
+  studyBlankState = blank
+    ? {
+      questionId: q.id,
+      question: q,
+      parsed: blank,
+      pool: null,
+      blanks: blank.blanks.map(item => ({ ...item, choices: null, picked: null })),
+      result: null,
+      revealed: false
+    }
     : null;
   renderStudyQuestionHead(q, choice);
 
@@ -906,10 +934,12 @@ function renderStudyQuestionCard(q) {
     clearIpadAnswerInputs();
     clearJudgeStatus();
     renderStudyChoices();
+    updateStudyBlankView();
     return;
   }
 
-  el.question.textContent = choice ? choice.stem : formatDisplayText(q.question);
+  if (blank) renderStudyBlankQuestion();
+  else el.question.textContent = choice ? choice.stem : formatDisplayText(q.question);
   renderQuestionImage(q);
   if (choice) {
     // Filled with the verdict and the correct options when they are shown.
@@ -926,6 +956,7 @@ function renderStudyQuestionCard(q) {
   else renderIpadAnswerInputs(q);
   clearJudgeStatus();
   renderStudyChoices();
+  updateStudyBlankView();
 }
 
 function renderStudyQuestionHead(q, choice) {
@@ -1066,6 +1097,10 @@ function answerStudyChoice(selectedLabels) {
 // 解き直す: 表示だけを戻す。記録は次に解答したときに上書きする。
 // Answer again: only the display is reset; the next answer replaces the record.
 function retryStudyChoice() {
+  if (studyBlankState) {
+    retryStudyBlank();
+    return;
+  }
   const state = studyChoiceState;
   if (!state || (!state.result && !state.revealed)) return;
   state.selected = [];
@@ -1085,9 +1120,305 @@ function showAnswerAndExplanation() {
     state.revealed = true;
     updateStudyChoiceView();
   }
+  const blankState = studyBlankState;
+  if (blankState && !blankState.result && !blankState.revealed) {
+    // The blanks not answered yet show their answers; nothing is recorded.
+    blankState.revealed = true;
+    closeStudyBlankPopover();
+    updateStudyBlankView();
+  }
   el.answerBox.style.display = "block";
   el.explainBox.style.display = "block";
   requestAnimationFrame(updateFloatingStudyActions);
+}
+
+
+// ---- 穴埋め問題の4択（改訂19） ----
+// Fill-in-the-blank questions on the iPhone version (revision 19): the blanks
+// of the question are boxes; tapping one shows four choices, and a choice is
+// marked right (green) or wrong (red, with the answer in green). When every
+// blank is answered, the question is recorded like a choice question: できる
+// when all are right, まだ otherwise. Showing the answer first records nothing.
+
+const BLANK_MARKS = {
+  right: '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+  wrong: '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>'
+};
+
+function studyBlankByLetter(letter) {
+  return studyBlankState?.blanks.find(blank => blank.letter === letter) || null;
+}
+
+function renderStudyBlankQuestion() {
+  const state = studyBlankState;
+  if (!state) return;
+  const nodes = state.parsed.segments.map(segment => {
+    if (segment.type === "text") return document.createTextNode(segment.text);
+    const slot = document.createElement("span");
+    slot.className = "study-blank-slot";
+    slot.dataset.blankLetter = segment.letter;
+    return slot;
+  });
+  el.question.replaceChildren(...nodes);
+}
+
+function createStudyBlankMark(kind) {
+  const mark = document.createElement("span");
+  mark.className = "study-blank-mark";
+  mark.innerHTML = BLANK_MARKS[kind];
+  return mark;
+}
+
+// A word in a blank and, for screen readers, what it is. The note stays out
+// of the word's box, which would otherwise show an empty piece of the box
+// where a line breaks after the word.
+function createStudyBlankWord(className, text, note, { mark = "", prefix = "" } = {}) {
+  const word = document.createElement("span");
+  // A short word stays on one line; a sentence wraps.
+  word.className = `${className}${text.length <= 12 ? " is-nowrap" : ""}`;
+  if (mark) word.append(createStudyBlankMark(mark));
+  word.append(document.createTextNode(`${prefix}${text}`));
+  const hidden = document.createElement("span");
+  hidden.className = "study-sr-only";
+  hidden.textContent = note;
+  return [word, hidden];
+}
+
+// One place of a blank in the question, as its state shows it.
+function renderStudyBlankSlot(slot, blank, state) {
+  const settled = !!state.result || state.revealed;
+  if (blank.picked !== null) {
+    const right = blank.picked === blank.answer;
+    const nodes = createStudyBlankWord(
+      `study-blank-word ${right ? "is-right" : "is-wrong"}`,
+      blank.picked,
+      right ? "（正解）" : "（不正解）",
+      { mark: right ? "right" : "wrong" }
+    );
+    if (!right) {
+      nodes.push(...createStudyBlankWord("study-blank-word is-correction", blank.answer, "（正答）", { prefix: "→ " }));
+    }
+    slot.replaceChildren(...nodes);
+    return;
+  }
+  if (settled) {
+    slot.replaceChildren(...createStudyBlankWord("study-blank-word is-revealed", blank.answer, "（正答）"));
+    return;
+  }
+  let button = slot.querySelector(".study-blank");
+  if (!button) {
+    button = document.createElement("button");
+    button.type = "button";
+    button.className = "study-blank";
+    button.dataset.blankLetter = blank.letter;
+    button.setAttribute("aria-haspopup", "listbox");
+    const line = document.createElement("span");
+    line.className = "study-blank-line";
+    line.setAttribute("aria-hidden", "true");
+    button.append(line);
+    slot.replaceChildren(button);
+  }
+  const open = el.studyBlankPopover?.dataset.blankLetter === blank.letter && !el.studyBlankPopover.hidden;
+  button.setAttribute("aria-expanded", String(open));
+  button.setAttribute("aria-label", `空欄${state.blanks.length > 1 ? blank.letter : ""}（押すと選択肢）`);
+}
+
+function studyBlankAnswerText(state) {
+  return state.blanks
+    .map(blank => state.blanks.length > 1 ? `${blank.letter} ${blank.answer}` : blank.answer)
+    .join("、");
+}
+
+function updateStudyBlankView() {
+  const state = studyBlankState;
+  el.studyCard?.classList.toggle("is-blank", !!state);
+  if (!state) return;
+  el.studyCard?.classList.toggle("is-correct", state.result?.correct === true);
+  el.studyCard?.classList.toggle("is-incorrect", state.result?.correct === false);
+  el.question.querySelectorAll(".study-blank-slot").forEach(slot => {
+    const blank = studyBlankByLetter(slot.dataset.blankLetter);
+    if (blank) renderStudyBlankSlot(slot, blank, state);
+  });
+
+  const settled = !!state.result || state.revealed;
+  el.choiceSubmitBtn?.classList.add("hidden");
+  el.choiceRetryBtn?.classList.toggle("hidden", !settled);
+  el.studyChoiceActions?.classList.toggle("hidden", !settled);
+
+  const answers = escapeHtml(studyBlankAnswerText(state));
+  if (state.result) {
+    const { correct, right, total } = state.result;
+    const count = total > 1 && !correct ? `（${total}つ中${right}つ正解）` : "";
+    el.answerBox.innerHTML = `<span class="study-verdict ${correct ? "is-ok" : "is-ng"}">${correct ? "正解" : "不正解"}</span>${count}　正答：${answers}`;
+  } else if (state.revealed) {
+    el.answerBox.innerHTML = `正答：${answers}`;
+  } else {
+    el.answerBox.innerHTML = "";
+  }
+}
+
+function openStudyBlank(letter, anchor, { fromKeyboard = false } = {}) {
+  const state = studyBlankState;
+  const blank = studyBlankByLetter(letter);
+  if (!state || !blank || state.result || state.revealed || blank.picked !== null) return;
+  if (!isInteractionReady()) return;
+  const popover = el.studyBlankPopover;
+  if (!popover) return;
+  if (!popover.hidden && popover.dataset.blankLetter === letter) {
+    closeStudyBlankPopover({ restoreFocus: fromKeyboard });
+    return;
+  }
+  if (!blank.choices) {
+    state.pool ||= createBlankChoicePool(allQuestions, state.question.subject);
+    blank.choices = buildBlankChoices({
+      question: state.question,
+      parsed: state.parsed,
+      blankIndex: blank.index,
+      pool: state.pool
+    })?.choices || [blank.answer];
+  }
+
+  popover.dataset.blankLetter = letter;
+  popover.setAttribute("aria-label", `空欄${state.blanks.length > 1 ? letter : ""}の選択肢`);
+  popover.replaceChildren(...blank.choices.map((choice, index) => {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "study-blank-option";
+    option.setAttribute("role", "option");
+    option.dataset.blankChoice = String(index);
+    option.textContent = choice;
+    return option;
+  }));
+  popover.hidden = false;
+  updateStudyBlankView();
+  positionStudyBlankPopover(anchor);
+  if (fromKeyboard) popover.querySelector(".study-blank-option")?.focus();
+}
+
+// Below the blank, or above it when it does not fit below; inside the card.
+function positionStudyBlankPopover(anchor) {
+  const popover = el.studyBlankPopover;
+  const card = el.studyCard;
+  if (!popover || !card || !anchor) return;
+  const cardRect = card.getBoundingClientRect();
+  const anchorRect = anchor.getBoundingClientRect();
+  popover.style.left = "0px";
+  popover.style.top = "0px";
+  const width = popover.offsetWidth;
+  const height = popover.offsetHeight;
+  const gap = 6;
+  const margin = 8;
+  const left = Math.min(
+    Math.max(anchorRect.left - cardRect.left, margin),
+    Math.max(margin, card.clientWidth - width - margin)
+  );
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+  const fitsBelow = anchorRect.bottom + gap + height <= viewportHeight - margin;
+  const fitsAbove = anchorRect.top - gap - height >= margin;
+  const below = fitsBelow || !fitsAbove;
+  const top = below
+    ? anchorRect.bottom - cardRect.top + gap
+    : anchorRect.top - cardRect.top - gap - height;
+  popover.style.left = `${Math.round(left)}px`;
+  popover.style.top = `${Math.round(top)}px`;
+  popover.classList.toggle("is-above", !below);
+  if (below && !fitsBelow) popover.scrollIntoView?.({ block: "nearest" });
+}
+
+function closeStudyBlankPopover({ restoreFocus = false } = {}) {
+  const popover = el.studyBlankPopover;
+  if (!popover || popover.hidden) return;
+  const letter = popover.dataset.blankLetter;
+  popover.hidden = true;
+  popover.replaceChildren();
+  delete popover.dataset.blankLetter;
+  if (studyBlankState) updateStudyBlankView();
+  if (restoreFocus && letter) el.question?.querySelector(`.study-blank[data-blank-letter="${letter}"]`)?.focus();
+}
+
+function answerStudyBlank(choiceIndex) {
+  const state = studyBlankState;
+  const popover = el.studyBlankPopover;
+  const blank = studyBlankByLetter(popover?.dataset.blankLetter);
+  if (!state || !blank || state.result || state.revealed || blank.picked !== null) return;
+  if (!isInteractionReady()) return;
+  const choice = blank.choices?.[choiceIndex];
+  if (choice === undefined) return;
+  blank.picked = choice;
+  closeStudyBlankPopover();
+  if (state.blanks.every(item => item.picked !== null)) finishStudyBlank();
+  else updateStudyBlankView();
+}
+
+// Every blank answered: record the question like the choice questions.
+function finishStudyBlank() {
+  const state = studyBlankState;
+  if (!state || state.result) return;
+  const right = state.blanks.filter(blank => blank.picked === blank.answer).length;
+  const correct = right === state.blanks.length;
+  state.result = { correct, right, total: state.blanks.length };
+  setQuestionState(state.questionId, correct ? 1 : 2);
+  recalcProgressFromQuestionStates();
+  updateStudyBlankView();
+  showAnswerAndExplanation();
+  renderProgressTable();
+  buildFilteredQuestions();
+  updateStudyStatsOnly();
+  autoSaveToCloud();
+}
+
+// 解き直す: the blanks are empty again, their choices in a new order. The
+// next answer replaces the record.
+function retryStudyBlank() {
+  const state = studyBlankState;
+  if (!state || (!state.result && !state.revealed)) return;
+  state.blanks.forEach(blank => {
+    blank.picked = null;
+    if (blank.choices) blank.choices = shuffleChoices(blank.choices);
+  });
+  state.result = null;
+  state.revealed = false;
+  el.answerBox.style.display = "none";
+  el.explainBox.style.display = "none";
+  updateStudyBlankView();
+  requestAnimationFrame(updateFloatingStudyActions);
+}
+
+function handleStudyBlankClick(event) {
+  const button = event.target.closest?.(".study-blank");
+  if (!button || !el.question.contains(button)) return;
+  // A click from the keyboard (Enter, Space) has no pointer position.
+  openStudyBlank(button.dataset.blankLetter, button, { fromKeyboard: event.detail === 0 });
+}
+
+function handleStudyBlankPopoverClick(event) {
+  const option = event.target.closest?.("[data-blank-choice]");
+  if (!option) return;
+  answerStudyBlank(Number(option.dataset.blankChoice));
+}
+
+function handleStudyBlankOutsidePointer(event) {
+  const popover = el.studyBlankPopover;
+  if (!popover || popover.hidden) return;
+  if (popover.contains(event.target) || event.target.closest?.(".study-blank")) return;
+  closeStudyBlankPopover();
+}
+
+function handleStudyBlankKeydown(event) {
+  const popover = el.studyBlankPopover;
+  if (!popover || popover.hidden) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeStudyBlankPopover({ restoreFocus: true });
+    return;
+  }
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  const options = [...popover.querySelectorAll(".study-blank-option")];
+  if (!options.length) return;
+  event.preventDefault();
+  const index = options.indexOf(document.activeElement);
+  const step = event.key === "ArrowDown" ? 1 : -1;
+  options[(index + step + options.length) % options.length].focus();
 }
 
 
@@ -2188,6 +2519,18 @@ document.getElementById("judgeBtn").addEventListener("click", judgeIpadAnswer);
 el.studyChoices?.addEventListener("click", handleStudyChoiceClick);
 el.choiceSubmitBtn?.addEventListener("click", submitStudyChoices);
 el.choiceRetryBtn?.addEventListener("click", retryStudyChoice);
+el.question?.addEventListener("click", handleStudyBlankClick);
+el.studyBlankPopover?.addEventListener("click", handleStudyBlankPopoverClick);
+document.addEventListener("pointerdown", handleStudyBlankOutsidePointer, true);
+document.addEventListener("keydown", handleStudyBlankKeydown);
+// The choices close when the width changes (rotation), not when the toolbar of
+// iPhone Safari shows or hides while scrolling.
+let studyBlankViewportWidth = window.innerWidth;
+window.addEventListener("resize", () => {
+  if (window.innerWidth === studyBlankViewportWidth) return;
+  studyBlankViewportWidth = window.innerWidth;
+  closeStudyBlankPopover();
+});
 document.getElementById("knownBtn").addEventListener("click", markKnown);
 document.getElementById("unknownBtn").addEventListener("click", markUnknown);
 document.getElementById("reviewWrongBtn").addEventListener("click", reviewWrongOnly);
